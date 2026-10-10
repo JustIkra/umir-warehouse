@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -47,6 +48,40 @@ func TestShelfLifeMonthBeforeYearZero(t *testing.T) {
 		t.Fatalf("CalculateExpiresAt(+1 month) error: %v", err)
 	}
 	want := time.Date(-1, time.February, 28, 12, 0, 0, 0, location)
+	if !got.Equal(want) {
+		t.Fatalf("expiry = %s; want %s", got.Format(time.RFC3339), want.Format(time.RFC3339))
+	}
+}
+
+func TestCalculateExpiresAtRejectsUnrepresentableDay(t *testing.T) {
+	location := time.FixedZone("MSK", 3*60*60)
+	manufacturedAt := time.Date(292_277_026_590, time.January, 1, 0, 0, 0, 0, location)
+	life := ShelfLife{Value: math.MaxInt64 / int64(24*time.Hour), Unit: ShelfLifeDay}
+
+	if _, err := CalculateExpiresAt(manufacturedAt, life); err == nil {
+		t.Fatal("CalculateExpiresAt accepted a day result outside time.Time range")
+	}
+}
+
+func TestCalculateExpiresAtRejectsUnrepresentableMonth(t *testing.T) {
+	location := time.FixedZone("MSK", 3*60*60)
+	manufacturedAt := time.Date(-100, time.January, 31, 12, 0, 0, 0, location)
+	if _, err := CalculateExpiresAt(manufacturedAt, ShelfLife{Value: math.MaxInt64, Unit: ShelfLifeMonth}); err == nil {
+		t.Fatal("CalculateExpiresAt accepted a month result outside time.Time range")
+	}
+}
+
+func TestCalculateExpiresAtLargeRepresentableSource(t *testing.T) {
+	location := time.FixedZone("MSK", 3*60*60)
+	manufacturedAt := time.Date(1_000_000_000_000_000, time.January, 31, 12, 0, 0, 0, location)
+	year, month, day := manufacturedAt.Date()
+	hour, minute, second := manufacturedAt.Clock()
+	want := time.Date(year, month+1, day, hour, minute, second, manufacturedAt.Nanosecond(), location)
+
+	got, err := CalculateExpiresAt(manufacturedAt, ShelfLife{Value: 1, Unit: ShelfLifeMonth})
+	if err != nil {
+		t.Fatalf("CalculateExpiresAt rejected a representable large date: %v", err)
+	}
 	if !got.Equal(want) {
 		t.Fatalf("expiry = %s; want %s", got.Format(time.RFC3339), want.Format(time.RFC3339))
 	}

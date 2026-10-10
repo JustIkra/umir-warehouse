@@ -18,3 +18,9 @@ func TestQuantityOverflow(t *testing.T) {
 		t.Fatal("MultiplyQuantity(MaxInt64, 2) succeeded; want overflow error")
 	}
 }
+
+func TestMultiplyQuantityRejectsZeroInput(t *testing.T) {
+	if _, err := MultiplyQuantity(0, 1); err == nil {
+		t.Fatal("MultiplyQuantity(0, 1) succeeded; want invalid quantity error")
+	}
+}

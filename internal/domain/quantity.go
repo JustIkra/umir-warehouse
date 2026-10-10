@@ -19,7 +19,7 @@ func AddQuantity(a, b Quantity) (Quantity, error) {
 }
 
 func MultiplyQuantity(quantity Quantity, portions int64) (Quantity, error) {
-	if quantity < 0 || portions <= 0 {
+	if quantity <= 0 || portions <= 0 {
 		return 0, ErrInvalidQuantity
 	}
 	if quantity != 0 && portions > math.MaxInt64/int64(quantity) {
