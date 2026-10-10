@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -22,17 +21,6 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func handler() (http.Handler, error) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "umir-warehouse"}); err != nil {
-			log.Printf("health response: %v", err)
-		}
-	})
-	return mux, nil
 }
 
 func healthcheck() error {
@@ -69,10 +57,6 @@ func runMain() error {
 	if err != nil {
 		return err
 	}
-	app, err := handler()
-	if err != nil {
-		return err
-	}
 	runtime, err := bootstrap.NewInMemory(bootstrap.Options{
 		Now:               time.Now,
 		NewID:             rand.Text,
@@ -81,15 +65,31 @@ func runMain() error {
 	if err != nil {
 		return fmt.Errorf("create in-memory runtime: %w", err)
 	}
-	server := &http.Server{
-		Addr:              ":" + cfg.port,
-		Handler:           app,
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
+	if err := runtime.Recover(context.Background()); err != nil {
+		return fmt.Errorf("recover in-memory runtime: %w", err)
+	}
+	publicHandler, internalHandler, err := bootstrap.NewHTTPHandlers(runtime, bootstrap.HTTPOptions{RequestTimeout: cfg.requestTimeout, MaxRequestBytes: cfg.maxRequestBytes})
+	if err != nil {
+		return fmt.Errorf("create HTTP handlers: %w", err)
+	}
+	publicServer := newHTTPServer(cfg.port, publicHandler, cfg.requestTimeout)
+	internalServer := newHTTPServer(cfg.internalPort, internalHandler, cfg.requestTimeout)
+	servers := []*http.Server{publicServer, internalServer}
+	shutdown := func(ctx context.Context) error {
+		var shutdownErr error
+		for _, server := range servers {
+			shutdownErr = errors.Join(shutdownErr, server.Shutdown(ctx))
+		}
+		if shutdownErr != nil {
+			for _, server := range servers {
+				shutdownErr = errors.Join(shutdownErr, server.Close())
+			}
+		}
+		return shutdownErr
 	}
 	signals, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Printf("umir-warehouse listening on %s", server.Addr)
+	log.Printf("umir-warehouse public listener on %s; internal listener on %s", publicServer.Addr, internalServer.Addr)
 	return runService(signals, cfg, lifecycleDependencies{
 		newTicker: func(interval time.Duration) ticker { return realTicker{ticker: time.NewTicker(interval)} },
 		processDueExpirations: func(ctx context.Context) error {
@@ -98,7 +98,30 @@ func runMain() error {
 		},
 		runSnapshotWorker: runtime.RunSnapshotWorker,
 		waitSnapshotRetry: waitForSnapshotRetry,
-		serve:             server.ListenAndServe,
-		shutdown:          server.Shutdown,
+		serve:             func() error { return serveListeners(publicServer, internalServer) },
+		shutdown:          shutdown,
 	})
+}
+
+func newHTTPServer(port string, handler http.Handler, requestTimeout time.Duration) *http.Server {
+	return &http.Server{
+		Addr:              ":" + port,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       requestTimeout,
+		WriteTimeout:      requestTimeout,
+		IdleTimeout:       60 * time.Second,
+	}
+}
+
+func serveListeners(publicServer, internalServer *http.Server) error {
+	results := make(chan error, 2)
+	go func() { results <- publicServer.ListenAndServe() }()
+	go func() { results <- internalServer.ListenAndServe() }()
+	first := <-results
+	if first != nil && !errors.Is(first, http.ErrServerClosed) {
+		first = errors.Join(first, publicServer.Close(), internalServer.Close())
+	}
+	second := <-results
+	return errors.Join(first, second)
 }

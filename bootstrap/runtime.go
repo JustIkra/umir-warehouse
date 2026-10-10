@@ -2,15 +2,35 @@ package bootstrap
 
 import (
 	"context"
+	"net/http"
 	"time"
 
 	"github.com/JustIkra/umir-warehouse/contract"
+	"github.com/JustIkra/umir-warehouse/internal/adapters/httpapi"
 	"github.com/JustIkra/umir-warehouse/internal/adapters/memory"
 	"github.com/JustIkra/umir-warehouse/internal/application"
 )
 
 type Runtime struct {
-	owner *application.Owner
+	owner    *application.Owner
+	attempts *application.OrderAttemptCoordinator
+}
+
+type attemptOwnerAdapter struct{ runtime *Runtime }
+
+func (a attemptOwnerAdapter) CommitAcceptedOrder(ctx context.Context, request contract.CommitOrderRequest) (contract.CommitResult, error) {
+	return a.runtime.owner.CommitAcceptedOrder(ctx, request)
+}
+
+func (a attemptOwnerAdapter) FindRecordedCommand(ctx context.Context, commandID string) (contract.CommandRecord, bool, error) {
+	return a.runtime.FindRecordedCommand(ctx, commandID)
+}
+
+func NewHTTPHandlers(runtime *Runtime, options HTTPOptions) (http.Handler, http.Handler, error) {
+	if runtime == nil {
+		return nil, nil, contract.ErrInvalidArgument
+	}
+	return httpapi.NewHandlers(runtime, httpapi.Options{RequestTimeout: options.RequestTimeout, MaxRequestBytes: options.MaxRequestBytes})
 }
 
 func NewInMemory(options Options) (*Runtime, error) {
@@ -25,7 +45,9 @@ func NewInMemory(options Options) (*Runtime, error) {
 	if err := owner.ConfigureSnapshots(memory.NewSnapshotStore(), options.EventsPerSnapshot); err != nil {
 		return nil, err
 	}
-	return &Runtime{owner: owner}, nil
+	runtime := &Runtime{owner: owner}
+	runtime.attempts = application.NewOrderAttemptCoordinator(attemptOwnerAdapter{runtime: runtime}, attemptOwnerAdapter{runtime: runtime})
+	return runtime, nil
 }
 
 func (r *Runtime) Recover(ctx context.Context) error {
@@ -33,15 +55,33 @@ func (r *Runtime) Recover(ctx context.Context) error {
 }
 
 func (r *Runtime) RegisterProduct(ctx context.Context, request contract.RegisterProductRequest) (contract.Product, error) {
-	return r.owner.RegisterProduct(ctx, request)
+	var product contract.Product
+	err := r.attempts.RunOtherCommand(ctx, request.CommandID, func() error {
+		var callErr error
+		product, callErr = r.owner.RegisterProduct(ctx, request)
+		return callErr
+	})
+	return product, err
 }
 
 func (r *Runtime) DefineDish(ctx context.Context, request contract.DefineDishRequest) (contract.Dish, error) {
-	return r.owner.DefineDish(ctx, request)
+	var dish contract.Dish
+	err := r.attempts.RunOtherCommand(ctx, request.CommandID, func() error {
+		var callErr error
+		dish, callErr = r.owner.DefineDish(ctx, request)
+		return callErr
+	})
+	return dish, err
 }
 
 func (r *Runtime) ReceiveDelivery(ctx context.Context, request contract.ReceiveDeliveryRequest) (contract.DeliveryReceipt, error) {
-	return r.owner.ReceiveDelivery(ctx, request)
+	var receipt contract.DeliveryReceipt
+	err := r.attempts.RunOtherCommand(ctx, request.CommandID, func() error {
+		var callErr error
+		receipt, callErr = r.owner.ReceiveDelivery(ctx, request)
+		return callErr
+	})
+	return receipt, err
 }
 
 func (r *Runtime) EvaluateOrder(ctx context.Context, request contract.EvaluateOrderRequest) (contract.OrderEvaluation, error) {
@@ -53,7 +93,11 @@ func (r *Runtime) EvaluateMenu(ctx context.Context) (contract.MenuEvaluation, er
 }
 
 func (r *Runtime) CommitAcceptedOrder(ctx context.Context, request contract.CommitOrderRequest) (contract.CommitResult, error) {
-	return r.owner.CommitAcceptedOrder(ctx, request)
+	return r.attempts.CommitAcceptedOrder(ctx, request)
+}
+
+func (r *Runtime) FindOrderAttempt(ctx context.Context, commandID, proposalID string) (contract.OrderAttempt, error) {
+	return r.attempts.FindOrderAttempt(ctx, commandID, proposalID)
 }
 
 func (r *Runtime) ProcessDueExpirations(ctx context.Context) ([]contract.ExpiryResult, error) {
@@ -61,7 +105,13 @@ func (r *Runtime) ProcessDueExpirations(ctx context.Context) ([]contract.ExpiryR
 }
 
 func (r *Runtime) ExpireBatch(ctx context.Context, request contract.ExpireBatchRequest) (contract.ExpiryResult, error) {
-	return r.owner.ExpireBatch(ctx, request)
+	var result contract.ExpiryResult
+	err := r.attempts.RunOtherCommand(ctx, request.CommandID, func() error {
+		var callErr error
+		result, callErr = r.owner.ExpireBatch(ctx, request)
+		return callErr
+	})
+	return result, err
 }
 
 func (r *Runtime) GetInventory(ctx context.Context) (contract.InventoryView, error) {

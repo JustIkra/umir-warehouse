@@ -7,12 +7,40 @@ type CommitResultKind string
 const (
 	CommitResultOrderCommitted  CommitResultKind = "OrderCommitted"
 	CommitResultRecheckRequired CommitResultKind = "RecheckRequired"
+	CommitResultPending         CommitResultKind = "Pending"
 )
 
 type CommitResult struct {
 	Kind       CommitResultKind
 	Order      *Order
 	Evaluation *OrderEvaluation
+}
+
+type OrderAttemptState string
+
+const (
+	OrderAttemptUnseen    OrderAttemptState = "Unseen"
+	OrderAttemptPending   OrderAttemptState = "Pending"
+	OrderAttemptCompleted OrderAttemptState = "Completed"
+	OrderAttemptRejected  OrderAttemptState = "Rejected"
+)
+
+type ErrorOutcome string
+
+const (
+	OutcomeNotCommitted ErrorOutcome = "not_committed"
+)
+
+type OrderAttemptError struct {
+	Code    string
+	Message string
+	Outcome ErrorOutcome
+}
+
+type OrderAttempt struct {
+	State  OrderAttemptState
+	Result *CommitResult
+	Error  *OrderAttemptError
 }
 
 type DeliveryReceipt struct {

@@ -7,13 +7,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/JustIkra/umir-warehouse/bootstrap"
 	"github.com/JustIkra/umir-warehouse/internal/application"
 )
 
@@ -57,9 +60,13 @@ func TestHealthHandlerLogsResponseWriteFailure(t *testing.T) {
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(previousWriter) })
 
-	app, err := handler()
+	runtime, err := bootstrap.NewInMemory(bootstrap.Options{Now: time.Now, NewID: func() string { return "id" }, EventsPerSnapshot: 1})
 	if err != nil {
-		t.Fatalf("handler() error = %v", err)
+		t.Fatalf("NewInMemory() error = %v", err)
+	}
+	app, _, err := bootstrap.NewHTTPHandlers(runtime, bootstrap.HTTPOptions{RequestTimeout: time.Second, MaxRequestBytes: 1024})
+	if err != nil {
+		t.Fatalf("NewHTTPHandlers() error = %v", err)
 	}
 	app.ServeHTTP(&failingResponseWriter{header: make(http.Header), err: writeErr}, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 
@@ -102,7 +109,7 @@ func TestLoadConfigDefaultsAndPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
 	}
-	if cfg.port != "8080" || cfg.eventsPerSnapshot != 100 || cfg.expirationCheckInterval != time.Second {
+	if cfg.port != "8080" || cfg.internalPort != "8082" || cfg.requestTimeout != 8*time.Second || cfg.maxRequestBytes != 1<<20 || cfg.eventsPerSnapshot != 100 || cfg.expirationCheckInterval != time.Second {
 		t.Fatalf("loadConfig() = %#v; want defaults", cfg)
 	}
 
@@ -130,6 +137,13 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{name: "zero interval", key: "EXPIRATION_CHECK_INTERVAL", value: "0s"},
 		{name: "negative interval", key: "EXPIRATION_CHECK_INTERVAL", value: "-1s"},
 		{name: "invalid interval", key: "EXPIRATION_CHECK_INTERVAL", value: "soon"},
+		{name: "same listeners", key: "INTERNAL_PORT", value: "8080"},
+		{name: "same listeners with leading zero", key: "INTERNAL_PORT", value: "08080"},
+		{name: "invalid port", key: "PORT", value: "70000"},
+		{name: "zero request timeout", key: "REQUEST_TIMEOUT", value: "0s"},
+		{name: "invalid request timeout", key: "REQUEST_TIMEOUT", value: "soon"},
+		{name: "zero body limit", key: "MAX_REQUEST_BYTES", value: "0"},
+		{name: "too large body limit", key: "MAX_REQUEST_BYTES", value: "67108865"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -143,6 +157,67 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 				t.Fatalf("loadConfig() error = %v; want error naming %s", err, tt.key)
 			}
 		})
+	}
+}
+
+func TestServeListenersOwnsBothListenersUntilShutdown(t *testing.T) {
+	publicPort := freePort(t)
+	internalPort := freePort(t)
+	app := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	publicServer := newHTTPServer(publicPort, app, time.Second)
+	internalServer := newHTTPServer(internalPort, app, time.Second)
+	served := make(chan error, 1)
+	go func() { served <- serveListeners(publicServer, internalServer) }()
+	client := &http.Client{Timeout: time.Second}
+	for _, address := range []string{"http://127.0.0.1:" + publicPort, "http://127.0.0.1:" + internalPort} {
+		waitForHTTP(t, client, address)
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := errors.Join(publicServer.Shutdown(shutdownCtx), internalServer.Shutdown(shutdownCtx)); err != nil {
+		t.Fatalf("Shutdown() = %v", err)
+	}
+	if err := <-served; !errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("serveListeners() = %v, want ErrServerClosed", err)
+	}
+}
+
+func freePort(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener address has type %T, want *net.TCPAddr", listener.Addr())
+	}
+	port := strconv.Itoa(address.Port)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return port
+}
+
+func waitForHTTP(t *testing.T, client *http.Client, address string) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		response, err := client.Get(address)
+		if err == nil {
+			if closeErr := response.Body.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("listener %s did not start: %v", address, err)
+		case <-ticker.C:
+		}
 	}
 }
 

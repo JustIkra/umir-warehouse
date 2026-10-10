@@ -119,6 +119,10 @@ func TestRuntimeDelegatesWarehouseOperations(t *testing.T) {
 	if err != nil || product.ProductID != "milk" {
 		t.Fatalf("RegisterProduct() = %+v, %v", product, err)
 	}
+	productRetry, err := runtime.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "command-product", ProductID: "milk", Name: "Milk", BaseUnit: contract.BaseUnitML})
+	if err != nil || productRetry != product {
+		t.Fatalf("exact RegisterProduct retry = (%+v, %v), want original product", productRetry, err)
+	}
 	dish, err := runtime.DefineDish(ctx, contract.DefineDishRequest{CommandID: "command-dish", DishID: "soup", Name: "Soup", Ingredients: []contract.Ingredient{{ProductID: "milk", Quantity: 1000}}})
 	if err != nil || dish.DishID != "soup" {
 		t.Fatalf("DefineDish() = %+v, %v", dish, err)
@@ -133,6 +137,10 @@ func TestRuntimeDelegatesWarehouseOperations(t *testing.T) {
 	})
 	if err != nil || receipt.DeliveryID != "delivery-1" || len(receipt.BatchIDs) != 1 {
 		t.Fatalf("ReceiveDelivery() = %+v, %v", receipt, err)
+	}
+	receiptRetry, err := runtime.ReceiveDelivery(ctx, contract.ReceiveDeliveryRequest{CommandID: "command-delivery", DeliveryID: "delivery-1", Number: "D-1", CreatedAt: createdAt, Lines: []contract.DeliveryLine{{ProductID: "milk", ManufacturedAt: now.Add(-24 * time.Hour), ShelfLife: contract.ShelfLife{Value: 2, Unit: contract.ShelfLifeDay}, ReceivedAt: now, Quantity: 3000}}})
+	if err != nil || receiptRetry.DeliveryID != receipt.DeliveryID || len(receiptRetry.BatchIDs) != len(receipt.BatchIDs) || receiptRetry.BatchIDs[0] != receipt.BatchIDs[0] {
+		t.Fatalf("exact ReceiveDelivery retry = (%+v, %v), want original receipt", receiptRetry, err)
 	}
 	orderEvaluation, err := runtime.EvaluateOrder(ctx, contract.EvaluateOrderRequest{Positions: []contract.Position{{LineNo: 7, DishID: "soup", Portions: 1}}})
 	if err != nil || len(orderEvaluation.AcceptedPositions) != 1 {
@@ -184,6 +192,118 @@ func TestRuntimeDelegatesWarehouseOperations(t *testing.T) {
 	}
 	if ran, err := runtime.RunSnapshotOnce(ctx); err != nil || !ran {
 		t.Fatalf("RunSnapshotOnce() = %v, %v", ran, err)
+	}
+}
+
+func TestRuntimeCachesRecheckBeforeOwnerAndBindsCommandIDGlobally(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
+	nextID := 0
+	runtime, err := NewInMemory(Options{
+		Now: func() time.Time { return now },
+		NewID: func() string {
+			nextID++
+			return fmt.Sprintf("event-%d", nextID)
+		},
+		EventsPerSnapshot: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product", ProductID: "p1", Name: "Milk", BaseUnit: contract.BaseUnitML}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runtime.DefineDish(ctx, contract.DefineDishRequest{CommandID: "dish", DishID: "d1", Name: "Soup", Ingredients: []contract.Ingredient{{ProductID: "p1", Quantity: 1000}}}); err != nil {
+		t.Fatal(err)
+	}
+	request := contract.CommitOrderRequest{CommandID: "same-command", ProposalID: "proposal-1", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "d1", Portions: 2}}}
+	first, err := runtime.CommitAcceptedOrder(ctx, request)
+	if err != nil || first.Kind != contract.CommitResultRecheckRequired {
+		t.Fatalf("initial commit = (%+v, %v), want RecheckRequired", first, err)
+	}
+	if _, err := runtime.ReceiveDelivery(ctx, contract.ReceiveDeliveryRequest{
+		CommandID:  "delivery",
+		DeliveryID: "delivery-1",
+		Number:     "D-1",
+		CreatedAt:  now,
+		Lines:      []contract.DeliveryLine{{ProductID: "p1", ManufacturedAt: now.Add(-time.Hour), ShelfLife: contract.ShelfLife{Value: 2, Unit: contract.ShelfLifeDay}, ReceivedAt: now, Quantity: 10000}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := runtime.CommitAcceptedOrder(ctx, request)
+	if err != nil || replay.Kind != contract.CommitResultRecheckRequired || replay.Evaluation.StateVersion != first.Evaluation.StateVersion {
+		t.Fatalf("late retry = (%+v, %v), want cached original evaluation", replay, err)
+	}
+	attempt, err := runtime.FindOrderAttempt(ctx, request.CommandID, request.ProposalID)
+	if err != nil || attempt.State != contract.OrderAttemptCompleted || attempt.Result == nil || attempt.Result.Kind != contract.CommitResultRecheckRequired {
+		t.Fatalf("attempt lookup = (%+v, %v), want Completed/RecheckRequired", attempt, err)
+	}
+	_, err = runtime.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: request.CommandID, ProductID: "p2", Name: "Butter", BaseUnit: contract.BaseUnitG})
+	if !errors.Is(err, contract.ErrCommandIdentityConflict) {
+		t.Fatalf("reuse in catalog command = %v, want identity conflict", err)
+	}
+	inventory, err := runtime.GetInventory(ctx)
+	if err != nil || len(inventory.Products) != 1 || inventory.Products[0].Quantity != 10000 {
+		t.Fatalf("late retry changed inventory = (%+v, %v)", inventory, err)
+	}
+}
+
+func TestForeignRecordedCommandConflictDoesNotPoisonItsExactRetry(t *testing.T) {
+	ctx := context.Background()
+	runtime, err := NewInMemory(Options{Now: time.Now, NewID: func() string { return "event" }, EventsPerSnapshot: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	request := contract.RegisterProductRequest{CommandID: "shared-id", ProductID: "p1", Name: "Milk", BaseUnit: contract.BaseUnitML}
+	product, err := runtime.RegisterProduct(ctx, request)
+	if err != nil || product.ProductID != request.ProductID {
+		t.Fatalf("RegisterProduct() = (%+v, %v)", product, err)
+	}
+	_, err = runtime.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: request.CommandID, ProposalID: "proposal-1", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "d1", Portions: 1}}})
+	if !errors.Is(err, contract.ErrCommandIdentityConflict) {
+		t.Fatalf("foreign commit error = %v, want identity conflict", err)
+	}
+	replay, err := runtime.RegisterProduct(ctx, request)
+	if err != nil || replay != product {
+		t.Fatalf("exact catalog retry = (%+v, %v), want original product", replay, err)
+	}
+	_, err = runtime.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: request.CommandID, ProposalID: "proposal-1", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "d1", Portions: 1}}})
+	if !errors.Is(err, contract.ErrCommandIdentityConflict) {
+		t.Fatalf("second foreign commit error = %v, want identity conflict", err)
+	}
+}
+
+func TestRuntimeRetainsDefiniteRefusalAndPreventsOtherCommandReuse(t *testing.T) {
+	ctx := context.Background()
+	runtime, err := NewInMemory(Options{Now: time.Now, NewID: func() string { return "event" }, EventsPerSnapshot: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	request := contract.CommitOrderRequest{CommandID: "refused-id", ProposalID: "p1", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "missing-dish", Portions: 1}}}
+	_, firstErr := runtime.CommitAcceptedOrder(ctx, request)
+	if !errors.Is(firstErr, contract.ErrDishNotFound) {
+		t.Fatalf("first commit error = %v", firstErr)
+	}
+	_, replayErr := runtime.CommitAcceptedOrder(ctx, request)
+	if !errors.Is(replayErr, contract.ErrDishNotFound) {
+		t.Fatalf("retry error = %v", replayErr)
+	}
+	attempt, err := runtime.FindOrderAttempt(ctx, request.CommandID, request.ProposalID)
+	if err != nil || attempt.State != contract.OrderAttemptRejected || attempt.Error == nil || attempt.Error.Outcome != contract.OutcomeNotCommitted {
+		t.Fatalf("attempt = (%+v, %v), want Rejected/not_committed", attempt, err)
+	}
+	_, err = runtime.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: request.CommandID, ProductID: "new-product", Name: "Milk", BaseUnit: contract.BaseUnitML})
+	if !errors.Is(err, contract.ErrCommandIdentityConflict) {
+		t.Fatalf("reusing refusal ID in catalog = %v", err)
 	}
 }
 
