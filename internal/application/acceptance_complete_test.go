@@ -167,6 +167,111 @@ func TestAcceptanceConcurrentDuplicateDeliverySurvivesRecovery(t *testing.T) {
 	}
 }
 
+func TestAcceptanceConcurrentDuplicateDeliveryAcrossOwners(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	setup, base, _ := newCatalogOwner(t, now)
+	if _, err := setup.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "register-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	barrier := &acceptanceConcurrentAppendBarrierStore{EventStore: base, arrivals: make(chan domain.CommandBatch, 2), release: make(chan struct{}), seen: make(map[string]bool)}
+	ownerA, err := NewOwner(barrier, func() time.Time { return now }, prefixedAcceptanceID("owner-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerB, err := NewOwner(barrier, func() time.Time { return now }, prefixedAcceptanceID("owner-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestA := validDeliveryRequest("cross-owner-command-a", "shared-delivery", now)
+	requestB := requestA
+	requestB.CommandID = "cross-owner-command-b"
+	type outcome struct {
+		command string
+		err     error
+	}
+	results := make(chan outcome, 2)
+	go func() {
+		_, err := ownerA.ReceiveDelivery(ctx, requestA)
+		results <- outcome{command: requestA.CommandID, err: err}
+	}()
+	go func() {
+		_, err := ownerB.ReceiveDelivery(ctx, requestB)
+		results <- outcome{command: requestB.CommandID, err: err}
+	}()
+	releaseBoth := sync.OnceFunc(func() { close(barrier.release) })
+	defer releaseBoth()
+	first := receiveAcceptanceAppend(t, barrier.arrivals)
+	second := receiveAcceptanceAppend(t, barrier.arrivals)
+	if first.ExpectedVersion != second.ExpectedVersion || first.ExpectedVersion != 1 || first.CommandID == second.CommandID {
+		t.Fatalf("first append attempts = (%s, version %d), (%s, version %d); want distinct commands at shared version 1", first.CommandID, first.ExpectedVersion, second.CommandID, second.ExpectedVersion)
+	}
+	releaseBoth()
+	var accepted, duplicate string
+	for range 2 {
+		result := <-results
+		switch {
+		case result.err == nil:
+			accepted = result.command
+		case errors.Is(result.err, contract.ErrDeliveryAlreadyReceived):
+			duplicate = result.command
+		default:
+			t.Fatalf("cross-owner command %q error = %v; want one success and one DeliveryAlreadyReceived", result.command, result.err)
+		}
+	}
+	if accepted == "" || duplicate == "" {
+		t.Fatalf("cross-owner accepted/duplicate commands = %q/%q; want one each", accepted, duplicate)
+	}
+	barrier.mu.Lock()
+	conflicts := barrier.conflicts
+	barrier.mu.Unlock()
+	if conflicts != 1 {
+		t.Fatalf("shared EventStore concurrent-modification results = %d; want exactly one conflict", conflicts)
+	}
+	versionBeforeRetry, err := base.Version(ctx)
+	if err != nil || versionBeforeRetry != 2 {
+		t.Fatalf("journal version after cross-owner race = %d, %v; want one delivery append after registration", versionBeforeRetry, err)
+	}
+	batches, err := base.ReadBatches(ctx, 0)
+	if err != nil || len(batches) != 2 || batches[1].CommandType != "ReceiveDelivery" || len(batches[1].Events) != 1 {
+		t.Fatalf("journal after cross-owner race = %#v, %v; want registration and one receipt batch", batches, err)
+	}
+	recovered, err := NewOwner(base, func() time.Time { return now }, prefixedAcceptanceID("owner-recovered"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recovered.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	loser := requestA
+	if duplicate == requestB.CommandID {
+		loser = requestB
+	}
+	if _, err := recovered.ReceiveDelivery(ctx, loser); !errors.Is(err, contract.ErrDeliveryAlreadyReceived) {
+		t.Fatalf("recovered losing command retry = %v; want DeliveryAlreadyReceived", err)
+	}
+	versionAfterRetry, err := base.Version(ctx)
+	if err != nil || versionAfterRetry != versionBeforeRetry || len(recovered.state.Deliveries) != 1 || len(recovered.state.Batches) != 1 {
+		t.Fatalf("journal/projection after recovered loser retry = version %d, deliveries %d, batches %d, err %v; want unchanged single delivery", versionAfterRetry, len(recovered.state.Deliveries), len(recovered.state.Batches), err)
+	}
+	for batchID, batch := range recovered.state.Batches {
+		if batch.RemainingQuantity != 1000 {
+			t.Fatalf("recovered stock for %s = %d; want one 1000-unit delivery without growth", batchID, batch.RemainingQuantity)
+		}
+	}
+}
+
+func receiveAcceptanceAppend(t *testing.T, arrivals <-chan domain.CommandBatch) domain.CommandBatch {
+	t.Helper()
+	select {
+	case batch := <-arrivals:
+		return batch
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent ReceiveDelivery did not reach the append barrier")
+		return domain.CommandBatch{}
+	}
+}
+
 func TestAcceptanceConsumedBatchLeavesNoExpiryTask(t *testing.T) {
 	dueAt := moscowTime(2026, time.April, 2, 10)
 	owner, store, _ := newSeededOwner(t, dueAt, 10000, 10000)
@@ -661,6 +766,50 @@ type acceptanceUnknownExpiryStore struct {
 	mu         sync.Mutex
 	failLookup bool
 	unknown    bool
+}
+
+type acceptanceConcurrentAppendBarrierStore struct {
+	EventStore
+	mu        sync.Mutex
+	arrivals  chan domain.CommandBatch
+	release   chan struct{}
+	seen      map[string]bool
+	conflicts int
+}
+
+func (s *acceptanceConcurrentAppendBarrierStore) AppendBatch(ctx context.Context, batch domain.CommandBatch) (domain.AppendResult, error) {
+	block := false
+	if batch.CommandType == "ReceiveDelivery" {
+		s.mu.Lock()
+		if !s.seen[batch.CommandID] {
+			s.seen[batch.CommandID] = true
+			block = true
+		}
+		s.mu.Unlock()
+	}
+	if block {
+		s.arrivals <- *cloneCommandBatch(batch)
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return domain.AppendResult{}, ctx.Err()
+		}
+	}
+	result, err := s.EventStore.AppendBatch(ctx, batch)
+	if errors.Is(err, domain.ErrConcurrentModification) {
+		s.mu.Lock()
+		s.conflicts++
+		s.mu.Unlock()
+	}
+	return result, err
+}
+
+func prefixedAcceptanceID(prefix string) func() string {
+	var next int
+	return func() string {
+		next++
+		return fmt.Sprintf("%s-%d", prefix, next)
+	}
 }
 
 func (s *acceptanceUnknownExpiryStore) AppendBatch(ctx context.Context, batch domain.CommandBatch) (domain.AppendResult, error) {
