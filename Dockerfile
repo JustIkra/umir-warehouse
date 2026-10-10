@@ -3,6 +3,9 @@ FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS build
 WORKDIR /app
 COPY go.mod ./
 RUN go mod download
+COPY contract ./contract
+COPY bootstrap ./bootstrap
+COPY internal ./internal
 COPY cmd ./cmd
 ARG TARGETOS
 ARG TARGETARCH
