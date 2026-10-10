@@ -13,22 +13,32 @@ import (
 
 func TestSnapshotRecoveryMatchesFullReplayAndProcessesDueBatch(t *testing.T) {
 	dueAt := moscowTime(2026, time.April, 2, 10)
-	makeStore := func() *memory.EventStore {
-		store := seedStore(t, dueAt, 10000, 0)
-		at := moscowTime(2026, time.April, 1, 10)
-		appendFixture(t, context.Background(), store, "register-extra", "RegisterProduct", domain.Event{EventID: "event-extra", RecordedAt: at, Type: domain.EventProductRegistered, Payload: domain.EventPayload{Product: &domain.Product{ProductID: "extra", Name: "Extra", BaseUnit: domain.BaseUnitG}}})
-		return store
-	}
-	fullStore := makeStore()
-	snapshotStore := makeStore()
+	fullStore := seedStore(t, dueAt, 10000, 0)
+	snapshotStore := seedStore(t, dueAt, 10000, 0)
+	snapshots := memory.NewSnapshotStore()
 	seedOwner, err := NewOwner(snapshotStore, func() time.Time { return moscowTime(2026, time.April, 1, 10) }, nextTestID())
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seedOwner.ConfigureSnapshots(snapshots, 2); err != nil {
 		t.Fatal(err)
 	}
 	if err := seedOwner.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	candidate := snapshotFor(seedOwner.state)
+	if worked, err := seedOwner.RunSnapshotOnce(context.Background()); err != nil || !worked {
+		t.Fatalf("save initial snapshot = %v, %v; want saved checkpoint before suffix", worked, err)
+	}
+	candidate, found, err := snapshots.LoadLatest(context.Background())
+	if err != nil || !found {
+		t.Fatalf("load pre-suffix checkpoint: found %v, err %v", found, err)
+	}
+	appendSuffix := func(store *memory.EventStore) {
+		at := moscowTime(2026, time.April, 1, 10)
+		appendFixture(t, context.Background(), store, "register-extra", "RegisterProduct", domain.Event{EventID: "event-extra", RecordedAt: at, Type: domain.EventProductRegistered, Payload: domain.EventPayload{Product: &domain.Product{ProductID: "extra", Name: "Extra", BaseUnit: domain.BaseUnitG}}})
+	}
+	appendSuffix(fullStore)
+	appendSuffix(snapshotStore)
 	fullOwner, err := NewOwner(fullStore, func() time.Time { return dueAt }, nextTestID())
 	if err != nil {
 		t.Fatal(err)
@@ -37,8 +47,23 @@ func TestSnapshotRecoveryMatchesFullReplayAndProcessesDueBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fastOwner.ConfigureSnapshots(&fixedSnapshotStore{snapshot: candidate, found: true}, 2); err != nil {
+	if err := fastOwner.ConfigureSnapshots(snapshots, 2); err != nil {
 		t.Fatal(err)
+	}
+	if err := fullOwner.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := fastOwner.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fastOwner.lastSavedSequence != candidate.LastSequence {
+		t.Fatalf("accepted snapshot sequence = %d; candidate sequence %d was not selected", fastOwner.lastSavedSequence, candidate.LastSequence)
+	}
+	if fastOwner.state.StateVersion != candidate.LastSequence+1 || fastOwner.state.Products["extra"].ProductID != "extra" {
+		t.Fatalf("suffix result = sequence %d, product %#v; want suffix applied after snapshot %d", fastOwner.state.StateVersion, fastOwner.state.Products["extra"], candidate.LastSequence)
+	}
+	if !reflect.DeepEqual(fullOwner.state, fastOwner.state) || !reflect.DeepEqual(fullOwner.expirations, fastOwner.expirations) {
+		t.Fatalf("snapshot-plus-suffix recovery differs before due processing\nfull: %#v / %#v\nsnapshot: %#v / %#v", fullOwner.state, fullOwner.expirations, fastOwner.state, fastOwner.expirations)
 	}
 	if _, err := fullOwner.Prepare(context.Background()); err != nil {
 		t.Fatal(err)
@@ -86,7 +111,7 @@ func TestSnapshotPrefixMismatchFallsBackToFullReplay(t *testing.T) {
 }
 
 func TestInvalidSnapshotCandidatesFallBackToFullReplay(t *testing.T) {
-	store := seedStore(t, moscowTime(2026, time.April, 4, 10), 10000, 0)
+	store := storeWithCompoundDeliveryExpiry(t)
 	seedOwner, err := NewOwner(store, func() time.Time { return moscowTime(2026, time.April, 1, 10) }, nextTestID())
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +127,7 @@ func TestInvalidSnapshotCandidatesFallBackToFullReplay(t *testing.T) {
 		{name: "schema", edit: func(s *domain.Snapshot) { s.SchemaVersion++ }},
 		{name: "stream", edit: func(s *domain.Snapshot) { s.StreamID = "other" }},
 		{name: "above journal", edit: func(s *domain.Snapshot) { s.LastSequence++; s.State.StateVersion++ }},
-		{name: "non boundary", edit: func(s *domain.Snapshot) { s.LastSequence = 2; s.State.StateVersion = 2 }},
+		{name: "non boundary", edit: func(s *domain.Snapshot) { s.LastSequence = 3; s.State.StateVersion = 3 }},
 		{name: "broken reference", edit: func(s *domain.Snapshot) { delete(s.State.Products, "p") }},
 	}
 	for _, test := range tests {
@@ -119,8 +144,8 @@ func TestInvalidSnapshotCandidatesFallBackToFullReplay(t *testing.T) {
 			if err := owner.Recover(context.Background()); err != nil {
 				t.Fatalf("Recover() with unusable candidate = %v; want full replay fallback", err)
 			}
-			if owner.state.StateVersion != 3 || owner.state.Products["p"].ProductID != "p" {
-				t.Fatalf("recovered state = version %d, product %#v; want journal version 3", owner.state.StateVersion, owner.state.Products["p"])
+			if owner.state.StateVersion != 4 || owner.state.Products["product"].ProductID != "product" {
+				t.Fatalf("recovered state = version %d, product %#v; want journal version 4", owner.state.StateVersion, owner.state.Products["product"])
 			}
 		})
 	}

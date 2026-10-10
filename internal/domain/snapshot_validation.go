@@ -18,6 +18,118 @@ func ValidateSnapshot(snapshot Snapshot) error {
 	return ValidateInventoryState(snapshot.State)
 }
 
+func ValidateSnapshotPrefix(snapshot Snapshot, batches []RecordedBatch) error {
+	if err := ValidateSnapshot(snapshot); err != nil {
+		return err
+	}
+	state := InventoryState{}
+	boundary := snapshot.LastSequence == 0
+	for _, batch := range batches {
+		if batch.FinalSequence > snapshot.LastSequence {
+			break
+		}
+		next, err := ApplyRecordedBatch(state, batch)
+		if err != nil {
+			return err
+		}
+		state = next
+		boundary = batch.FinalSequence == snapshot.LastSequence
+	}
+	if !boundary || state.StateVersion != snapshot.LastSequence || !equalInventoryState(state, snapshot.State) {
+		return ErrInvalidSnapshot
+	}
+	return nil
+}
+
+func equalInventoryState(a, b InventoryState) bool {
+	if a.StateVersion != b.StateVersion || len(a.Products) != len(b.Products) || len(a.Dishes) != len(b.Dishes) || len(a.Deliveries) != len(b.Deliveries) || len(a.Batches) != len(b.Batches) || len(a.Orders) != len(b.Orders) || len(a.OrdersByProposal) != len(b.OrdersByProposal) || len(a.Commands) != len(b.Commands) {
+		return false
+	}
+	for id, value := range a.Products {
+		other, exists := b.Products[id]
+		if !exists || !equalProduct(value, other) {
+			return false
+		}
+	}
+	for id, value := range a.Dishes {
+		other, exists := b.Dishes[id]
+		if !exists || !equalDish(value, other) {
+			return false
+		}
+	}
+	for id, value := range a.Deliveries {
+		other, exists := b.Deliveries[id]
+		if !exists || !equalDelivery(value, other) {
+			return false
+		}
+	}
+	for id, value := range a.Batches {
+		other, exists := b.Batches[id]
+		if !exists || !equalBatch(value, other) {
+			return false
+		}
+	}
+	for id, value := range a.Orders {
+		other, exists := b.Orders[id]
+		if !exists || !equalOrder(value, other) {
+			return false
+		}
+	}
+	for id, value := range a.OrdersByProposal {
+		if other, exists := b.OrdersByProposal[id]; !exists || other != value {
+			return false
+		}
+	}
+	for id, value := range a.Commands {
+		other, exists := b.Commands[id]
+		if !exists || value.CommandID != other.CommandID || value.CommandType != other.CommandType || value.CommandFingerprint != other.CommandFingerprint || !equalCommandResult(value.Result, other.Result) {
+			return false
+		}
+	}
+	return true
+}
+
+func equalDelivery(a, b Delivery) bool {
+	if a.DeliveryID != b.DeliveryID || a.Number != b.Number || !a.CreatedAt.Equal(b.CreatedAt) || len(a.Lines) != len(b.Lines) {
+		return false
+	}
+	for i := range a.Lines {
+		x, y := a.Lines[i], b.Lines[i]
+		if x.ProductID != y.ProductID || !x.ManufacturedAt.Equal(y.ManufacturedAt) || x.ShelfLife != y.ShelfLife || !x.ReceivedAt.Equal(y.ReceivedAt) || x.Quantity != y.Quantity {
+			return false
+		}
+	}
+	return true
+}
+
+func equalBatch(a, b Batch) bool {
+	return a.BatchID == b.BatchID && a.DeliveryID == b.DeliveryID && a.LineNo == b.LineNo && a.ProductID == b.ProductID && a.ManufacturedAt.Equal(b.ManufacturedAt) && a.ShelfLife == b.ShelfLife && a.ReceivedAt.Equal(b.ReceivedAt) && a.ExpiresAt.Equal(b.ExpiresAt) && a.ReceivedQuantity == b.ReceivedQuantity && a.RemainingQuantity == b.RemainingQuantity && a.ConsumedByOrders == b.ConsumedByOrders && a.WrittenOffForExpiry == b.WrittenOffForExpiry
+}
+
+func equalCommandResult(a, b CommandResult) bool {
+	if a.Kind != b.Kind || (a.Product == nil) != (b.Product == nil) || (a.Dish == nil) != (b.Dish == nil) || (a.Delivery == nil) != (b.Delivery == nil) || (a.Order == nil) != (b.Order == nil) || (a.Expiry == nil) != (b.Expiry == nil) {
+		return false
+	}
+	if a.Product != nil && !equalProduct(*a.Product, *b.Product) || a.Dish != nil && !equalDish(*a.Dish, *b.Dish) || a.Order != nil && !equalOrder(*a.Order, *b.Order) {
+		return false
+	}
+	if a.Delivery != nil {
+		if a.Delivery.DeliveryID != b.Delivery.DeliveryID || len(a.Delivery.BatchIDs) != len(b.Delivery.BatchIDs) {
+			return false
+		}
+		for i := range a.Delivery.BatchIDs {
+			if a.Delivery.BatchIDs[i] != b.Delivery.BatchIDs[i] {
+				return false
+			}
+		}
+	}
+	return a.Expiry == nil || equalExpiry(*a.Expiry, *b.Expiry)
+}
+
+func equalExpiry(a, b ExpiryResult) bool {
+	return a.BatchID == b.BatchID && a.ProductID == b.ProductID && a.WrittenOffQuantity == b.WrittenOffQuantity && a.Reason == b.Reason && a.ExpiresAt.Equal(b.ExpiresAt) && a.ProcessedAt.Equal(b.ProcessedAt)
+}
+
 func ValidateInventoryState(state InventoryState) error {
 	if state.StateVersion < 0 || state.StateVersion > 0 && len(state.Commands) == 0 {
 		return ErrInvalidSnapshot

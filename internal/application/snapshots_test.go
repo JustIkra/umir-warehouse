@@ -13,7 +13,7 @@ import (
 )
 
 func TestSnapshotFullCommandBoundary(t *testing.T) {
-	store := seedStore(t, moscowTime(2026, time.April, 2, 10), 10000, 0)
+	store := storeWithCompoundDeliveryExpiry(t)
 	snapshots := memory.NewSnapshotStore()
 	owner, err := NewOwner(store, func() time.Time { return moscowTime(2026, time.April, 1, 10) }, nextTestID())
 	if err != nil {
@@ -32,14 +32,27 @@ func TestSnapshotFullCommandBoundary(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("LoadLatest() = found %v, err %v", found, err)
 	}
-	if snapshot.LastSequence != 3 || snapshot.LastSequence != snapshot.State.StateVersion {
-		t.Fatalf("snapshot sequence/state version = %d/%d; want full command boundary 3", snapshot.LastSequence, snapshot.State.StateVersion)
+	if snapshot.LastSequence != 4 || snapshot.LastSequence != snapshot.State.StateVersion {
+		t.Fatalf("snapshot sequence/state version = %d/%d; want final sequence 4 of compound command", snapshot.LastSequence, snapshot.State.StateVersion)
 	}
 	owner.mu.Lock()
 	lastSaved := owner.lastSavedSequence
 	owner.mu.Unlock()
-	if lastSaved != 3 {
-		t.Fatalf("confirmed saved sequence = %d; want monotonic acknowledgment 3", lastSaved)
+	if lastSaved != 4 {
+		t.Fatalf("confirmed saved sequence = %d; want monotonic acknowledgment 4", lastSaved)
+	}
+	batches, err := store.ReadBatches(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batches[1].FinalSequence != 4 || len(batches[1].Events) != 3 {
+		t.Fatalf("delivery command = %d events ending at %d; want one three-event compound command", len(batches[1].Events), batches[1].FinalSequence)
+	}
+	inside := domain.CloneSnapshot(snapshot)
+	inside.LastSequence = 3
+	inside.State.StateVersion = 3
+	if err := auditSnapshotPrefix(inside, batches); err == nil {
+		t.Fatal("snapshot candidate at sequence 3 inside the compound command was accepted")
 	}
 }
 
@@ -207,4 +220,34 @@ func emptySnapshot(sequence int64) domain.Snapshot {
 	product := domain.Product{ProductID: "p", Name: "Product", BaseUnit: domain.BaseUnitG}
 	record := domain.CommandRecord{CommandID: "c", CommandType: "RegisterProduct", CommandFingerprint: "fingerprint", Result: domain.CommandResult{Kind: domain.CommandResultProductRegistered, Product: &product}}
 	return domain.Snapshot{SchemaVersion: domain.InventorySchemaV1, StreamID: domain.InventoryStreamID, LastSequence: sequence, State: domain.InventoryState{Products: map[string]domain.Product{"p": product}, Dishes: map[string]domain.Dish{}, Deliveries: map[string]domain.Delivery{}, Batches: map[string]domain.Batch{}, Orders: map[string]domain.Order{}, OrdersByProposal: map[string]string{}, Commands: map[string]domain.CommandRecord{"c": record}, StateVersion: sequence}}
+}
+
+func storeWithCompoundDeliveryExpiry(t *testing.T) *memory.EventStore {
+	t.Helper()
+	ctx := context.Background()
+	store := memory.NewEventStore()
+	registeredAt := moscowTime(2026, time.March, 1, 12)
+	appendFixture(t, ctx, store, "register-product", "RegisterProduct", domain.Event{EventID: "product-event", RecordedAt: registeredAt, Type: domain.EventProductRegistered, Payload: domain.EventPayload{Product: &domain.Product{ProductID: "product", Name: "Product", BaseUnit: domain.BaseUnitG}}})
+	manufacturedAt := moscowTime(2026, time.February, 28, 12)
+	arrivalAt := moscowTime(2026, time.March, 1, 12)
+	processedAt := moscowTime(2026, time.March, 3, 12)
+	expiresAt := moscowTime(2026, time.March, 2, 12)
+	delivery := domain.Delivery{DeliveryID: "delivery", Number: "invoice", CreatedAt: arrivalAt, Lines: []domain.DeliveryLine{
+		{ProductID: "product", ManufacturedAt: manufacturedAt, ShelfLife: domain.ShelfLife{Value: 2, Unit: domain.ShelfLifeDay}, ReceivedAt: arrivalAt, Quantity: 1000},
+		{ProductID: "product", ManufacturedAt: manufacturedAt, ShelfLife: domain.ShelfLife{Value: 2, Unit: domain.ShelfLifeDay}, ReceivedAt: arrivalAt, Quantity: 2000},
+	}}
+	batches := []domain.Batch{
+		{BatchID: "batch-1", DeliveryID: "delivery", LineNo: 1, ProductID: "product", ManufacturedAt: manufacturedAt, ShelfLife: domain.ShelfLife{Value: 2, Unit: domain.ShelfLifeDay}, ReceivedAt: arrivalAt, ExpiresAt: expiresAt, ReceivedQuantity: 1000, RemainingQuantity: 1000},
+		{BatchID: "batch-2", DeliveryID: "delivery", LineNo: 2, ProductID: "product", ManufacturedAt: manufacturedAt, ShelfLife: domain.ShelfLife{Value: 2, Unit: domain.ShelfLifeDay}, ReceivedAt: arrivalAt, ExpiresAt: expiresAt, ReceivedQuantity: 2000, RemainingQuantity: 2000},
+	}
+	fingerprint := domain.Fingerprint("ReceiveDelivery", []byte("delivery"))
+	events := []domain.Event{
+		{EventID: "delivery-event", RecordedAt: processedAt, Type: domain.EventDeliveryReceived, Payload: domain.EventPayload{Delivery: &delivery, Batches: batches}},
+		{EventID: "expiry-event-1", RecordedAt: processedAt, Type: domain.EventBatchExpired, Payload: domain.EventPayload{Expiry: &domain.ExpiryResult{BatchID: "batch-1", ProductID: "product", WrittenOffQuantity: 1000, Reason: domain.ExpiryReasonExpiration, ExpiresAt: expiresAt, ProcessedAt: processedAt}}},
+		{EventID: "expiry-event-2", RecordedAt: processedAt, Type: domain.EventBatchExpired, Payload: domain.EventPayload{Expiry: &domain.ExpiryResult{BatchID: "batch-2", ProductID: "product", WrittenOffQuantity: 2000, Reason: domain.ExpiryReasonExpiration, ExpiresAt: expiresAt, ProcessedAt: processedAt}}},
+	}
+	if _, err := store.AppendBatch(ctx, domain.CommandBatch{ExpectedVersion: 1, CommandID: "receive-delivery", CommandType: "ReceiveDelivery", CommandFingerprint: fingerprint, Events: events}); err != nil {
+		t.Fatal(err)
+	}
+	return store
 }

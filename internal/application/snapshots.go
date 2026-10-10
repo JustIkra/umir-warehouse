@@ -81,9 +81,11 @@ func (w *SnapshotWorker) RunOnce(ctx context.Context) (bool, error) {
 
 func (w *SnapshotWorker) Run(ctx context.Context) error {
 	defer func() {
-		w.mu.Lock()
-		w.pending = nil
-		w.mu.Unlock()
+		if ctx.Err() != nil {
+			w.mu.Lock()
+			w.pending = nil
+			w.mu.Unlock()
+		}
 	}()
 	for {
 		if err := ctx.Err(); err != nil {
