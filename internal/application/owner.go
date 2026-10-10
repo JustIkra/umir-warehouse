@@ -13,14 +13,19 @@ import (
 var ErrNotDue = contract.ErrNotDue
 
 type Owner struct {
-	mu          sync.Mutex
-	events      EventStore
-	now         func() time.Time
-	newID       func() string
-	state       domain.InventoryState
-	expirations map[string]time.Time
-	usable      bool
-	pending     *domain.CommandBatch
+	mu                sync.Mutex
+	events            EventStore
+	now               func() time.Time
+	newID             func() string
+	state             domain.InventoryState
+	expirations       map[string]time.Time
+	usable            bool
+	pending           *domain.CommandBatch
+	started           bool
+	snapshotStore     SnapshotStore
+	snapshotWorker    *SnapshotWorker
+	snapshotEvery     int64
+	lastSavedSequence int64
 }
 
 type ReadState struct {
@@ -39,6 +44,7 @@ func NewOwner(events EventStore, now func() time.Time, newID func() string) (*Ow
 func (o *Owner) Recover(ctx context.Context) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	o.started = true
 	if err := o.recoverLocked(ctx); err != nil {
 		return inventoryUnavailable(err)
 	}
@@ -60,6 +66,7 @@ func (o *Owner) Recover(ctx context.Context) error {
 func (o *Owner) Prepare(ctx context.Context) (ReadState, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	o.started = true
 	state, _, err := o.prepareLocked(ctx)
 	if err != nil {
 		return ReadState{}, inventoryUnavailable(err)
