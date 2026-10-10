@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -24,18 +25,26 @@ func handler() (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "umir-warehouse"})
+		if err := json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "umir-warehouse"}); err != nil {
+			log.Printf("health response: %v", err)
+		}
 	})
 	return mux, nil
 }
 
 func healthcheck() error {
 	client := &http.Client{Timeout: 2 * time.Second}
-	response, err := client.Get("http://127.0.0.1:" + env("PORT", "8080") + "/healthz")
+	return healthcheckWithClient(client, "http://127.0.0.1:"+env("PORT", "8080")+"/healthz")
+}
+
+func healthcheckWithClient(client *http.Client, address string) (err error) {
+	response, err := client.Get(address)
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() {
+		err = errors.Join(err, response.Body.Close())
+	}()
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("health status: %d", response.StatusCode)
 	}

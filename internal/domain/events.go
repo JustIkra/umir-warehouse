@@ -127,11 +127,12 @@ var (
 )
 
 func Fingerprint(commandType string, normalizedInput []byte) string {
-	digest := sha256.New()
-	_, _ = digest.Write([]byte(commandType))
-	_, _ = digest.Write([]byte{0})
-	_, _ = digest.Write(normalizedInput)
-	return hex.EncodeToString(digest.Sum(nil))
+	input := make([]byte, 0, len(commandType)+1+len(normalizedInput))
+	input = append(input, commandType...)
+	input = append(input, 0)
+	input = append(input, normalizedInput...)
+	digest := sha256.Sum256(input)
+	return hex.EncodeToString(digest[:])
 }
 
 func CanonicalBusinessTime(value time.Time) time.Time {
