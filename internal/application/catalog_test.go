@@ -224,6 +224,101 @@ func TestDuplicateDeliveryID(t *testing.T) {
 	}
 }
 
+func TestDuplicateDeliveryIDPrecedesBodyValidation(t *testing.T) {
+	ctx := context.Background()
+	owner, _, _ := newCatalogOwner(t, moscowTime(2026, time.April, 2, 10))
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.ReceiveDelivery(ctx, validDeliveryRequest("delivery-cmd-1", "delivery-1", moscowTime(2026, time.April, 2, 9))); err != nil {
+		t.Fatal(err)
+	}
+	valid := validDeliveryRequest("unused", "delivery-1", moscowTime(2026, time.April, 2, 9))
+	requests := []contract.ReceiveDeliveryRequest{valid, valid, valid, valid}
+	requests[0].Number = ""
+	requests[1].Lines = nil
+	requests[2].CreatedAt = requests[2].CreatedAt.In(time.FixedZone("UTC", 0))
+	requests[3].CreatedAt = moscowTime(2026, time.April, 2, 11)
+	ids := []string{"duplicate-no-number", "duplicate-no-lines", "duplicate-wrong-offset", "duplicate-future-created"}
+	for index, request := range requests {
+		request.CommandID = ids[index]
+		if _, err := owner.ReceiveDelivery(ctx, request); !errors.Is(err, contract.ErrDeliveryAlreadyReceived) {
+			t.Fatalf("ReceiveDelivery(duplicate with invalid body %d) error = %v; want DeliveryAlreadyReceived", index, err)
+		}
+	}
+}
+
+func TestPendingExactRetriesReturnRecordedResults(t *testing.T) {
+	ctx := context.Background()
+	t.Run("product", func(t *testing.T) {
+		base := memory.NewEventStore()
+		store := &delayedCommitStore{EventStore: base, commandID: "product-p"}
+		owner := newOwnerForCatalogTest(t, store, moscowTime(2026, time.April, 2, 10))
+		request := contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}
+		if _, err := owner.RegisterProduct(ctx, request); !errors.Is(err, domain.ErrUnknownWriteOutcome) {
+			t.Fatalf("first RegisterProduct() error = %v; want unknown write", err)
+		}
+		got, err := owner.RegisterProduct(ctx, request)
+		if err != nil || got != (contract.Product{ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}) {
+			t.Fatalf("exact RegisterProduct retry = %#v, %v; want original product", got, err)
+		}
+	})
+	t.Run("dish", func(t *testing.T) {
+		base := memory.NewEventStore()
+		store := &delayedCommitStore{EventStore: base, commandID: "dish-d"}
+		owner := newOwnerForCatalogTest(t, store, moscowTime(2026, time.April, 2, 10))
+		if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+			t.Fatal(err)
+		}
+		request := contract.DefineDishRequest{CommandID: "dish-d", DishID: "d", Name: "Pear dish", Ingredients: []contract.Ingredient{{ProductID: "p", Quantity: 500}}}
+		if _, err := owner.DefineDish(ctx, request); !errors.Is(err, domain.ErrUnknownWriteOutcome) {
+			t.Fatalf("first DefineDish() error = %v; want unknown write", err)
+		}
+		got, err := owner.DefineDish(ctx, request)
+		want := contract.Dish{DishID: "d", Name: "Pear dish", Ingredients: []contract.Ingredient{{ProductID: "p", Quantity: 500, BaseUnit: contract.BaseUnitG}}}
+		if err != nil || !reflect.DeepEqual(got, want) {
+			t.Fatalf("exact DefineDish retry = %#v, %v; want original dish %#v", got, err, want)
+		}
+	})
+	t.Run("delivery", func(t *testing.T) {
+		base := memory.NewEventStore()
+		store := &delayedCommitStore{EventStore: base, commandID: "delivery-cmd"}
+		owner := newOwnerForCatalogTest(t, store, moscowTime(2026, time.April, 2, 10))
+		if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+			t.Fatal(err)
+		}
+		request := validDeliveryRequest("delivery-cmd", "delivery-1", moscowTime(2026, time.April, 2, 9))
+		if _, err := owner.ReceiveDelivery(ctx, request); !errors.Is(err, domain.ErrUnknownWriteOutcome) {
+			t.Fatalf("first ReceiveDelivery() error = %v; want unknown write", err)
+		}
+		got, err := owner.ReceiveDelivery(ctx, request)
+		if err != nil || got.DeliveryID != "delivery-1" || len(got.BatchIDs) != 1 {
+			t.Fatalf("exact ReceiveDelivery retry = %#v, %v; want original receipt", got, err)
+		}
+	})
+}
+
+func TestPendingExactRetryReturnsResultWhenProjectionRepairFails(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewEventStore()
+	store := &delayedCommitStore{EventStore: base, commandID: "delivery-cmd", corruptResultBatch: true}
+	owner := newOwnerForCatalogTest(t, store, moscowTime(2026, time.April, 2, 10))
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	request := validDeliveryRequest("delivery-cmd", "delivery-1", moscowTime(2026, time.April, 2, 9))
+	if _, err := owner.ReceiveDelivery(ctx, request); !errors.Is(err, domain.ErrUnknownWriteOutcome) {
+		t.Fatalf("first ReceiveDelivery() error = %v; want unknown write", err)
+	}
+	got, err := owner.ReceiveDelivery(ctx, request)
+	if err != nil || got.DeliveryID != "delivery-1" || len(got.BatchIDs) != 1 {
+		t.Fatalf("exact retry after projection repair failure = %#v, %v; want recorded receipt", got, err)
+	}
+	if owner.usable {
+		t.Fatal("projection should remain unavailable after failed repair")
+	}
+}
+
 func TestDeliveryFingerprintCanonicalizesTimesAndPreservesLineOrder(t *testing.T) {
 	ctx := context.Background()
 	owner, _, _ := newCatalogOwner(t, moscowTime(2026, time.April, 2, 10))
@@ -423,6 +518,37 @@ func newCatalogOwner(t *testing.T, now time.Time) (*Owner, *memory.EventStore, *
 		t.Fatal(err)
 	}
 	return owner, store, clock
+}
+
+func newOwnerForCatalogTest(t *testing.T, store EventStore, now time.Time) *Owner {
+	t.Helper()
+	owner, err := NewOwner(store, func() time.Time { return now }, nextTestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return owner
+}
+
+type delayedCommitStore struct {
+	EventStore
+	commandID          string
+	appendAttempts     int
+	corruptResultBatch bool
+}
+
+func (s *delayedCommitStore) AppendBatch(ctx context.Context, command domain.CommandBatch) (domain.AppendResult, error) {
+	if command.CommandID != s.commandID {
+		return s.EventStore.AppendBatch(ctx, command)
+	}
+	s.appendAttempts++
+	if s.appendAttempts <= 2 {
+		return domain.AppendResult{}, domain.ErrUnknownWriteOutcome
+	}
+	result, err := s.EventStore.AppendBatch(ctx, command)
+	if err == nil && s.corruptResultBatch && len(result.Batch.Events) != 0 {
+		result.Batch.Events[0].Type = domain.EventBatchExpired
+	}
+	return result, err
 }
 
 func validDeliveryRequest(commandID, deliveryID string, now time.Time) contract.ReceiveDeliveryRequest {

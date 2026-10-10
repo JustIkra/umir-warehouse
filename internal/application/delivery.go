@@ -25,21 +25,21 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 		if found {
 			return recordedDelivery(record, fingerprint)
 		}
+		if request.DeliveryID == "" {
+			return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
+		}
 		if err := o.syncProjectionLocked(ctx); err != nil {
 			return contract.DeliveryReceipt{}, inventoryUnavailable(err)
 		}
-		if request.DeliveryID == "" || request.Number == "" || len(request.Lines) == 0 {
-			return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
+		if _, exists := o.state.Deliveries[request.DeliveryID]; exists {
+			return contract.DeliveryReceipt{}, contract.ErrDeliveryAlreadyReceived
 		}
-		if !businessTime(request.CreatedAt) {
+		if request.Number == "" || len(request.Lines) == 0 || !businessTime(request.CreatedAt) {
 			return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
 		}
 		now := domain.CanonicalBusinessTime(o.now())
 		if request.CreatedAt.After(now) {
 			return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
-		}
-		if _, exists := o.state.Deliveries[request.DeliveryID]; exists {
-			return contract.DeliveryReceipt{}, contract.ErrDeliveryAlreadyReceived
 		}
 		delivery, batches, err := validateDelivery(o.state, request, now)
 		if err != nil {

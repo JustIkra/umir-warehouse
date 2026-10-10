@@ -184,6 +184,24 @@ func (o *Owner) GetDish(ctx context.Context, dishID string) (contract.Dish, erro
 }
 
 func (o *Owner) findCommand(ctx context.Context, commandID, commandType, fingerprint string) (domain.CommandRecord, bool, error) {
+	if o.pending != nil && o.pending.CommandID == commandID {
+		if o.pending.CommandType != commandType || o.pending.CommandFingerprint != fingerprint {
+			return domain.CommandRecord{}, false, contract.ErrCommandIdentityConflict
+		}
+		record, found, err := o.resolvePendingLocked(ctx)
+		if found {
+			return domain.CloneCommandRecord(record), true, nil
+		}
+		if errors.Is(err, domain.ErrConcurrentModification) {
+			return domain.CommandRecord{}, false, nil
+		}
+		if errors.Is(err, domain.ErrCommandIdentityConflict) {
+			return domain.CommandRecord{}, false, contract.ErrCommandIdentityConflict
+		}
+		if err != nil {
+			return domain.CommandRecord{}, false, err
+		}
+	}
 	record, found, err := o.events.FindCommand(ctx, commandID)
 	if err != nil {
 		if errors.Is(err, domain.ErrCommandIdentityConflict) {
