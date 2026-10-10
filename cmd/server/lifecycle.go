@@ -7,8 +7,6 @@ import (
 	"log"
 	"net/http"
 	"time"
-
-	"github.com/JustIkra/umir-warehouse/internal/application"
 )
 
 type ticker interface {
@@ -36,6 +34,10 @@ type lifecycleDependencies struct {
 type lifecycleResult struct {
 	done chan struct{}
 	err  error
+}
+
+type retryableSnapshotSaveError interface {
+	RetryableSnapshotSave()
 }
 
 func runService(parent context.Context, cfg serverConfig, dependencies lifecycleDependencies) error {
@@ -164,7 +166,7 @@ func runSnapshotWorkerWithRetry(ctx context.Context, retryInterval time.Duration
 		if err == nil {
 			return errors.New("snapshot worker stopped unexpectedly")
 		}
-		var saveErr *application.SnapshotSaveError
+		var saveErr retryableSnapshotSaveError
 		if !errors.As(err, &saveErr) {
 			return err
 		}

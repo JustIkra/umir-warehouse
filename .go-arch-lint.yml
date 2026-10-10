@@ -4,6 +4,8 @@ allow:
   deepScan: false
   depOnAnyVendor: false
   ignoreNotFoundComponents: true
+excludeFiles:
+  - "^.*_test\\.go$"
 components:
   domain: {in: "internal/domain/**"}
   contract: {in: "contract/**"}

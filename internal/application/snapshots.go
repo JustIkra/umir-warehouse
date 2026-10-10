@@ -33,6 +33,8 @@ func (e *SnapshotSaveError) Unwrap() error {
 	return e.Err
 }
 
+func (e *SnapshotSaveError) RetryableSnapshotSave() {}
+
 func NewSnapshotWorker(store SnapshotStore) *SnapshotWorker {
 	return &SnapshotWorker{store: store, notify: make(chan struct{}, 1)}
 }

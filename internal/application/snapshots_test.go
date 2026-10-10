@@ -12,6 +12,14 @@ import (
 	"github.com/JustIkra/umir-warehouse/internal/domain"
 )
 
+func TestSnapshotSaveErrorMarksRetryable(t *testing.T) {
+	var err error = &SnapshotSaveError{Err: errors.New("temporary store failure")}
+	var retryable interface{ RetryableSnapshotSave() }
+	if !errors.As(err, &retryable) {
+		t.Fatal("snapshot save error does not mark itself as retryable")
+	}
+}
+
 func TestSnapshotFullCommandBoundary(t *testing.T) {
 	store := storeWithCompoundDeliveryExpiry(t)
 	snapshots := memory.NewSnapshotStore()

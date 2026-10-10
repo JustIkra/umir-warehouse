@@ -55,7 +55,8 @@ printf 'package unclassified\n\nconst Value = 1\n' > "$fixture/internal/unclassi
 reject arch 'not attached'
 rm "$fixture/internal/unclassified/new.go"
 printf 'package unclassified\n\nimport "testing"\n\nfunc TestExample(t *testing.T) {}\n' > "$fixture/internal/unclassified/new_test.go"
-reject arch 'not attached'
+run arch > "$scratch/test-arch" 2>&1 || { cat "$scratch/test-arch"; printf 'Test-only package imports should not affect source architecture\n' >&2; exit 1; }
+passed=$((passed + 1))
 rm "$fixture/internal/unclassified/new_test.go"
 mkdir -p "$fixture/unlisted-module"
 printf 'module example.com/unlisted\n\ngo 1.26.5\n' > "$fixture/unlisted-module/go.mod"
@@ -79,6 +80,15 @@ printf 'package testsupport\n\nconst Value = 1\n' > "$fixture/tests/testsupport/
 printf 'package main\n\nimport "%s/tests/testsupport"\n\nfunc main() { _ = testsupport.Value }\n' "$module" > "$fixture/cmd/server/main.go"
 reject lint 'depguard'
 reject arch 'testsupport'
+cp "$fixture/go.mod" "$scratch/go.mod"
+printf 'package service\n\nconst Value = 1\n' > "$fixture/service.go"
+for service in umir-serving umir-gateway umir-factory; do
+  sed "s#^module .*#module github.com/JustIkra/$service#" "$scratch/go.mod" > "$fixture/go.mod"
+  printf 'package main\n\nimport service "github.com/JustIkra/%s"\n\nfunc main() { _ = service.Value }\n' "$service" > "$fixture/cmd/server/main.go"
+  reject lint 'depguard'
+done
+mv "$scratch/go.mod" "$fixture/go.mod"
+rm "$fixture/service.go"
 printf 'package main\n\nfunc main() {}\n' > "$fixture/cmd/server/main.go"
 if grep -q '^  domain:' "$root/.go-arch-lint.yml"; then
   mkdir -p "$fixture/internal/domain" "$fixture/internal/application" "$fixture/internal/adapters/memory" "$fixture/bootstrap"
