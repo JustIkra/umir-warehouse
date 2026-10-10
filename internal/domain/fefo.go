@@ -48,3 +48,128 @@ func AllocateFEFO(batches []Batch, required Quantity) ([]Allocation, error) {
 	}
 	return nil, ErrInsufficientQuantity
 }
+
+func pureEvaluatePositions(state InventoryState, positions []Position) (OrderEvaluation, error) {
+	evaluation, _, err := evaluatePositions(state, positions)
+	return evaluation, err
+}
+
+func PureEvaluatePositions(state InventoryState, positions []Position) (OrderEvaluation, error) {
+	return pureEvaluatePositions(state, positions)
+}
+
+func EvaluatePositionsWithAllocations(state InventoryState, positions []Position) (OrderEvaluation, []Allocation, error) {
+	return evaluatePositions(state, positions)
+}
+
+func evaluatePositions(state InventoryState, positions []Position) (OrderEvaluation, []Allocation, error) {
+	evaluation := OrderEvaluation{
+		StateVersion:       state.StateVersion,
+		RequestedPositions: append([]Position(nil), positions...),
+		AcceptedPositions:  make([]AcceptedPosition, 0, len(positions)),
+		Changes:            make([]Change, 0),
+	}
+	working := make(map[string]Quantity, len(state.Batches))
+	for id, batch := range state.Batches {
+		working[id] = batch.RemainingQuantity
+	}
+	allocations := make([]Allocation, 0)
+	seenLines := make(map[int64]struct{}, len(positions))
+	for _, position := range positions {
+		if position.LineNo <= 0 || position.DishID == "" || position.Portions <= 0 {
+			return OrderEvaluation{}, nil, ErrInvalidQuantity
+		}
+		if _, exists := seenLines[position.LineNo]; exists {
+			return OrderEvaluation{}, nil, ErrInvalidQuantity
+		}
+		seenLines[position.LineNo] = struct{}{}
+		dish, exists := state.Dishes[position.DishID]
+		if !exists {
+			return OrderEvaluation{}, nil, ErrDishNotFound
+		}
+		maximum := position.Portions
+		availableByProduct := make(map[string]Quantity, len(dish.Ingredients))
+		if len(dish.Ingredients) == 0 {
+			return OrderEvaluation{}, nil, ErrInvalidQuantity
+		}
+		for _, ingredient := range dish.Ingredients {
+			if ingredient.Quantity <= 0 {
+				return OrderEvaluation{}, nil, ErrInvalidQuantity
+			}
+			available, err := availableQuantity(state, working, ingredient.ProductID)
+			if err != nil {
+				return OrderEvaluation{}, nil, err
+			}
+			availableByProduct[ingredient.ProductID] = available
+			possible := int64(available / ingredient.Quantity)
+			if possible < maximum {
+				maximum = possible
+			}
+		}
+		if maximum < 0 {
+			maximum = 0
+		}
+		if maximum > 0 {
+			accepted := AcceptedPosition{LineNo: position.LineNo, DishID: position.DishID, Portions: maximum}
+			evaluation.AcceptedPositions = append(evaluation.AcceptedPositions, accepted)
+			for _, ingredient := range dish.Ingredients {
+				required, err := MultiplyQuantity(ingredient.Quantity, maximum)
+				if err != nil {
+					return OrderEvaluation{}, nil, err
+				}
+				batches := productBatches(state, working, ingredient.ProductID)
+				allocated, err := AllocateFEFO(batches, required)
+				if err != nil {
+					return OrderEvaluation{}, nil, err
+				}
+				for _, allocation := range allocated {
+					remaining := working[allocation.BatchID] - allocation.Quantity
+					working[allocation.BatchID] = remaining
+				}
+				allocations = append(allocations, allocated...)
+			}
+		}
+		if maximum < position.Portions {
+			change := Change{LineNo: position.LineNo, DishID: position.DishID, RequestedPortions: position.Portions, AcceptedPortions: maximum, Deficits: make([]Deficit, 0, len(dish.Ingredients))}
+			for _, ingredient := range dish.Ingredients {
+				required, err := MultiplyQuantity(ingredient.Quantity, position.Portions)
+				if err != nil {
+					return OrderEvaluation{}, nil, err
+				}
+				available := availableByProduct[ingredient.ProductID]
+				if available < required {
+					change.Deficits = append(change.Deficits, Deficit{ProductID: ingredient.ProductID, RequiredQuantity: required, AvailableQuantity: available})
+				}
+			}
+			evaluation.Changes = append(evaluation.Changes, change)
+		}
+	}
+	return evaluation, allocations, nil
+}
+
+func availableQuantity(state InventoryState, working map[string]Quantity, productID string) (Quantity, error) {
+	var available Quantity
+	for batchID, batch := range state.Batches {
+		if batch.ProductID != productID || working[batchID] <= 0 {
+			continue
+		}
+		var err error
+		available, err = AddQuantity(available, working[batchID])
+		if err != nil {
+			return 0, err
+		}
+	}
+	return available, nil
+}
+
+func productBatches(state InventoryState, working map[string]Quantity, productID string) []Batch {
+	batches := make([]Batch, 0)
+	for batchID, batch := range state.Batches {
+		if batch.ProductID != productID || working[batchID] <= 0 {
+			continue
+		}
+		batch.RemainingQuantity = working[batchID]
+		batches = append(batches, batch)
+	}
+	return batches
+}

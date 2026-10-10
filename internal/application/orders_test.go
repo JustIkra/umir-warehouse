@@ -1,0 +1,250 @@
+package application
+
+import (
+	"context"
+	"errors"
+	"math"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/JustIkra/umir-warehouse/contract"
+	"github.com/JustIkra/umir-warehouse/internal/domain"
+)
+
+func TestSharedIngredientOrder(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, _, _ := newCatalogOwner(t, now)
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-cheese", ProductID: "cheese", Name: "Cheese", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	for _, dish := range []contract.DefineDishRequest{
+		{CommandID: "dish-a", DishID: "a", Name: "Dish A", Ingredients: []contract.Ingredient{{ProductID: "cheese", Quantity: 40000}}},
+		{CommandID: "dish-b", DishID: "b", Name: "Dish B", Ingredients: []contract.Ingredient{{ProductID: "cheese", Quantity: 40000}}},
+	} {
+		if _, err := owner.DefineDish(ctx, dish); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delivery := validDeliveryRequest("delivery-cheese", "cheese-stock", now)
+	delivery.Lines[0].ProductID = "cheese"
+	delivery.Lines[0].Quantity = 40000
+	if _, err := owner.ReceiveDelivery(ctx, delivery); err != nil {
+		t.Fatal(err)
+	}
+	menu, err := owner.EvaluateMenu(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(menu.Dishes) != 2 || !menu.Dishes[0].IsAvailable || !menu.Dishes[1].IsAvailable {
+		t.Fatalf("independent menu availability = %#v; want both dishes available", menu.Dishes)
+	}
+	evaluation, err := owner.EvaluateOrder(ctx, contract.EvaluateOrderRequest{Positions: []contract.Position{{LineNo: 4, DishID: "a", Portions: 1}, {LineNo: 9, DishID: "b", Portions: 1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAccepted := []contract.AcceptedPosition{{LineNo: 4, DishID: "a", Portions: 1}}
+	if !reflect.DeepEqual(evaluation.AcceptedPositions, wantAccepted) {
+		t.Fatalf("accepted positions = %#v; want %#v", evaluation.AcceptedPositions, wantAccepted)
+	}
+	if len(evaluation.Changes) != 1 || evaluation.Changes[0].LineNo != 9 || evaluation.Changes[0].AcceptedPortions != 0 {
+		t.Fatalf("changes = %#v; want line 9 reduced to zero", evaluation.Changes)
+	}
+	if deficit := evaluation.Changes[0].Deficits[0]; deficit.ProductID != "cheese" || deficit.RequiredQuantity != 40000 || deficit.AvailableQuantity != 0 {
+		t.Fatalf("second-line deficit = %#v; want 40000 required and none available", deficit)
+	}
+}
+
+func TestIndependentMenu(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, _, _ := newCatalogOwner(t, now)
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-q", ProductID: "q", Name: "Quince", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	for _, dish := range []contract.DefineDishRequest{
+		{CommandID: "dish-b", DishID: "b", Name: "B", Ingredients: []contract.Ingredient{{ProductID: "p", Quantity: 40000}}},
+		{CommandID: "dish-a", DishID: "a", Name: "A", Ingredients: []contract.Ingredient{{ProductID: "p", Quantity: 40000}}},
+		{CommandID: "dish-c", DishID: "c", Name: "C", Ingredients: []contract.Ingredient{{ProductID: "q", Quantity: 500}}},
+	} {
+		if _, err := owner.DefineDish(ctx, dish); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delivery := validDeliveryRequest("delivery-p", "delivery-1", now)
+	delivery.Lines[0].Quantity = 40000
+	if _, err := owner.ReceiveDelivery(ctx, delivery); err != nil {
+		t.Fatal(err)
+	}
+	menu, err := owner.EvaluateMenu(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := contract.MenuEvaluation{
+		EvaluatedAt:  now,
+		StateVersion: 6,
+		Dishes: []contract.DishEvaluation{
+			{DishID: "a", DishName: "A", IsAvailable: true, Deficits: []contract.Deficit{}, Allocations: []contract.MenuAllocation{{ProductID: "p", ProductName: "Pear", BatchID: "owner-event-6", Quantity: 40000, BaseUnit: contract.BaseUnitG, ExpiresAt: moscowTime(2026, time.April, 4, 10)}}},
+			{DishID: "b", DishName: "B", IsAvailable: true, Deficits: []contract.Deficit{}, Allocations: []contract.MenuAllocation{{ProductID: "p", ProductName: "Pear", BatchID: "owner-event-6", Quantity: 40000, BaseUnit: contract.BaseUnitG, ExpiresAt: moscowTime(2026, time.April, 4, 10)}}},
+			{DishID: "c", DishName: "C", IsAvailable: false, Deficits: []contract.Deficit{{ProductID: "q", RequiredQuantity: 500, AvailableQuantity: 0}}, Allocations: []contract.MenuAllocation{}},
+		},
+	}
+	if !reflect.DeepEqual(menu, want) {
+		t.Fatalf("EvaluateMenu() = %#v; want %#v", menu, want)
+	}
+}
+
+func TestCommitRecheck(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, _, _ := newCatalogOwner(t, now)
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.DefineDish(ctx, contract.DefineDishRequest{CommandID: "dish-d", DishID: "d", Name: "Dish", Ingredients: []contract.Ingredient{{ProductID: "p", Quantity: 40000}}}); err != nil {
+		t.Fatal(err)
+	}
+	delivery := validDeliveryRequest("delivery-p", "delivery-1", now)
+	delivery.Lines[0].Quantity = 80000
+	if _, err := owner.ReceiveDelivery(ctx, delivery); err != nil {
+		t.Fatal(err)
+	}
+	first, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "order-one", ProposalID: "proposal-one", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "d", Portions: 1}}})
+	if err != nil || first.Kind != contract.CommitResultOrderCommitted || first.Order == nil {
+		t.Fatalf("first commit = %#v, %v; want committed order", first, err)
+	}
+	wantAllocations := []contract.Allocation{{ProductID: "p", BatchID: "owner-event-3", Quantity: 40000}}
+	if !reflect.DeepEqual(first.Order.Allocations, wantAllocations) {
+		t.Fatalf("first order allocations = %#v; want %#v", first.Order.Allocations, wantAllocations)
+	}
+	result, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "order-two", ProposalID: "proposal-two", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 7, DishID: "d", Portions: 2}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Kind != contract.CommitResultRecheckRequired || result.Order != nil || result.Evaluation == nil {
+		t.Fatalf("rechecked commit = %#v; want RecheckRequired without an order", result)
+	}
+	if len(result.Evaluation.AcceptedPositions) != 1 || result.Evaluation.AcceptedPositions[0].Portions != 1 || len(result.Evaluation.Changes) != 1 || result.Evaluation.Changes[0].LineNo != 7 {
+		t.Fatalf("recheck evaluation = %#v; want original line 7 reduced to one", result.Evaluation)
+	}
+	if deficit := result.Evaluation.Changes[0].Deficits[0]; deficit.ProductID != "p" || deficit.RequiredQuantity != 80000 || deficit.AvailableQuantity != 40000 {
+		t.Fatalf("recheck deficit = %#v; want 80000 required and 40000 available", deficit)
+	}
+}
+
+func TestKnownOrderReturnsBeforeProjectionRecovery(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, original := committedOrderOwner(t, now)
+	owner.events = &failingVersionEventStore{EventStore: owner.events}
+	owner.usable = false
+	replayed, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "order", ProposalID: "proposal", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "d", Portions: 99}}})
+	if err != nil || replayed.Kind != contract.CommitResultOrderCommitted || replayed.Order == nil {
+		t.Fatalf("known command retry = %#v, %v; want recorded order before projection recovery", replayed, err)
+	}
+	if !reflect.DeepEqual(replayed, original) {
+		t.Fatalf("known order = %#v; want original %#v", replayed, original)
+	}
+}
+
+func TestKnownProposalReturnsBeforeProjectionRecovery(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, original := committedOrderOwner(t, now)
+	owner.events = &failingVersionEventStore{EventStore: owner.events}
+	owner.usable = false
+	result, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "another-command", ProposalID: "proposal"})
+	if err != nil || result.Kind != contract.CommitResultOrderCommitted || result.Order == nil || !reflect.DeepEqual(result, original) {
+		t.Fatalf("known proposal result = %#v, %v; want recorded order before projection recovery", result, err)
+	}
+}
+
+func committedOrderOwner(t *testing.T, now time.Time) (*Owner, contract.CommitResult) {
+	t.Helper()
+	ctx := context.Background()
+	owner, _, _ := newCatalogOwner(t, now)
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.DefineDish(ctx, contract.DefineDishRequest{CommandID: "dish-d", DishID: "d", Name: "Dish", Ingredients: []contract.Ingredient{{ProductID: "p", Quantity: 6000}}}); err != nil {
+		t.Fatal(err)
+	}
+	delivery := validDeliveryRequest("delivery-p", "delivery-1", now)
+	delivery.Lines[0].Quantity = 6000
+	if _, err := owner.ReceiveDelivery(ctx, delivery); err != nil {
+		t.Fatal(err)
+	}
+	result, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "order", ProposalID: "proposal", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "d", Portions: 1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return owner, result
+}
+
+func TestCommitRejectsEmptyAcceptedPositions(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, store, _ := newCatalogOwner(t, now)
+	if _, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "empty-order", ProposalID: "proposal"}); !errors.Is(err, contract.ErrInvalidArgument) {
+		t.Fatalf("CommitAcceptedOrder(empty) error = %v; want InvalidArgument", err)
+	}
+	version, err := store.Version(ctx)
+	if err != nil || version != 0 {
+		t.Fatalf("version after empty commit = %d, %v; want zero", version, err)
+	}
+}
+
+func TestCommitRejectsQuantityOverflowWithoutSale(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, store, _ := newCatalogOwner(t, now)
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.DefineDish(ctx, contract.DefineDishRequest{CommandID: "dish-d", DishID: "d", Name: "Dish", Ingredients: []contract.Ingredient{{ProductID: "p", Quantity: 2}}}); err != nil {
+		t.Fatal(err)
+	}
+	delivery := validDeliveryRequest("delivery-p", "delivery-1", now)
+	delivery.Lines[0].Quantity = contract.Quantity(math.MaxInt64)
+	if _, err := owner.ReceiveDelivery(ctx, delivery); err != nil {
+		t.Fatal(err)
+	}
+	_, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "overflow-order", ProposalID: "overflow-proposal", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "d", Portions: math.MaxInt64}}})
+	if !errors.Is(err, domain.ErrQuantityOverflow) {
+		t.Fatalf("CommitAcceptedOrder(overflow) error = %v; want ErrQuantityOverflow", err)
+	}
+	version, err := store.Version(ctx)
+	if err != nil || version != 3 {
+		t.Fatalf("version after rejected overflow = %d, %v; want only setup events", version, err)
+	}
+}
+
+func TestProposalOrderUniqueness(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, _, _ := newCatalogOwner(t, now)
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.DefineDish(ctx, contract.DefineDishRequest{CommandID: "dish-d", DishID: "d", Name: "Dish", Ingredients: []contract.Ingredient{{ProductID: "p", Quantity: 1000}}}); err != nil {
+		t.Fatal(err)
+	}
+	delivery := validDeliveryRequest("delivery-p", "delivery-1", now)
+	delivery.Lines[0].Quantity = 5000
+	if _, err := owner.ReceiveDelivery(ctx, delivery); err != nil {
+		t.Fatal(err)
+	}
+	accepted := []contract.AcceptedPosition{{LineNo: 1, DishID: "d", Portions: 1}}
+	first, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "order-one", ProposalID: "same-proposal", AcceptedPositions: accepted})
+	if err != nil || first.Order == nil {
+		t.Fatalf("first commit = %#v, %v; want committed order", first, err)
+	}
+	second, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "order-two", ProposalID: "same-proposal", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "d", Portions: 5}}})
+	if err != nil || second.Order == nil || !reflect.DeepEqual(*second.Order, *first.Order) {
+		t.Fatalf("second commit = %#v, %v; want original order %#v", second, err, *first.Order)
+	}
+}

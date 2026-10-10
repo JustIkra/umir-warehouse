@@ -114,12 +114,27 @@ type OrderEvaluation struct {
 	Changes            []Change
 }
 
+type MenuAllocation struct {
+	ProductID   string
+	ProductName string
+	BatchID     string
+	Quantity    Quantity
+	BaseUnit    BaseUnit
+	ExpiresAt   time.Time
+}
+
+type DishEvaluation struct {
+	DishID      string
+	DishName    string
+	IsAvailable bool
+	Deficits    []Deficit
+	Allocations []MenuAllocation
+}
+
 type MenuEvaluation struct {
-	EvaluatedAt       time.Time
-	StateVersion      int64
-	AvailableDishes   []Dish
-	UnavailableDishes []Dish
-	Deficits          []Change
+	EvaluatedAt  time.Time
+	StateVersion int64
+	Dishes       []DishEvaluation
 }
 
 type ProductInventory struct {

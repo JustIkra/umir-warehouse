@@ -105,14 +105,6 @@ type OrderEvaluation struct {
 	Changes            []Change
 }
 
-type MenuEvaluation struct {
-	EvaluatedAt       time.Time
-	StateVersion      int64
-	AvailableDishes   []Dish
-	UnavailableDishes []Dish
-	Deficits          []Change
-}
-
 type InventoryView struct {
 	ProductID string
 	BaseUnit  BaseUnit
