@@ -90,12 +90,12 @@ func (o *Owner) CommitAcceptedOrder(ctx context.Context, request contract.Commit
 				}
 			}
 		}
-		record, found, err := o.findCommand(ctx, request.CommandID, "ConfirmOrder", fingerprint)
+		result, found, err := o.findRecordedCommitOrder(ctx, request.CommandID, fingerprint)
 		if err != nil {
 			return contract.CommitResult{}, err
 		}
 		if found {
-			return recordedCommitOrder(record, fingerprint)
+			return result, nil
 		}
 		if pendingOrder != nil {
 			order := toContractOrder(*pendingOrder)
@@ -121,6 +121,13 @@ func (o *Owner) CommitAcceptedOrder(ctx context.Context, request contract.Commit
 		}
 		prepared, _, err := o.prepareLocked(ctx)
 		if err != nil {
+			recorded, found, lookupErr := o.findRecordedCommitOrder(ctx, request.CommandID, fingerprint)
+			if lookupErr != nil {
+				return contract.CommitResult{}, lookupErr
+			}
+			if found {
+				return recorded, nil
+			}
 			order, found, lookupErr := o.events.FindOrderByProposal(ctx, request.ProposalID)
 			if lookupErr == nil && found {
 				publicOrder := toContractOrder(order)
@@ -166,7 +173,7 @@ func (o *Owner) CommitAcceptedOrder(ctx context.Context, request contract.Commit
 			}
 			return contract.CommitResult{}, err
 		}
-		record, found, err = o.appendOwnerCommandLocked(ctx, command)
+		record, found, err := o.appendOwnerCommandLocked(ctx, command)
 		if errors.Is(err, domain.ErrConcurrentModification) {
 			continue
 		}
@@ -178,6 +185,15 @@ func (o *Owner) CommitAcceptedOrder(ctx context.Context, request contract.Commit
 		}
 		return recordedCommitOrder(record, fingerprint)
 	}
+}
+
+func (o *Owner) findRecordedCommitOrder(ctx context.Context, commandID, fingerprint string) (contract.CommitResult, bool, error) {
+	record, found, err := o.findCommand(ctx, commandID, "ConfirmOrder", fingerprint)
+	if err != nil || !found {
+		return contract.CommitResult{}, found, err
+	}
+	result, err := recordedCommitOrder(record, fingerprint)
+	return result, true, err
 }
 
 func canonicalConfirmOrderFP(proposalID string) string {

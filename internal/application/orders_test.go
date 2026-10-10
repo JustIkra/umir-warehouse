@@ -359,6 +359,69 @@ func TestPendingRecordedOrderReturnsWhenProjectionApplyFails(t *testing.T) {
 	}
 }
 
+func TestCommitIdentityConflictDuringFailedPreparationPrecedesProposalOrder(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, store := newOrderCommitFixture(t, now, 120000)
+	stateVersion := owner.state.StateVersion
+	foreignCommand := externalOrderBatch(owner, "retry-command", "foreign-proposal", 3, 1, "foreign-order", "foreign-event", 40000)
+	proposalOrder := externalOrderBatch(owner, "other-command", "requested-proposal", 4, 1, "requested-order", "requested-event", 40000)
+	proposalOrder.ExpectedVersion++
+	wrapper := &commitCollisionDuringReadFailureStore{EventStore: store, firstVersion: stateVersion, batches: []domain.CommandBatch{foreignCommand, proposalOrder}}
+	owner.events = wrapper
+	newIDs := 0
+	owner.newID = func() string {
+		newIDs++
+		return "unexpected-id"
+	}
+	result, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "retry-command", ProposalID: "requested-proposal", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 3, DishID: "d", Portions: 1}}})
+	if !errors.Is(err, contract.ErrCommandIdentityConflict) {
+		t.Fatalf("CommitAcceptedOrder() = %#v, %v; want CommandIdentityConflict", result, err)
+	}
+	if !wrapper.readFailed {
+		t.Fatal("preparation did not fail after recording the conflicting command")
+	}
+	if newIDs != 0 {
+		t.Fatalf("generated %d IDs after command identity conflict; want none", newIDs)
+	}
+	version, err := store.Version(ctx)
+	if err != nil || version != stateVersion+2 {
+		t.Fatalf("version after collision = %d, %v; want only the two concurrent orders", version, err)
+	}
+	order, found, err := store.FindOrderByProposal(ctx, "requested-proposal")
+	if err != nil || !found || order.OrderID != "requested-order" {
+		t.Fatalf("concurrent proposal order = %#v, %v, %v; want recorded fallback candidate", order, found, err)
+	}
+}
+
+type commitCollisionDuringReadFailureStore struct {
+	EventStore
+	firstVersion int64
+	batches      []domain.CommandBatch
+	injected     bool
+	readFailed   bool
+}
+
+func (s *commitCollisionDuringReadFailureStore) Version(ctx context.Context) (int64, error) {
+	if !s.injected {
+		s.injected = true
+		for _, batch := range s.batches {
+			if _, err := s.AppendBatch(ctx, batch); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return s.EventStore.Version(ctx)
+}
+
+func (s *commitCollisionDuringReadFailureStore) ReadBatches(ctx context.Context, afterSequence int64) ([]domain.RecordedBatch, error) {
+	if s.injected && afterSequence == s.firstVersion {
+		s.readFailed = true
+		return nil, errors.New("projection synchronization failed")
+	}
+	return s.EventStore.ReadBatches(ctx, afterSequence)
+}
+
 type delayConfirmOrderEventStore struct {
 	EventStore
 	unknownAttempts int
