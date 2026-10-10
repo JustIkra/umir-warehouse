@@ -89,17 +89,24 @@ func (o *Owner) writeExpiryLocked(ctx context.Context, commandID, fingerprint st
 	appendResult, err := o.events.AppendBatch(ctx, command)
 	if errors.Is(err, domain.ErrUnknownWriteOutcome) {
 		o.pending = cloneCommandBatch(command)
-		if err := o.resolvePendingLocked(ctx); err != nil {
-			return domain.ExpiryResult{}, err
-		}
-		record, found, err := o.events.FindCommand(ctx, commandID)
-		if err != nil || !found {
-			if err == nil {
-				err = domain.ErrUnknownWriteOutcome
+		record, found, resolveErr := o.resolvePendingLocked(ctx)
+		if found {
+			resolved, recordErr := recordedDomainExpiry(record, fingerprint, batch.BatchID)
+			if recordErr != nil {
+				return domain.ExpiryResult{}, recordErr
 			}
-			return domain.ExpiryResult{}, err
+			if resolveErr != nil {
+				o.pending = nil
+				o.usable = false
+			}
+			return resolved, nil
 		}
-		return recordedDomainExpiry(record, fingerprint, batch.BatchID)
+		if resolveErr != nil {
+			return domain.ExpiryResult{}, resolveErr
+		}
+		if !found {
+			return domain.ExpiryResult{}, domain.ErrUnknownWriteOutcome
+		}
 	}
 	if err != nil {
 		return domain.ExpiryResult{}, err

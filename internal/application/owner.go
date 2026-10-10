@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -42,7 +43,14 @@ func (o *Owner) Recover(ctx context.Context) error {
 		return inventoryUnavailable(err)
 	}
 	if o.pending != nil {
-		if err := o.resolvePendingLocked(ctx); err != nil {
+		_, _, err := o.resolvePendingLocked(ctx)
+		if err != nil {
+			if errors.Is(err, domain.ErrConcurrentModification) {
+				if recoverErr := o.recoverLocked(ctx); recoverErr != nil {
+					return inventoryUnavailable(recoverErr)
+				}
+				return nil
+			}
 			return inventoryUnavailable(err)
 		}
 	}
@@ -95,10 +103,20 @@ func (o *Owner) prepareLocked(ctx context.Context) (ReadState, []contract.Expiry
 				}
 				continue
 			}
-			return ReadState{State: domain.CloneInventoryState(o.state), EvaluatedAt: now, StateVersion: o.state.StateVersion}, results, nil
+			evaluatedAt := domain.CanonicalBusinessTime(o.now())
+			if _, due := o.nextDueBatch(evaluatedAt); due {
+				continue
+			}
+			return ReadState{State: domain.CloneInventoryState(o.state), EvaluatedAt: evaluatedAt, StateVersion: o.state.StateVersion}, results, nil
 		}
 		result, err := o.expireDueLocked(ctx, batchID, now)
 		if err != nil {
+			if errors.Is(err, domain.ErrConcurrentModification) {
+				if syncErr := o.syncProjectionLocked(ctx); syncErr != nil {
+					return ReadState{}, results, syncErr
+				}
+				continue
+			}
 			return ReadState{}, results, err
 		}
 		results = append(results, toContractExpiry(result))

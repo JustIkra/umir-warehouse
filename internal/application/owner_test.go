@@ -158,6 +158,40 @@ func TestPrepareReusesUsableProjection(t *testing.T) {
 	}
 }
 
+func TestPrepareRechecksDueAfterFinalVersionWait(t *testing.T) {
+	dueAt := moscowTime(2026, time.April, 2, 10)
+	clock := &testClock{now: dueAt.Add(-time.Nanosecond)}
+	base := seedStore(t, dueAt, 10000, 0)
+	wrapped := &versionAdvanceStore{EventStore: base, clock: clock, advanceOnCall: 2, advanceTo: dueAt}
+	owner, err := NewOwner(wrapped, clock.Now, nextTestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := owner.Prepare(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.EvaluatedAt.Equal(dueAt) || state.State.Batches["batch"].RemainingQuantity != 0 {
+		t.Fatalf("capture = at %s, remaining %d; want fresh boundary time and expired stock", state.EvaluatedAt, state.State.Batches["batch"].RemainingQuantity)
+	}
+}
+
+type versionAdvanceStore struct {
+	EventStore
+	clock         *testClock
+	advanceOnCall int
+	advanceTo     time.Time
+	calls         int
+}
+
+func (s *versionAdvanceStore) Version(ctx context.Context) (int64, error) {
+	s.calls++
+	if s.calls == s.advanceOnCall {
+		s.clock.Set(s.advanceTo)
+	}
+	return s.EventStore.Version(ctx)
+}
+
 func expireRequest(batchID string) contract.ExpireBatchRequest {
 	return contract.ExpireBatchRequest{CommandID: "expiration/" + batchID, BatchID: batchID}
 }

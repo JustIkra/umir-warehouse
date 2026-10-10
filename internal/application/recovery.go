@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/JustIkra/umir-warehouse/internal/domain"
@@ -9,7 +10,11 @@ import (
 
 func (o *Owner) syncProjectionLocked(ctx context.Context) error {
 	if o.pending != nil {
-		if err := o.resolvePendingLocked(ctx); err != nil {
+		_, _, err := o.resolvePendingLocked(ctx)
+		if err != nil {
+			if errors.Is(err, domain.ErrConcurrentModification) {
+				return o.recoverLocked(ctx)
+			}
 			return err
 		}
 	}
@@ -154,48 +159,56 @@ func (o *Owner) applyCommittedBatch(batch domain.RecordedBatch) error {
 	return nil
 }
 
-func (o *Owner) resolvePendingLocked(ctx context.Context) error {
+func (o *Owner) resolvePendingLocked(ctx context.Context) (domain.CommandRecord, bool, error) {
 	if o.pending == nil {
-		return nil
+		return domain.CommandRecord{}, false, nil
 	}
 	pending := cloneCommandBatch(*o.pending)
 	record, found, err := o.events.FindCommand(ctx, pending.CommandID)
 	if err != nil {
 		o.usable = false
-		return err
+		return domain.CommandRecord{}, false, err
 	}
 	if found {
 		if record.CommandType != pending.CommandType || record.CommandFingerprint != pending.CommandFingerprint {
 			o.usable = false
-			return domain.ErrCommandIdentityConflict
+			o.pending = nil
+			return record, false, domain.ErrCommandIdentityConflict
 		}
 		batches, err := o.events.ReadBatches(ctx, pending.ExpectedVersion)
 		if err != nil {
 			o.usable = false
-			return err
+			o.pending = nil
+			return record, true, err
 		}
 		for _, batch := range batches {
 			if batch.CommandID == pending.CommandID {
 				if err := o.applyCommittedBatch(batch); err != nil {
 					o.usable = false
-					return err
+					o.pending = nil
+					return record, true, err
 				}
 				o.pending = nil
-				return nil
+				return record, true, nil
 			}
 		}
 		o.usable = false
-		return domain.ErrInvalidRecordedBatch
+		o.pending = nil
+		return record, true, domain.ErrInvalidRecordedBatch
 	}
 	result, err := o.events.AppendBatch(ctx, *pending)
 	if err != nil {
 		o.usable = false
-		return err
+		if errors.Is(err, domain.ErrConcurrentModification) {
+			o.pending = nil
+		}
+		return domain.CommandRecord{}, false, err
 	}
 	if err := o.applyCommittedBatch(result.Batch); err != nil {
 		o.usable = false
-		return err
+		o.pending = nil
+		return result.Command, true, err
 	}
 	o.pending = nil
-	return nil
+	return result.Command, true, nil
 }

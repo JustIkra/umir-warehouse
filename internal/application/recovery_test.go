@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/JustIkra/umir-warehouse/contract"
+	"github.com/JustIkra/umir-warehouse/internal/adapters/memory"
 	"github.com/JustIkra/umir-warehouse/internal/domain"
 )
 
@@ -148,6 +149,110 @@ func TestZeroBalanceExpirationIsEventless(t *testing.T) {
 	if _, found, err := store.FindCommand(context.Background(), "expiration/batch"); err != nil || found {
 		t.Fatalf("FindCommand(expiration/batch) = found %v, err %v; want no zero-write-off command", found, err)
 	}
+}
+
+func TestPendingUnknownWriteClearsAfterVersionConflict(t *testing.T) {
+	dueAt := moscowTime(2026, time.April, 2, 10)
+	base := seedStore(t, dueAt, 10000, 0)
+	wrapped := &unknownConflictStore{EventStore: base, store: base}
+	clock := &testClock{now: dueAt}
+	owner, err := NewOwner(wrapped, clock.Now, nextTestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := owner.Prepare(context.Background())
+	if err != nil {
+		t.Fatalf("Prepare() after exact retry conflict: %v", err)
+	}
+	if state.StateVersion != 5 || state.State.Batches["batch"].RemainingQuantity != 0 {
+		t.Fatalf("state = version %d, remaining %d; want external command plus refreshed expiry", state.StateVersion, state.State.Batches["batch"].RemainingQuantity)
+	}
+	if _, found := state.State.Products["external-product"]; !found {
+		t.Fatal("recovery lost the external command that caused the version conflict")
+	}
+	if wrapped.expiryAttempts != 3 || owner.pending != nil {
+		t.Fatalf("expiry attempts/pending = %d/%v; want fresh attempt and no obsolete pending batch", wrapped.expiryAttempts, owner.pending)
+	}
+}
+
+func TestUnknownCommittedExpiryReturnsWhenProjectionReadFails(t *testing.T) {
+	dueAt := moscowTime(2026, time.April, 2, 10)
+	base := seedStore(t, dueAt, 10000, 0)
+	wrapped := &unknownCommitReadFailureStore{EventStore: base, failAfter: 3}
+	clock := &testClock{now: dueAt}
+	owner, err := NewOwner(wrapped, clock.Now, nextTestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := owner.ExpireBatch(context.Background(), expireRequest("batch"))
+	if err != nil || result.WrittenOffQuantity != 10000 {
+		t.Fatalf("ExpireBatch() = %#v, %v; want recorded expiry despite projection read error", result, err)
+	}
+	if owner.usable || owner.pending != nil || wrapped.expiryAppends != 1 {
+		t.Fatalf("projection usable/pending/appends = %v/%v/%d; want dirty projection, resolved write, and one append", owner.usable, owner.pending, wrapped.expiryAppends)
+	}
+	state, err := owner.Prepare(context.Background())
+	if err != nil || state.State.Batches["batch"].RemainingQuantity != 0 {
+		t.Fatalf("Prepare() recovery = %#v, %v; want recovered committed expiry", state, err)
+	}
+}
+
+type unknownConflictStore struct {
+	EventStore
+	store          *memory.EventStore
+	expiryAttempts int
+}
+
+func (s *unknownConflictStore) AppendBatch(ctx context.Context, batch domain.CommandBatch) (domain.AppendResult, error) {
+	if batch.CommandID != "expiration/batch" {
+		return s.EventStore.AppendBatch(ctx, batch)
+	}
+	s.expiryAttempts++
+	if s.expiryAttempts == 1 {
+		return domain.AppendResult{}, domain.ErrUnknownWriteOutcome
+	}
+	if s.expiryAttempts == 2 {
+		at := moscowTime(2026, time.April, 1, 10)
+		if err := appendFixtureWithoutTest(s.store, ctx, "external-register", "RegisterProduct", domain.Event{EventID: "external-register-event", RecordedAt: at, Type: domain.EventProductRegistered, Payload: domain.EventPayload{Product: &domain.Product{ProductID: "external-product", Name: "External", BaseUnit: domain.BaseUnitG}}}); err != nil {
+			return domain.AppendResult{}, err
+		}
+	}
+	return s.EventStore.AppendBatch(ctx, batch)
+}
+
+func appendFixtureWithoutTest(store *memory.EventStore, ctx context.Context, commandID, commandType string, event domain.Event) error {
+	version, err := store.Version(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = store.AppendBatch(ctx, domain.CommandBatch{ExpectedVersion: version, CommandID: commandID, CommandType: commandType, CommandFingerprint: domain.Fingerprint(commandType, []byte(commandID)), Events: []domain.Event{event}})
+	return err
+}
+
+type unknownCommitReadFailureStore struct {
+	EventStore
+	failAfter     int64
+	failed        bool
+	expiryAppends int
+}
+
+func (s *unknownCommitReadFailureStore) AppendBatch(ctx context.Context, batch domain.CommandBatch) (domain.AppendResult, error) {
+	result, err := s.EventStore.AppendBatch(ctx, batch)
+	if batch.CommandID == "expiration/batch" {
+		s.expiryAppends++
+		if s.expiryAppends == 1 && err == nil {
+			return domain.AppendResult{}, domain.ErrUnknownWriteOutcome
+		}
+	}
+	return result, err
+}
+
+func (s *unknownCommitReadFailureStore) ReadBatches(ctx context.Context, afterSequence int64) ([]domain.RecordedBatch, error) {
+	if !s.failed && afterSequence == s.failAfter {
+		s.failed = true
+		return nil, errors.New("projection read failed")
+	}
+	return s.EventStore.ReadBatches(ctx, afterSequence)
 }
 
 type findCommandFailureStore struct {
