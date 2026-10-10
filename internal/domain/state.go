@@ -170,7 +170,12 @@ func applyEvent(state *InventoryState, event Event) error {
 		if _, exists := state.Dishes[dish.DishID]; exists {
 			return ErrInvalidEvent
 		}
+		ingredientProducts := make(map[string]struct{}, len(dish.Ingredients))
 		for _, ingredient := range dish.Ingredients {
+			if _, exists := ingredientProducts[ingredient.ProductID]; exists {
+				return ErrInvalidEvent
+			}
+			ingredientProducts[ingredient.ProductID] = struct{}{}
 			if _, exists := state.Products[ingredient.ProductID]; !exists {
 				return ErrProductNotFound
 			}

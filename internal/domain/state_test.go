@@ -62,6 +62,30 @@ func TestReducerRejectsBrokenReferencesWithoutMutatingInput(t *testing.T) {
 	}
 }
 
+func TestReducerRejectsRepeatedRecipeProductWithoutMutatingInput(t *testing.T) {
+	recordedAt := time.Date(2026, 1, 1, 12, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
+	original := InventoryState{
+		Products: map[string]Product{"p1": {ProductID: "p1", Name: "Tomato", BaseUnit: BaseUnitG}},
+	}
+	_, err := ApplyRecordedBatch(original, RecordedBatch{
+		CommandID: "define-dish", CommandType: "DefineDish", CommandFingerprint: "fp", FinalSequence: 1,
+		Events: []Event{{
+			EventID: "dish-event", StreamID: InventoryStreamID, Sequence: 1, SchemaVersion: InventorySchemaV1,
+			CommandID: "define-dish", CommandFingerprint: "fp", RecordedAt: recordedAt,
+			Type: EventDishDefined, Payload: EventPayload{Dish: &Dish{DishID: "d1", Name: "Soup", Ingredients: []Ingredient{
+				{ProductID: "p1", Quantity: 1000},
+				{ProductID: "p1", Quantity: 500},
+			}}},
+		}},
+	})
+	if !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("ApplyRecordedBatch() error = %v; want ErrInvalidEvent", err)
+	}
+	if original.StateVersion != 0 || len(original.Dishes) != 0 || len(original.Products) != 1 || original.Products["p1"].Name != "Tomato" {
+		t.Fatalf("failed replay mutated input state: %#v", original)
+	}
+}
+
 func TestReducerRejectsUnsupportedSchema(t *testing.T) {
 	_, err := ApplyRecordedBatch(InventoryState{}, RecordedBatch{
 		CommandID: "register-p", CommandType: "RegisterProduct", CommandFingerprint: "fp", FinalSequence: 1,
