@@ -136,13 +136,6 @@ func (r *Runtime) FindRecordedCommand(ctx context.Context, commandID string) (co
 		expiry := contract.ExpiryResult{BatchID: value.BatchID, ProductID: value.ProductID, WrittenOffQuantity: contract.Quantity(value.WrittenOffQuantity), Reason: value.Reason, ExpiresAt: value.ExpiresAt, ProcessedAt: value.ProcessedAt}
 		result.Result.Expiry = &expiry
 	}
-	if result.Result.Dish != nil {
-		dish, err := r.owner.GetDish(ctx, result.Result.Dish.DishID)
-		if err != nil {
-			return contract.CommandRecord{}, false, err
-		}
-		result.Result.Dish = &dish
-	}
 	return result, true, nil
 }
 

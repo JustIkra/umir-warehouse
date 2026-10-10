@@ -197,7 +197,9 @@ func (o *Owner) findRecordedCommitOrder(ctx context.Context, commandID, fingerpr
 }
 
 func canonicalConfirmOrderFP(proposalID string) string {
-	return fingerprintJSON("ConfirmOrder", struct{ ProposalID string }{ProposalID: proposalID})
+	return fingerprintJSON("ConfirmOrder", struct {
+		ProposalID string `json:"proposalID"`
+	}{ProposalID: proposalID})
 }
 
 func toDomainPositions(positions []contract.Position) ([]domain.Position, error) {

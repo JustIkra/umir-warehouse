@@ -12,6 +12,17 @@ import (
 	"github.com/JustIkra/umir-warehouse/internal/domain"
 )
 
+func TestCanonicalConfirmOrderFingerprintMatchesSharedValues(t *testing.T) {
+	for proposalID, want := range map[string]string{
+		"p1":        "67610c5d5f3bb1111e064b8ca1f6c8e020c17f3d3dd9651ebb3a3fc69d9ac3b5",
+		"serving-1": "2fa5cd21faf2eb52aaf62b6d34e9ba95fdd0f0b1e1211d16a81cf1a2d074d080",
+	} {
+		if got := canonicalConfirmOrderFP(proposalID); got != want {
+			t.Errorf("canonicalConfirmOrderFP(%q) = %q, want %q", proposalID, got, want)
+		}
+	}
+}
+
 func TestSharedIngredientOrder(t *testing.T) {
 	ctx := context.Background()
 	now := moscowTime(2026, time.April, 2, 10)

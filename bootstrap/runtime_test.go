@@ -8,7 +8,21 @@ import (
 	"time"
 
 	"github.com/JustIkra/umir-warehouse/contract"
+	"github.com/JustIkra/umir-warehouse/internal/adapters/memory"
+	"github.com/JustIkra/umir-warehouse/internal/application"
 )
+
+type versionFailureStore struct {
+	*memory.EventStore
+	failVersion bool
+}
+
+func (s *versionFailureStore) Version(ctx context.Context) (int64, error) {
+	if s.failVersion {
+		return 0, errors.New("injected projection lookup failure")
+	}
+	return s.EventStore.Version(ctx)
+}
 
 func TestPublicRuntimeOptions(t *testing.T) {
 	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
@@ -244,7 +258,7 @@ func TestRuntimeCommandLookupsPreserveTaggedResultsAndCopies(t *testing.T) {
 				t.Errorf("product result = %+v", record.Result.Product)
 			}
 		case contract.CommandResultDishDefined:
-			if record.Result.Dish == nil || record.Result.Dish.DishID != "soup" || len(record.Result.Dish.Ingredients) != 1 || record.Result.Dish.Ingredients[0].BaseUnit != contract.BaseUnitML {
+			if record.Result.Dish == nil || record.Result.Dish.DishID != "soup" || len(record.Result.Dish.Ingredients) != 1 || record.Result.Dish.Ingredients[0].ProductID != "milk" || record.Result.Dish.Ingredients[0].Quantity != 1000 || record.Result.Dish.Ingredients[0].BaseUnit != "" {
 				t.Errorf("dish result = %+v", record.Result.Dish)
 			}
 		case contract.CommandResultDeliveryReceived:
@@ -306,6 +320,46 @@ func TestRuntimeCommandLookupsPreserveTaggedResultsAndCopies(t *testing.T) {
 
 	if _, found, err := runtime.FindRecordedCommand(ctx, "unknown-command"); err != nil || found {
 		t.Fatalf("FindRecordedCommand(unknown) found=%v, err=%v", found, err)
+	}
+}
+
+func TestRecordedDishLookupDoesNotRequireCatalogRead(t *testing.T) {
+	ctx := context.Background()
+	store := &versionFailureStore{EventStore: memory.NewEventStore()}
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
+	nextID := 0
+	owner, err := application.NewOwner(store, func() time.Time { return now }, func() string {
+		nextID++
+		return fmt.Sprintf("generated-%d", nextID)
+	})
+	if err != nil {
+		t.Fatalf("NewOwner() error = %v", err)
+	}
+	if err := owner.ConfigureSnapshots(memory.NewSnapshotStore(), 10); err != nil {
+		t.Fatalf("ConfigureSnapshots() error = %v", err)
+	}
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "register", ProductID: "milk", Name: "Milk", BaseUnit: contract.BaseUnitML}); err != nil {
+		t.Fatalf("RegisterProduct() error = %v", err)
+	}
+	if _, err := owner.DefineDish(ctx, contract.DefineDishRequest{CommandID: "define", DishID: "soup", Name: "Soup", Ingredients: []contract.Ingredient{{ProductID: "milk", Quantity: 1000}}}); err != nil {
+		t.Fatalf("DefineDish() error = %v", err)
+	}
+	if record, found, err := store.FindCommand(ctx, "define"); err != nil || !found || record.Result.Dish == nil {
+		t.Fatalf("FindCommand() found=%v result=%+v err=%v; want committed dish fact", found, record.Result.Dish, err)
+	}
+
+	runtime := &Runtime{owner: owner}
+	store.failVersion = true
+	record, found, err := runtime.FindRecordedCommand(ctx, "define")
+	if err != nil || !found {
+		t.Fatalf("FindRecordedCommand() found=%v err=%v; want journal result despite unavailable catalog projection", found, err)
+	}
+	if record.Result.Dish == nil || record.Result.Dish.DishID != "soup" || len(record.Result.Dish.Ingredients) != 1 {
+		t.Fatalf("FindRecordedCommand() dish = %+v", record.Result.Dish)
+	}
+	ingredient := record.Result.Dish.Ingredients[0]
+	if ingredient.ProductID != "milk" || ingredient.Quantity != 1000 || ingredient.BaseUnit != "" {
+		t.Fatalf("recorded ingredient = %+v, want fact fields with optional BaseUnit unset", ingredient)
 	}
 }
 
