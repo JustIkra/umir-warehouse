@@ -93,14 +93,27 @@ func TestAcceptanceFailedReconciliationBlocksAdmissionAndRepairs(t *testing.T) {
 	if err != nil || initial.Products[0].Quantity != 10000 {
 		t.Fatalf("initial GetInventory() = %#v, %v; want 10000 balance", initial, err)
 	}
+	assertOldProjection := func() {
+		t.Helper()
+		owner.mu.Lock()
+		defer owner.mu.Unlock()
+		if owner.state.StateVersion != 3 || owner.state.Batches["batch"].RemainingQuantity != 10000 {
+			t.Fatalf("failed reconciliation changed old inventory: %#v", owner.state)
+		}
+		if len(owner.expirations) != 1 || !owner.expirations["batch"].Equal(dueAt) {
+			t.Fatalf("failed reconciliation changed old expiration index: %#v", owner.expirations)
+		}
+	}
 	wrapped.failNextFullReads(2)
 	if err := owner.Recover(ctx); !errors.Is(err, contract.ErrInventoryUnavailable) {
 		t.Fatalf("Recover() during rebuild failure = %v; want InventoryUnavailable", err)
 	}
+	assertOldProjection()
 	clock.Set(dueAt)
 	if _, err := owner.GetInventory(ctx); !errors.Is(err, contract.ErrInventoryUnavailable) {
 		t.Fatalf("GetInventory() while rebuild still fails = %v; want InventoryUnavailable", err)
 	}
+	assertOldProjection()
 	if version, err := base.Version(ctx); err != nil || version != 3 {
 		t.Fatalf("version while reconciliation is unavailable = %d, %v; want no expiry/order write", version, err)
 	}
@@ -181,24 +194,34 @@ func TestAcceptanceReaderSeesWholeDeliveryAndExpiryProjection(t *testing.T) {
 		deliveryDone <- err
 	}()
 	<-appendGate.entered
-	readerStarted := make(chan struct{})
+	readerAtGate := make(chan bool, 1)
 	readerDone := make(chan struct {
 		view contract.InventoryView
 		err  error
 	}, 1)
 	go func() {
-		close(readerStarted)
+		entered := owner.mu.TryLock()
+		if entered {
+			owner.mu.Unlock()
+		}
+		readerAtGate <- entered
 		view, err := owner.GetInventory(ctx)
 		readerDone <- struct {
 			view contract.InventoryView
 			err  error
 		}{view: view, err: err}
 	}()
-	<-readerStarted
-	select {
-	case result := <-readerDone:
-		t.Fatalf("reader returned while delivery append was paused: view=%#v err=%v", result.view, result.err)
-	default:
+	if <-readerAtGate {
+		close(appendGate.release)
+		<-deliveryDone
+		<-readerDone
+		t.Fatal("reader entered the owner gate while delivery append was paused")
+	}
+	if owner.state.StateVersion != 1 || len(owner.state.Batches) != 0 || len(owner.expirations) != 0 {
+		close(appendGate.release)
+		<-deliveryDone
+		<-readerDone
+		t.Fatal("delivery published an intermediate inventory or expiration index")
 	}
 	close(appendGate.release)
 	if err := <-deliveryDone; err != nil {
@@ -210,6 +233,12 @@ func TestAcceptanceReaderSeesWholeDeliveryAndExpiryProjection(t *testing.T) {
 	}
 	if read.view.StateVersion != 3 || len(read.view.Products) != 1 || read.view.Products[0].Quantity != 0 || len(read.view.Products[0].Batches) != 0 {
 		t.Fatalf("reader inventory after atomic delivery+expiry = %#v; want final zero-stock state at version 3", read.view)
+	}
+	owner.mu.Lock()
+	version, tasks := owner.state.StateVersion, len(owner.expirations)
+	owner.mu.Unlock()
+	if version != 3 || tasks != 0 {
+		t.Fatalf("completed projection version=%d expiration tasks=%d; want 3 and 0", version, tasks)
 	}
 	history, err := owner.GetHistory(ctx)
 	if err != nil {

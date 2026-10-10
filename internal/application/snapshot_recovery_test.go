@@ -128,12 +128,19 @@ func TestInvalidSnapshotCandidatesFallBackToFullReplay(t *testing.T) {
 		{name: "stream", edit: func(s *domain.Snapshot) { s.StreamID = "other" }},
 		{name: "above journal", edit: func(s *domain.Snapshot) { s.LastSequence++; s.State.StateVersion++ }},
 		{name: "non boundary", edit: func(s *domain.Snapshot) { s.LastSequence = 3; s.State.StateVersion = 3 }},
-		{name: "broken reference", edit: func(s *domain.Snapshot) { delete(s.State.Products, "p") }},
+		{name: "broken reference", edit: func(s *domain.Snapshot) { delete(s.State.Products, "product") }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := domain.CloneSnapshot(valid)
 			test.edit(&candidate)
+			batches, err := store.ReadBatches(context.Background(), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := auditSnapshotPrefix(candidate, batches); err == nil {
+				t.Fatal("invalid candidate passed prefix validation")
+			}
 			owner, err := NewOwner(store, func() time.Time { return moscowTime(2026, time.April, 1, 10) }, nextTestID())
 			if err != nil {
 				t.Fatal(err)
@@ -143,6 +150,9 @@ func TestInvalidSnapshotCandidatesFallBackToFullReplay(t *testing.T) {
 			}
 			if err := owner.Recover(context.Background()); err != nil {
 				t.Fatalf("Recover() with unusable candidate = %v; want full replay fallback", err)
+			}
+			if owner.lastSavedSequence != 0 {
+				t.Fatalf("invalid candidate accepted at sequence %d", owner.lastSavedSequence)
 			}
 			if owner.state.StateVersion != 4 || owner.state.Products["product"].ProductID != "product" {
 				t.Fatalf("recovered state = version %d, product %#v; want journal version 4", owner.state.StateVersion, owner.state.Products["product"])
