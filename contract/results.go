@@ -24,6 +24,7 @@ type ExpiryResult struct {
 	BatchID            string
 	ProductID          string
 	WrittenOffQuantity Quantity
+	Reason             string
 	ExpiresAt          time.Time
 	ProcessedAt        time.Time
 }

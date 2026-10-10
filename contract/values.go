@@ -171,6 +171,7 @@ type EventPayload struct {
 	Product  *Product
 	Dish     *Dish
 	Delivery *Delivery
+	Batches  []Batch
 	Order    *Order
 	Expiry   *ExpiryResult
 }

@@ -43,16 +43,18 @@ type Delivery struct {
 }
 
 type Batch struct {
-	BatchID           string
-	DeliveryID        string
-	LineNo            int64
-	ProductID         string
-	ManufacturedAt    time.Time
-	ShelfLife         ShelfLife
-	ReceivedAt        time.Time
-	ExpiresAt         time.Time
-	ReceivedQuantity  Quantity
-	RemainingQuantity Quantity
+	BatchID             string
+	DeliveryID          string
+	LineNo              int64
+	ProductID           string
+	ManufacturedAt      time.Time
+	ShelfLife           ShelfLife
+	ReceivedAt          time.Time
+	ExpiresAt           time.Time
+	ReceivedQuantity    Quantity
+	RemainingQuantity   Quantity
+	ConsumedByOrders    Quantity
+	WrittenOffForExpiry Quantity
 }
 
 type Position struct {
@@ -135,5 +137,6 @@ type InventoryState struct {
 	Batches          map[string]Batch
 	Orders           map[string]Order
 	OrdersByProposal map[string]string
+	Commands         map[string]CommandRecord
 	StateVersion     int64
 }
