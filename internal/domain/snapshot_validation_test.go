@@ -65,6 +65,27 @@ func TestValidateInventoryStateRejectsNegativeBalancesAndBrokenOrderIndex(t *tes
 	}
 }
 
+func TestEqualOrderUsesTimeInstantAndTypedSlices(t *testing.T) {
+	placedAt := time.Date(2026, time.March, 1, 12, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
+	first := Order{
+		OrderID: "order-1", ProposalID: "proposal-1", PlacedAt: placedAt,
+		AcceptedPositions: []AcceptedPosition{{LineNo: 1, DishID: "dish-1", Portions: 2}},
+		Allocations:       []Allocation{{ProductID: "product-1", BatchID: "batch-1", Quantity: 2000}},
+	}
+	second := Order{
+		OrderID: first.OrderID, ProposalID: first.ProposalID, PlacedAt: time.Date(2026, time.March, 1, 11, 0, 0, 0, time.FixedZone("Other", 2*60*60)),
+		AcceptedPositions: append([]AcceptedPosition(nil), first.AcceptedPositions...),
+		Allocations:       append([]Allocation(nil), first.Allocations...),
+	}
+	if !equalOrder(first, second) {
+		t.Fatal("equalOrder treated equivalent instants or typed slices as different")
+	}
+	second.Allocations[0].Quantity++
+	if equalOrder(first, second) {
+		t.Fatal("equalOrder ignored an allocation change")
+	}
+}
+
 func validationTime() time.Time {
 	return time.Date(2026, time.March, 1, 12, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
 }

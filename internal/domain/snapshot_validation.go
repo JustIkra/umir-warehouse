@@ -3,7 +3,7 @@ package domain
 import (
 	"errors"
 	"fmt"
-	"reflect"
+	"slices"
 )
 
 var ErrInvalidSnapshot = errors.New("invalid snapshot")
@@ -70,7 +70,7 @@ func validateDeliveriesAndBatches(state InventoryState) error {
 	}
 	counts := make(map[string]int, len(state.Deliveries))
 	for id, batch := range state.Batches {
-		if id == "" || id != batch.BatchID || batch.DeliveryID == "" || batch.ProductID == "" || batch.LineNo <= 0 || batch.ReceivedQuantity <= 0 || batch.ShelfLife.Value <= 0 || batch.ShelfLife.Unit != ShelfLifeDay && batch.ShelfLife.Unit != ShelfLifeMonth || !isBusinessTime(batch.ManufacturedAt) || !isBusinessTime(batch.ReceivedAt) || !isBusinessTime(batch.ExpiresAt) || !batch.ExpiresAt.After(batch.ManufacturedAt) || !validBatchBalance(batch) {
+		if id == "" || id != batch.BatchID || batch.DeliveryID == "" || batch.ProductID == "" || batch.LineNo <= 0 || batch.ReceivedQuantity <= 0 || batch.ShelfLife.Value <= 0 || batch.ShelfLife.Unit != ShelfLifeDay && batch.ShelfLife.Unit != ShelfLifeMonth || !isBusinessTime(batch.ManufacturedAt) || !isBusinessTime(batch.ReceivedAt) || !isBusinessTime(batch.ExpiresAt) || !batch.ExpiresAt.After(batch.ManufacturedAt) || batch.WrittenOffForExpiry > 0 && batch.RemainingQuantity > 0 || !validBatchBalance(batch) {
 			return ErrInvalidSnapshot
 		}
 		if _, exists := state.Products[batch.ProductID]; !exists {
@@ -166,11 +166,12 @@ func validateOrders(state InventoryState) error {
 }
 
 func validateCommands(state InventoryState) error {
-	productResults := 0
-	dishResults := 0
-	deliveryResults := 0
-	orderResults := 0
+	products := make(map[string]struct{}, len(state.Products))
+	dishes := make(map[string]struct{}, len(state.Dishes))
+	deliveries := make(map[string]struct{}, len(state.Deliveries))
+	orders := make(map[string]struct{}, len(state.Orders))
 	expired := make(map[string]Quantity)
+	arrivalExpired := make(map[string]Quantity)
 	for id, record := range state.Commands {
 		if id == "" || id != record.CommandID || record.CommandType == "" || record.CommandFingerprint == "" {
 			return ErrInvalidSnapshot
@@ -189,41 +190,69 @@ func validateCommands(state InventoryState) error {
 			if record.CommandType != "RegisterProduct" || record.Result.Product == nil {
 				return ErrInvalidSnapshot
 			}
-			product, exists := state.Products[record.Result.Product.ProductID]
-			if !exists || !reflect.DeepEqual(product, *record.Result.Product) {
+			productID := record.Result.Product.ProductID
+			product, exists := state.Products[productID]
+			if !exists || !equalProduct(product, *record.Result.Product) {
 				return ErrInvalidSnapshot
 			}
-			productResults++
+			if _, exists := products[productID]; exists {
+				return ErrInvalidSnapshot
+			}
+			products[productID] = struct{}{}
 		case CommandResultDishDefined:
 			if record.CommandType != "DefineDish" || record.Result.Dish == nil {
 				return ErrInvalidSnapshot
 			}
-			dish, exists := state.Dishes[record.Result.Dish.DishID]
-			if !exists || !reflect.DeepEqual(dish, *record.Result.Dish) {
+			dishID := record.Result.Dish.DishID
+			dish, exists := state.Dishes[dishID]
+			if !exists || !equalDish(dish, *record.Result.Dish) {
 				return ErrInvalidSnapshot
 			}
-			dishResults++
+			if _, exists := dishes[dishID]; exists {
+				return ErrInvalidSnapshot
+			}
+			dishes[dishID] = struct{}{}
 		case CommandResultDeliveryReceived:
 			if err := validateDeliveryCommandResult(state, record); err != nil {
 				return err
 			}
-			deliveryResults++
+			deliveryID := record.Result.Delivery.DeliveryID
+			if _, exists := deliveries[deliveryID]; exists {
+				return ErrInvalidSnapshot
+			}
+			deliveries[deliveryID] = struct{}{}
+			for _, batchID := range record.Result.Delivery.BatchIDs {
+				batch := state.Batches[batchID]
+				if !batch.ExpiresAt.After(batch.ReceivedAt) {
+					if batch.RemainingQuantity != 0 || batch.ConsumedByOrders != 0 || batch.WrittenOffForExpiry != batch.ReceivedQuantity {
+						return ErrInvalidSnapshot
+					}
+					arrivalExpired[batchID] = batch.WrittenOffForExpiry
+				}
+			}
 		case CommandResultOrderPlaced:
 			if record.CommandType != "ConfirmOrder" || record.Result.Order == nil {
 				return ErrInvalidSnapshot
 			}
-			order, exists := state.Orders[record.Result.Order.OrderID]
-			if !exists || !reflect.DeepEqual(order, *record.Result.Order) {
+			orderID := record.Result.Order.OrderID
+			order, exists := state.Orders[orderID]
+			if !exists || !equalOrder(order, *record.Result.Order) {
 				return ErrInvalidSnapshot
 			}
-			orderResults++
+			if _, exists := orders[orderID]; exists {
+				return ErrInvalidSnapshot
+			}
+			orders[orderID] = struct{}{}
 		case CommandResultBatchExpired:
 			if record.CommandType != "ExpireBatch" || record.Result.Expiry == nil {
 				return ErrInvalidSnapshot
 			}
 			expiry := record.Result.Expiry
 			batch, exists := state.Batches[expiry.BatchID]
-			if !exists || expiry.ProductID != batch.ProductID || expiry.Reason != ExpiryReasonExpiration || expiry.WrittenOffQuantity <= 0 || !expiry.ExpiresAt.Equal(batch.ExpiresAt) {
+			if !exists || expiry.ProductID != batch.ProductID || expiry.Reason != ExpiryReasonExpiration || expiry.WrittenOffQuantity <= 0 || !expiry.ExpiresAt.Equal(batch.ExpiresAt) || !isBusinessTime(expiry.ProcessedAt) {
+				return ErrInvalidSnapshot
+			}
+			if _, exists := expired[expiry.BatchID]; exists {
 				return ErrInvalidSnapshot
 			}
 			total, err := AddQuantity(expired[expiry.BatchID], expiry.WrittenOffQuantity)
@@ -235,15 +264,61 @@ func validateCommands(state InventoryState) error {
 			return ErrInvalidSnapshot
 		}
 	}
-	if productResults != len(state.Products) || dishResults != len(state.Dishes) || deliveryResults != len(state.Deliveries) || orderResults != len(state.Orders) {
+	if len(products) != len(state.Products) || len(dishes) != len(state.Dishes) || len(deliveries) != len(state.Deliveries) || len(orders) != len(state.Orders) {
 		return ErrInvalidSnapshot
 	}
+	for id := range state.Products {
+		if _, exists := products[id]; !exists {
+			return ErrInvalidSnapshot
+		}
+	}
+	for id := range state.Dishes {
+		if _, exists := dishes[id]; !exists {
+			return ErrInvalidSnapshot
+		}
+	}
+	for id := range state.Deliveries {
+		if _, exists := deliveries[id]; !exists {
+			return ErrInvalidSnapshot
+		}
+	}
+	for id := range state.Orders {
+		if _, exists := orders[id]; !exists {
+			return ErrInvalidSnapshot
+		}
+	}
 	for id, batch := range state.Batches {
-		if expired[id] != batch.WrittenOffForExpiry {
+		expiredQuantity := expired[id]
+		if arrivalExpired[id] > 0 {
+			if expiredQuantity > 0 {
+				return fmt.Errorf("%w: batch %q has duplicate expiry evidence", ErrInvalidSnapshot, id)
+			}
+			expiredQuantity = arrivalExpired[id]
+		}
+		if expiredQuantity != batch.WrittenOffForExpiry {
 			return fmt.Errorf("%w: batch %q write-off does not match command results", ErrInvalidSnapshot, id)
 		}
 	}
 	return nil
+}
+
+func equalProduct(a, b Product) bool {
+	return a.ProductID == b.ProductID && a.Name == b.Name && a.BaseUnit == b.BaseUnit
+}
+
+func equalDish(a, b Dish) bool {
+	return a.DishID == b.DishID && a.Name == b.Name && slices.EqualFunc(a.Ingredients, b.Ingredients, func(x, y Ingredient) bool {
+		return x.ProductID == y.ProductID && x.Quantity == y.Quantity
+	})
+}
+
+func equalOrder(a, b Order) bool {
+	return a.OrderID == b.OrderID && a.ProposalID == b.ProposalID && a.PlacedAt.Equal(b.PlacedAt) &&
+		slices.EqualFunc(a.AcceptedPositions, b.AcceptedPositions, func(x, y AcceptedPosition) bool {
+			return x.LineNo == y.LineNo && x.DishID == y.DishID && x.Portions == y.Portions
+		}) && slices.EqualFunc(a.Allocations, b.Allocations, func(x, y Allocation) bool {
+		return x.ProductID == y.ProductID && x.BatchID == y.BatchID && x.Quantity == y.Quantity
+	})
 }
 
 func validateDeliveryCommandResult(state InventoryState, record CommandRecord) error {
