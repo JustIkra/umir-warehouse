@@ -95,7 +95,7 @@ func TestSnapshotStoreCancellationBeforeCommitPreservesPrevious(t *testing.T) {
 	}
 }
 
-func TestSnapshotStoreAcceptsImmediateDeliveryExpiration(t *testing.T) {
+func TestSnapshotStoreAcceptsDelayedDeliveryExpiration(t *testing.T) {
 	store := memory.NewSnapshotStore()
 	state := domain.InventoryState{}
 	registeredAt := snapshotTime(2026, time.March, 1, 12)
@@ -114,13 +114,15 @@ func TestSnapshotStoreAcceptsImmediateDeliveryExpiration(t *testing.T) {
 	}
 	manufacturedAt := snapshotTime(2026, time.February, 28, 12)
 	arrivalAt := snapshotTime(2026, time.March, 1, 12)
-	delivery := domain.Delivery{DeliveryID: "delivery-1", Number: "invoice-1", CreatedAt: arrivalAt, Lines: []domain.DeliveryLine{{ProductID: "product-1", ManufacturedAt: manufacturedAt, ShelfLife: domain.ShelfLife{Value: 1, Unit: domain.ShelfLifeDay}, ReceivedAt: arrivalAt, Quantity: 1000}}}
-	batch := domain.Batch{BatchID: "batch-1", DeliveryID: "delivery-1", LineNo: 1, ProductID: "product-1", ManufacturedAt: manufacturedAt, ShelfLife: domain.ShelfLife{Value: 1, Unit: domain.ShelfLifeDay}, ReceivedAt: arrivalAt, ExpiresAt: arrivalAt, ReceivedQuantity: 1000, RemainingQuantity: 1000}
+	processedAt := snapshotTime(2026, time.March, 3, 12)
+	delivery := domain.Delivery{DeliveryID: "delivery-1", Number: "invoice-1", CreatedAt: arrivalAt, Lines: []domain.DeliveryLine{{ProductID: "product-1", ManufacturedAt: manufacturedAt, ShelfLife: domain.ShelfLife{Value: 2, Unit: domain.ShelfLifeDay}, ReceivedAt: arrivalAt, Quantity: 1000}}}
+	expiresAt := snapshotTime(2026, time.March, 2, 12)
+	batch := domain.Batch{BatchID: "batch-1", DeliveryID: "delivery-1", LineNo: 1, ProductID: "product-1", ManufacturedAt: manufacturedAt, ShelfLife: domain.ShelfLife{Value: 2, Unit: domain.ShelfLifeDay}, ReceivedAt: arrivalAt, ExpiresAt: expiresAt, ReceivedQuantity: 1000, RemainingQuantity: 1000}
 	deliveryBatch := domain.RecordedBatch{
 		CommandID: "receive-delivery", CommandType: "ReceiveDelivery", CommandFingerprint: "delivery-fingerprint", FinalSequence: 3,
 		Events: []domain.Event{
-			{EventID: "delivery-event", StreamID: domain.InventoryStreamID, Sequence: 2, SchemaVersion: domain.InventorySchemaV1, CommandID: "receive-delivery", CommandFingerprint: "delivery-fingerprint", RecordedAt: arrivalAt, Type: domain.EventDeliveryReceived, Payload: domain.EventPayload{Delivery: &delivery, Batches: []domain.Batch{batch}}},
-			{EventID: "expiry-event", StreamID: domain.InventoryStreamID, Sequence: 3, SchemaVersion: domain.InventorySchemaV1, CommandID: "receive-delivery", CommandFingerprint: "delivery-fingerprint", RecordedAt: arrivalAt, Type: domain.EventBatchExpired, Payload: domain.EventPayload{Expiry: &domain.ExpiryResult{BatchID: "batch-1", ProductID: "product-1", WrittenOffQuantity: 1000, Reason: domain.ExpiryReasonExpiration, ExpiresAt: arrivalAt, ProcessedAt: arrivalAt}}},
+			{EventID: "delivery-event", StreamID: domain.InventoryStreamID, Sequence: 2, SchemaVersion: domain.InventorySchemaV1, CommandID: "receive-delivery", CommandFingerprint: "delivery-fingerprint", RecordedAt: processedAt, Type: domain.EventDeliveryReceived, Payload: domain.EventPayload{Delivery: &delivery, Batches: []domain.Batch{batch}}},
+			{EventID: "expiry-event", StreamID: domain.InventoryStreamID, Sequence: 3, SchemaVersion: domain.InventorySchemaV1, CommandID: "receive-delivery", CommandFingerprint: "delivery-fingerprint", RecordedAt: processedAt, Type: domain.EventBatchExpired, Payload: domain.EventPayload{Expiry: &domain.ExpiryResult{BatchID: "batch-1", ProductID: "product-1", WrittenOffQuantity: 1000, Reason: domain.ExpiryReasonExpiration, ExpiresAt: expiresAt, ProcessedAt: processedAt}}},
 		},
 	}
 	state, err = domain.ApplyRecordedBatch(state, deliveryBatch)

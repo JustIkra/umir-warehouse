@@ -171,7 +171,7 @@ func validateCommands(state InventoryState) error {
 	deliveries := make(map[string]struct{}, len(state.Deliveries))
 	orders := make(map[string]struct{}, len(state.Orders))
 	expired := make(map[string]Quantity)
-	arrivalExpired := make(map[string]Quantity)
+	deliveryBatches := make(map[string]struct{}, len(state.Batches))
 	for id, record := range state.Commands {
 		if id == "" || id != record.CommandID || record.CommandType == "" || record.CommandFingerprint == "" {
 			return ErrInvalidSnapshot
@@ -222,13 +222,7 @@ func validateCommands(state InventoryState) error {
 			}
 			deliveries[deliveryID] = struct{}{}
 			for _, batchID := range record.Result.Delivery.BatchIDs {
-				batch := state.Batches[batchID]
-				if !batch.ExpiresAt.After(batch.ReceivedAt) {
-					if batch.RemainingQuantity != 0 || batch.ConsumedByOrders != 0 || batch.WrittenOffForExpiry != batch.ReceivedQuantity {
-						return ErrInvalidSnapshot
-					}
-					arrivalExpired[batchID] = batch.WrittenOffForExpiry
-				}
+				deliveryBatches[batchID] = struct{}{}
 			}
 		case CommandResultOrderPlaced:
 			if record.CommandType != "ConfirmOrder" || record.Result.Order == nil {
@@ -288,14 +282,17 @@ func validateCommands(state InventoryState) error {
 		}
 	}
 	for id, batch := range state.Batches {
-		expiredQuantity := expired[id]
-		if arrivalExpired[id] > 0 {
-			if expiredQuantity > 0 {
-				return fmt.Errorf("%w: batch %q has duplicate expiry evidence", ErrInvalidSnapshot, id)
+		if expired[id] > 0 {
+			if expired[id] != batch.WrittenOffForExpiry {
+				return fmt.Errorf("%w: batch %q write-off does not match command results", ErrInvalidSnapshot, id)
 			}
-			expiredQuantity = arrivalExpired[id]
+			continue
 		}
-		if expiredQuantity != batch.WrittenOffForExpiry {
+		if batch.WrittenOffForExpiry == 0 {
+			continue
+		}
+		_, hasDeliveryReceipt := deliveryBatches[id]
+		if !hasDeliveryReceipt || batch.RemainingQuantity != 0 || batch.ConsumedByOrders != 0 || batch.WrittenOffForExpiry != batch.ReceivedQuantity {
 			return fmt.Errorf("%w: batch %q write-off does not match command results", ErrInvalidSnapshot, id)
 		}
 	}
