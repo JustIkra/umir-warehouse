@@ -75,12 +75,31 @@ func (o *Owner) CommitAcceptedOrder(ctx context.Context, request contract.Commit
 	}
 	fingerprint := canonicalConfirmOrderFP(request.ProposalID)
 	for {
+		var pendingOrder *domain.Order
+		var pendingErr error
+		if o.pending != nil {
+			pendingRecord, found, err := o.resolvePendingLocked(ctx)
+			pendingErr = err
+			if found {
+				if pendingRecord.CommandID == request.CommandID {
+					return recordedCommitOrder(pendingRecord, fingerprint)
+				}
+				if pendingRecord.Result.Order != nil && pendingRecord.Result.Order.ProposalID == request.ProposalID {
+					order := domain.CloneOrder(*pendingRecord.Result.Order)
+					pendingOrder = &order
+				}
+			}
+		}
 		record, found, err := o.findCommand(ctx, request.CommandID, "ConfirmOrder", fingerprint)
 		if err != nil {
 			return contract.CommitResult{}, err
 		}
 		if found {
 			return recordedCommitOrder(record, fingerprint)
+		}
+		if pendingOrder != nil {
+			order := toContractOrder(*pendingOrder)
+			return contract.CommitResult{Kind: contract.CommitResultOrderCommitted, Order: &order}, nil
 		}
 		existing, found, err := o.events.FindOrderByProposal(ctx, request.ProposalID)
 		if err != nil {
@@ -89,6 +108,9 @@ func (o *Owner) CommitAcceptedOrder(ctx context.Context, request contract.Commit
 		if found {
 			order := toContractOrder(existing)
 			return contract.CommitResult{Kind: contract.CommitResultOrderCommitted, Order: &order}, nil
+		}
+		if pendingErr != nil && !errors.Is(pendingErr, domain.ErrConcurrentModification) {
+			return contract.CommitResult{}, inventoryUnavailable(pendingErr)
 		}
 		requested, err := toDomainAcceptedPositions(request.AcceptedPositions)
 		if err != nil {
@@ -99,7 +121,26 @@ func (o *Owner) CommitAcceptedOrder(ctx context.Context, request contract.Commit
 		}
 		prepared, _, err := o.prepareLocked(ctx)
 		if err != nil {
+			order, found, lookupErr := o.events.FindOrderByProposal(ctx, request.ProposalID)
+			if lookupErr == nil && found {
+				publicOrder := toContractOrder(order)
+				return contract.CommitResult{Kind: contract.CommitResultOrderCommitted, Order: &publicOrder}, nil
+			}
+			if lookupErr != nil {
+				return contract.CommitResult{}, lookupErr
+			}
 			return contract.CommitResult{}, inventoryUnavailable(err)
+		}
+		if recorded, exists := prepared.State.Commands[request.CommandID]; exists {
+			return recordedCommitOrder(recorded, fingerprint)
+		}
+		if orderID, exists := prepared.State.OrdersByProposal[request.ProposalID]; exists {
+			order, found := prepared.State.Orders[orderID]
+			if !found {
+				return contract.CommitResult{}, domain.ErrInvalidRecordedBatch
+			}
+			publicOrder := toContractOrder(order)
+			return contract.CommitResult{Kind: contract.CommitResultOrderCommitted, Order: &publicOrder}, nil
 		}
 		evaluation, allocations, err := domain.EvaluatePositionsWithAllocations(prepared.State, acceptedAsPositions(requested))
 		if err != nil {

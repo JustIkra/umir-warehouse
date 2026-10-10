@@ -248,3 +248,203 @@ func TestProposalOrderUniqueness(t *testing.T) {
 		t.Fatalf("second commit = %#v, %v; want original order %#v", second, err, *first.Order)
 	}
 }
+
+func TestPendingProposalReturnsOriginalOrderWithExhaustedStock(t *testing.T) {
+	testPendingProposalReturnsOriginalOrder(t, 40000)
+}
+
+func TestPendingProposalReturnsOriginalOrderWithRemainingStock(t *testing.T) {
+	testPendingProposalReturnsOriginalOrder(t, 80000)
+}
+
+func testPendingProposalReturnsOriginalOrder(t *testing.T, stock contract.Quantity) {
+	t.Helper()
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, store := newOrderCommitFixture(t, now, stock)
+	wrapper := &delayConfirmOrderEventStore{EventStore: store, unknownAttempts: 2}
+	owner.events = wrapper
+	accepted := []contract.AcceptedPosition{{LineNo: 3, DishID: "d", Portions: 1}}
+	if _, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "original-command", ProposalID: "same-proposal", AcceptedPositions: accepted}); !errors.Is(err, domain.ErrUnknownWriteOutcome) {
+		t.Fatalf("initial pending commit error = %v; want UnknownWriteOutcome", err)
+	}
+	if owner.pending == nil {
+		t.Fatal("unknown write did not retain the original command")
+	}
+	wantOrder := toContractOrder(*owner.pending.Events[0].Payload.Order)
+	newIDs := 0
+	owner.newID = func() string {
+		newIDs++
+		return "unexpected-id"
+	}
+	versionBeforeResolution, err := store.Version(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "retry-command", ProposalID: "same-proposal", AcceptedPositions: accepted})
+	if err != nil || result.Kind != contract.CommitResultOrderCommitted || result.Order == nil || !reflect.DeepEqual(*result.Order, wantOrder) {
+		t.Fatalf("new command for pending proposal = %#v, %v; want original order %#v", result, err, wantOrder)
+	}
+	versionAfterResolution, err := store.Version(ctx)
+	if err != nil || versionAfterResolution != versionBeforeResolution+1 {
+		t.Fatalf("version after resolving pending order = %d, %v; want one original order event", versionAfterResolution, err)
+	}
+	if newIDs != 0 {
+		t.Fatalf("generated %d IDs while returning the original order; want none", newIDs)
+	}
+}
+
+func TestOrderDiscoveredDuringPreparationReturnsOriginal(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, store := newOrderCommitFixture(t, now, 80000)
+	stateVersion := owner.state.StateVersion
+	batch := externalOrderBatch(owner, "external-command", "same-proposal", 3, 1, "external-order", "external-event", 40000)
+	wrapper := &appendOrderDuringVersionRead{EventStore: store, batch: batch}
+	owner.events = wrapper
+	newIDs := 0
+	owner.newID = func() string {
+		newIDs++
+		return "unexpected-id"
+	}
+	wantOrder := toContractOrder(*batch.Events[0].Payload.Order)
+	result, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "retry-command", ProposalID: "same-proposal", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 3, DishID: "d", Portions: 1}}})
+	if err != nil || result.Kind != contract.CommitResultOrderCommitted || result.Order == nil || !reflect.DeepEqual(*result.Order, wantOrder) {
+		t.Fatalf("order discovered during preparation = %#v, %v; want original order %#v", result, err, wantOrder)
+	}
+	version, err := store.Version(ctx)
+	if err != nil || version != stateVersion+1 {
+		t.Fatalf("version after concurrent order discovery = %d, %v; want one external event", version, err)
+	}
+	if newIDs != 0 {
+		t.Fatalf("generated %d IDs while returning the discovered order; want none", newIDs)
+	}
+}
+
+func TestPendingRecordedOrderReturnsWhenProjectionApplyFails(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, store := newOrderCommitFixture(t, now, 40000)
+	batch := externalOrderBatch(owner, "original-command", "same-proposal", 3, 1, "original-order", "original-event", 40000)
+	appendResult, err := store.AppendBatch(ctx, batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionBeforeRetry, err := store.Version(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner.pending = cloneCommandBatch(batch)
+	wrapper := &hiddenProposalCorruptReadStore{EventStore: store}
+	owner.events = wrapper
+	newIDs := 0
+	owner.newID = func() string {
+		newIDs++
+		return "unexpected-id"
+	}
+	wantOrder := toContractOrder(*appendResult.Command.Result.Order)
+	result, err := owner.CommitAcceptedOrder(ctx, contract.CommitOrderRequest{CommandID: "retry-command", ProposalID: "same-proposal", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 3, DishID: "d", Portions: 1}}})
+	if err != nil || result.Kind != contract.CommitResultOrderCommitted || result.Order == nil || !reflect.DeepEqual(*result.Order, wantOrder) {
+		t.Fatalf("pending order with failed projection apply = %#v, %v; want recorded order %#v", result, err, wantOrder)
+	}
+	if newIDs != 0 {
+		t.Fatalf("generated %d IDs while returning the recorded order; want none", newIDs)
+	}
+	if !wrapper.corruptedRead {
+		t.Fatal("projection read was not fault-injected")
+	}
+	versionAfterRetry, err := store.Version(ctx)
+	if err != nil || versionAfterRetry != versionBeforeRetry {
+		t.Fatalf("version after returning known order = %d, %v; want unchanged %d", versionAfterRetry, err, versionBeforeRetry)
+	}
+}
+
+type delayConfirmOrderEventStore struct {
+	EventStore
+	unknownAttempts int
+	confirmAttempts int
+}
+
+func (s *delayConfirmOrderEventStore) AppendBatch(ctx context.Context, batch domain.CommandBatch) (domain.AppendResult, error) {
+	if batch.CommandType == "ConfirmOrder" {
+		s.confirmAttempts++
+		if s.confirmAttempts <= s.unknownAttempts {
+			return domain.AppendResult{}, domain.ErrUnknownWriteOutcome
+		}
+	}
+	return s.EventStore.AppendBatch(ctx, batch)
+}
+
+type appendOrderDuringVersionRead struct {
+	EventStore
+	batch  domain.CommandBatch
+	insert bool
+}
+
+func (s *appendOrderDuringVersionRead) Version(ctx context.Context) (int64, error) {
+	if !s.insert {
+		s.insert = true
+		if _, err := s.AppendBatch(ctx, s.batch); err != nil {
+			return 0, err
+		}
+	}
+	return s.EventStore.Version(ctx)
+}
+
+type hiddenProposalCorruptReadStore struct {
+	EventStore
+	hidProposal   bool
+	corruptedRead bool
+}
+
+func (s *hiddenProposalCorruptReadStore) FindOrderByProposal(ctx context.Context, proposalID string) (domain.Order, bool, error) {
+	if !s.hidProposal {
+		s.hidProposal = true
+		return domain.Order{}, false, nil
+	}
+	return s.EventStore.FindOrderByProposal(ctx, proposalID)
+}
+
+func (s *hiddenProposalCorruptReadStore) ReadBatches(ctx context.Context, afterSequence int64) ([]domain.RecordedBatch, error) {
+	batches, err := s.EventStore.ReadBatches(ctx, afterSequence)
+	if err == nil && !s.corruptedRead && len(batches) > 0 && batches[0].CommandType == "ConfirmOrder" {
+		batches[0] = domain.CloneRecordedBatch(batches[0])
+		batches[0].Events[0].Payload.Order.OrderID = ""
+		s.corruptedRead = true
+	}
+	return batches, err
+}
+
+func newOrderCommitFixture(t *testing.T, now time.Time, stock contract.Quantity) (*Owner, EventStore) {
+	t.Helper()
+	ctx := context.Background()
+	owner, store, _ := newCatalogOwner(t, now)
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.DefineDish(ctx, contract.DefineDishRequest{CommandID: "dish-d", DishID: "d", Name: "Dish", Ingredients: []contract.Ingredient{{ProductID: "p", Quantity: 40000}}}); err != nil {
+		t.Fatal(err)
+	}
+	delivery := validDeliveryRequest("delivery-p", "delivery-1", now)
+	delivery.Lines[0].Quantity = stock
+	if _, err := owner.ReceiveDelivery(ctx, delivery); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return owner, store
+}
+
+func externalOrderBatch(owner *Owner, commandID, proposalID string, lineNo, portions int64, orderID, eventID string, quantity domain.Quantity) domain.CommandBatch {
+	batchID := ""
+	for id, batch := range owner.state.Batches {
+		if batch.ProductID == "p" {
+			batchID = id
+			break
+		}
+	}
+	order := domain.Order{OrderID: orderID, ProposalID: proposalID, AcceptedPositions: []domain.AcceptedPosition{{LineNo: lineNo, DishID: "d", Portions: portions}}, Allocations: []domain.Allocation{{ProductID: "p", BatchID: batchID, Quantity: quantity}}, PlacedAt: owner.state.Batches[batchID].ReceivedAt}
+	event := domain.Event{EventID: eventID, RecordedAt: owner.state.Batches[batchID].ReceivedAt, Type: domain.EventOrderPlaced, Payload: domain.EventPayload{Order: &order}}
+	return domain.CommandBatch{ExpectedVersion: owner.state.StateVersion, CommandID: commandID, CommandType: "ConfirmOrder", CommandFingerprint: canonicalConfirmOrderFP(proposalID), Events: []domain.Event{event}}
+}
