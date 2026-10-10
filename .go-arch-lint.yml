@@ -13,20 +13,29 @@ components:
   process: {in: "cmd/**"}
   testsupport: {in: "tests/testsupport/**"}
   tests: {in: "tests/**"}
+  contracttests: {in: "tests/contracts/**"}
+  integration: {in: "tests/integration/**"}
+  acceptance: {in: "tests/acceptance/**"}
 deps:
   domain:
     mayDependOn: [domain]
   contract:
     mayDependOn: [contract]
   application:
-    mayDependOn: [application, domain, contract, adapters, testsupport]
+    mayDependOn: [application, domain, contract]
   adapters:
     mayDependOn: [adapters, application, domain, contract]
   bootstrap:
     mayDependOn: [bootstrap, application, adapters, contract]
   process:
-    mayDependOn: [process, bootstrap, contract, application]
+    mayDependOn: [process, bootstrap]
   testsupport:
-    mayDependOn: [testsupport, domain, contract]
+    mayDependOn: [testsupport, application, domain, contract]
   tests:
     mayDependOn: [tests, testsupport, application, adapters, domain, contract, bootstrap]
+  contracttests:
+    mayDependOn: [contracttests, application, adapters, domain, contract, testsupport]
+  integration:
+    mayDependOn: [integration, bootstrap, contract, testsupport]
+  acceptance:
+    mayDependOn: [acceptance, bootstrap, contract, testsupport]
