@@ -78,9 +78,9 @@ func TestWarehouseHTTPRoutesPreserveWireContract(t *testing.T) {
 	if got := getJSON(t, internal, "/internal/v1/dish-catalog"); len(arrayField(t, got, "items")) != 0 {
 		t.Fatalf("empty dish catalog response = %#v", got)
 	}
-	dishID := "суп/+ &?"
+	dishID := "суп/+ &?;"
 	postJSON(t, internal, "/internal/v1/products", `{"commandID":"product-command","productID":"сыр/+ &?","name":"Молоко","baseUnit":"ml"}`, http.StatusOK)
-	postJSON(t, internal, "/internal/v1/dishes", `{"commandID":"dish-command","dishID":"суп/+ &?","name":"Суп","ingredients":[{"productID":"сыр/+ &?","quantity":"1"}]}`, http.StatusOK)
+	postJSON(t, internal, "/internal/v1/dishes", `{"commandID":"dish-command","dishID":"суп/+ &?;","name":"Суп","ingredients":[{"productID":"сыр/+ &?","quantity":"1"}]}`, http.StatusOK)
 	dishPath := "/internal/v1/dish?" + url.Values{"dishID": []string{dishID}}.Encode()
 	details := getJSON(t, internal, dishPath)
 	dishDetails := objectField(t, details["dish"], "dish")
@@ -96,19 +96,19 @@ func TestWarehouseHTTPRoutesPreserveWireContract(t *testing.T) {
 		t.Fatalf("menu response = %#v", menu)
 	}
 	lineNo := "9007199254740993"
-	evaluation := postJSON(t, internal, "/internal/v1/order-evaluations", `{"positions":[{"lineNo":"9007199254740993","dishID":"суп/+ &?","portions":"2"}]}`, http.StatusOK)
+	evaluation := postJSON(t, internal, "/internal/v1/order-evaluations", `{"positions":[{"lineNo":"9007199254740993","dishID":"суп/+ &?;","portions":"2"}]}`, http.StatusOK)
 	requested := objectField(t, arrayField(t, evaluation, "requestedPositions")[0], "requested position")
 	if requested["lineNo"] != lineNo {
 		t.Fatalf("lineNo lost precision: %#v", evaluation)
 	}
 	deliveryBody := `{"commandID":"delivery-command","deliveryID":"поставка/+ &?","number":"D-1","createdAt":"2026-10-11T11:59:59.123456789+03:00","lines":[{"productID":"сыр/+ &?","manufacturedAt":"2026-10-10T12:00:00+03:00","shelfLife":{"value":"3","unit":"day"},"receivedAt":"2026-10-11T12:00:00+03:00","quantity":"9007199254740993"}]}`
 	postJSON(t, public, "/deliveries", deliveryBody, http.StatusOK)
-	evaluation = postJSON(t, internal, "/internal/v1/order-evaluations", `{"positions":[{"lineNo":"9007199254740993","dishID":"суп/+ &?","portions":"2"}]}`, http.StatusOK)
+	evaluation = postJSON(t, internal, "/internal/v1/order-evaluations", `{"positions":[{"lineNo":"9007199254740993","dishID":"суп/+ &?;","portions":"2"}]}`, http.StatusOK)
 	accepted := objectField(t, arrayField(t, evaluation, "acceptedPositions")[0], "accepted position")
 	if accepted["lineNo"] != lineNo || accepted["portions"] != "2" {
 		t.Fatalf("accepted position = %#v", accepted)
 	}
-	commitBody := `{"commandID":"order-command","proposalID":"proposal-1","acceptedPositions":[{"lineNo":"9007199254740993","dishID":"суп/+ &?","portions":"2"}]}`
+	commitBody := `{"commandID":"order-command","proposalID":"proposal-1","acceptedPositions":[{"lineNo":"9007199254740993","dishID":"суп/+ &?;","portions":"2"}]}`
 	commit := postJSON(t, internal, "/internal/v1/order-commits", commitBody, http.StatusOK)
 	if commit["kind"] != "OrderCommitted" || objectField(t, commit["order"], "order")["placedAt"] != "2026-10-11T12:00:00+03:00" {
 		t.Fatalf("commit wire response = %#v", commit)
@@ -192,6 +192,11 @@ func TestWarehouseHTTPStrictBodyAndQueryRejectionsDoNotMutate(t *testing.T) {
 			t.Errorf("GET %s status = %d, want 400", path, response.Code)
 		}
 	}
+	response := httptest.NewRecorder()
+	internal.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/internal/v1/dish?dishID=d1;extra=x", nil))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("raw semicolon query status = %d, want 400", response.Code)
+	}
 	if got := getJSON(t, internal, "/internal/v1/order-attempts?commandID=c1&proposalID=p1"); got["state"] != "Unseen" {
 		t.Fatalf("invalid requests reserved order attempt: %#v", got)
 	}
@@ -200,7 +205,7 @@ func TestWarehouseHTTPStrictBodyAndQueryRejectionsDoNotMutate(t *testing.T) {
 	}
 	oversized := httptest.NewRequest(http.MethodPost, "/deliveries", strings.NewReader(strings.Repeat(" ", 65)))
 	oversized.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
+	response = httptest.NewRecorder()
 	public.ServeHTTP(response, oversized)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("oversized request status = %d, want 400", response.Code)
@@ -224,6 +229,26 @@ func TestOrderCommitPendingUsesHTTP202AndTaggedPayloadOnly(t *testing.T) {
 	internal.ServeHTTP(response, request)
 	if response.Code != http.StatusAccepted || response.Body.String() != "{\"kind\":\"Pending\"}\n" {
 		t.Fatalf("pending response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestDishRejectsExplicitEmptyOptionalBaseUnitBeforeMutation(t *testing.T) {
+	runtime := newRuntime(t)
+	_, internal := newHandlers(t, runtime)
+	postJSON(t, internal, "/internal/v1/products", `{"commandID":"product-command","productID":"p1","name":"Milk","baseUnit":"ml"}`, http.StatusOK)
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/dishes", strings.NewReader(`{"commandID":"dish-command","dishID":"d1","name":"Soup","ingredients":[{"productID":"p1","quantity":"1","baseUnit":""}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	internal.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("empty baseUnit status = %d body=%s; want 400", response.Code, response.Body.String())
+	}
+	if _, found, err := runtime.FindRecordedCommand(context.Background(), "dish-command"); err != nil || found {
+		t.Fatalf("dish command recorded: found=%v err=%v", found, err)
+	}
+	history, err := runtime.GetHistory(context.Background())
+	if err != nil || len(history.Events) != 1 || history.Events[0].Type != contract.EventProductRegistered {
+		t.Fatalf("invalid dish changed history: events=%+v err=%v", history.Events, err)
 	}
 }
 

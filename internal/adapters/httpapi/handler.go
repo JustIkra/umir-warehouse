@@ -532,6 +532,11 @@ func parseDish(input dishRequest) (contract.DefineDishRequest, error) {
 		unit := ""
 		if ingredient.BaseUnit != nil {
 			unit = *ingredient.BaseUnit
+			switch contract.BaseUnit(unit) {
+			case contract.BaseUnitG, contract.BaseUnitML, contract.BaseUnitPCS:
+			default:
+				return contract.DefineDishRequest{}, errInvalidJSON
+			}
 		}
 		result.Ingredients[index] = contract.Ingredient{ProductID: productID, Quantity: contract.Quantity(quantity), BaseUnit: contract.BaseUnit(unit)}
 	}
