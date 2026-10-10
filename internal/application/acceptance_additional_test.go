@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -246,6 +247,57 @@ func TestAcceptanceReaderSeesWholeDeliveryAndExpiryProjection(t *testing.T) {
 	}
 	if len(history.Events) != 3 || history.Events[1].Type != contract.EventDeliveryReceived || history.Events[2].Type != contract.EventBatchExpired {
 		t.Fatalf("delivery command history = %#v; want delivery and expiry committed as one two-event command", history.Events)
+	}
+}
+
+func TestAcceptanceDeliveryOverflowRechecksAfterConcurrentModification(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	base := memory.NewEventStore()
+	setup := newOwnerForCatalogTest(t, base, now)
+	if _, err := setup.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "register-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	gate := &acceptanceGateAppendStore{EventStore: base, commandType: "ReceiveDelivery", entered: make(chan struct{}), release: make(chan struct{})}
+	ownerA, err := NewOwner(gate, func() time.Time { return now }, nextTestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerB, err := NewOwner(base, func() time.Time { return now }, nextTestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestA := validDeliveryRequest("delivery-small", "delivery-small", now)
+	requestA.Lines[0].Quantity = 1
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := ownerA.ReceiveDelivery(ctx, requestA)
+		firstResult <- err
+	}()
+	select {
+	case <-gate.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("small delivery did not reach the controlled append boundary")
+	}
+
+	requestB := validDeliveryRequest("delivery-max", "delivery-max", now)
+	requestB.Lines[0].Quantity = contract.Quantity(math.MaxInt64)
+	if _, err := ownerB.ReceiveDelivery(ctx, requestB); err != nil {
+		t.Fatalf("concurrent MaxInt64 delivery error = %v", err)
+	}
+	close(gate.release)
+	if err := <-firstResult; !errors.Is(err, domain.ErrQuantityOverflow) {
+		t.Fatalf("small delivery after concurrent MaxInt64 write error = %v; want refreshed quantity overflow", err)
+	}
+	if _, found, err := base.FindCommand(ctx, requestA.CommandID); err != nil || found {
+		t.Fatalf("stale-version delivery command found=%v err=%v; want no receipt facts", found, err)
+	}
+	if _, found, err := base.FindCommand(ctx, requestB.CommandID); err != nil || !found {
+		t.Fatalf("concurrent winning delivery found=%v err=%v; want recorded command", found, err)
+	}
+	history, err := ownerA.GetHistory(ctx)
+	if err != nil || history.StateVersion != 2 || len(history.Events) != 2 || history.Events[1].CommandID != requestB.CommandID {
+		t.Fatalf("history after stale candidate rejection = version %d events %#v error %v; want only concurrent delivery", history.StateVersion, history.Events, err)
 	}
 }
 

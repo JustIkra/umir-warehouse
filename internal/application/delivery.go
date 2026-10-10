@@ -37,11 +37,28 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 		if request.Number == "" || len(request.Lines) == 0 || !businessTime(request.CreatedAt) {
 			return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
 		}
-		now := domain.CanonicalBusinessTime(o.now())
+		validationTime := domain.CanonicalBusinessTime(o.now())
+		if request.CreatedAt.After(validationTime) {
+			return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
+		}
+		if _, _, err := validateDelivery(o.state, request, validationTime); err != nil {
+			return contract.DeliveryReceipt{}, err
+		}
+		prepared, _, err := o.prepareLocked(ctx)
+		if err != nil {
+			return contract.DeliveryReceipt{}, inventoryUnavailable(err)
+		}
+		if record, exists := prepared.State.Commands[request.CommandID]; exists {
+			return recordedDelivery(record, fingerprint)
+		}
+		if _, exists := prepared.State.Deliveries[request.DeliveryID]; exists {
+			return contract.DeliveryReceipt{}, contract.ErrDeliveryAlreadyReceived
+		}
+		now := prepared.EvaluatedAt
 		if request.CreatedAt.After(now) {
 			return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
 		}
-		delivery, batches, err := validateDelivery(o.state, request, now)
+		delivery, batches, err := validateDelivery(prepared.State, request, now)
 		if err != nil {
 			return contract.DeliveryReceipt{}, err
 		}
@@ -54,7 +71,7 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 			if _, exists := batchIDs[batchID]; exists {
 				return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
 			}
-			if _, exists := o.state.Batches[batchID]; exists {
+			if _, exists := prepared.State.Batches[batchID]; exists {
 				return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
 			}
 			batchIDs[batchID] = struct{}{}
@@ -66,7 +83,7 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 		}
 		seenEventIDs := map[string]struct{}{eventID: {}}
 		deliveryEvent := domain.Event{EventID: eventID, RecordedAt: now, Type: domain.EventDeliveryReceived, Payload: domain.EventPayload{Delivery: &delivery, Batches: batches}}
-		temporary, err := deliveryProjection(o.state, request.CommandID, fingerprint, deliveryEvent)
+		temporary, err := deliveryProjection(prepared.State, request.CommandID, fingerprint, deliveryEvent)
 		if err != nil {
 			return contract.DeliveryReceipt{}, err
 		}
@@ -95,8 +112,12 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 			expiry := domain.ExpiryResult{BatchID: batch.BatchID, ProductID: batch.ProductID, WrittenOffQuantity: batch.RemainingQuantity, Reason: domain.ExpiryReasonExpiration, ExpiresAt: batch.ExpiresAt, ProcessedAt: now}
 			events = append(events, domain.Event{EventID: expiryEventID, RecordedAt: now, Type: domain.EventBatchExpired, Payload: domain.EventPayload{Expiry: &expiry}})
 		}
-		command := domain.CommandBatch{ExpectedVersion: o.state.StateVersion, CommandID: request.CommandID, CommandType: "ReceiveDelivery", CommandFingerprint: fingerprint, Events: events}
-		if _, err := domain.ApplyRecordedBatch(o.state, asRecordedBatch(command)); err != nil {
+		command := domain.CommandBatch{ExpectedVersion: prepared.StateVersion, CommandID: request.CommandID, CommandType: "ReceiveDelivery", CommandFingerprint: fingerprint, Events: events}
+		candidate, err := domain.ApplyRecordedBatch(prepared.State, asRecordedBatch(command))
+		if err != nil {
+			return contract.DeliveryReceipt{}, err
+		}
+		if err := domain.ValidateInventoryTotals(candidate); err != nil {
 			return contract.DeliveryReceipt{}, err
 		}
 		record, found, err = o.appendOwnerCommandLocked(ctx, command)

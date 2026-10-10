@@ -102,6 +102,12 @@ type DishCatalog struct {
 	Items        []Dish
 }
 
+type DishDetails struct {
+	EvaluatedAt  time.Time
+	StateVersion int64
+	Dish         Dish
+}
+
 type ExpiringBatches struct {
 	EvaluatedAt  time.Time
 	StateVersion int64

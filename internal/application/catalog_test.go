@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -14,7 +15,7 @@ import (
 
 func TestImmutableDefinitions(t *testing.T) {
 	ctx := context.Background()
-	owner, _, _ := newCatalogOwner(t, moscowTime(2026, time.April, 2, 10))
+	owner, _, clock := newCatalogOwner(t, moscowTime(2026, time.April, 2, 10))
 	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
 		t.Fatal(err)
 	}
@@ -29,14 +30,22 @@ func TestImmutableDefinitions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := contract.Dish{DishID: "d", Name: "Pear", Ingredients: []contract.Ingredient{{ProductID: "p", Quantity: 500, BaseUnit: contract.BaseUnitG}}}
+	want := contract.DishDetails{
+		EvaluatedAt:  clock.Now(),
+		StateVersion: 2,
+		Dish:         contract.Dish{DishID: "d", Name: "Pear", Ingredients: []contract.Ingredient{{ProductID: "p", Quantity: 500, BaseUnit: contract.BaseUnitG}}},
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("GetDish() = %#v; want %#v", got, want)
+	}
+	got.Dish.Ingredients[0].Quantity = 1
+	if readAgain, err := owner.GetDish(ctx, "d"); err != nil || !reflect.DeepEqual(readAgain, want) {
+		t.Fatalf("GetDish() after caller mutation = %#v, %v; want independent capture %#v", readAgain, err, want)
 	}
 	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p-2", ProductID: "p", Name: "Pear 2", BaseUnit: contract.BaseUnitG}); !errors.Is(err, contract.ErrProductAlreadyExists) {
 		t.Fatalf("RegisterProduct duplicate error = %v; want ProductAlreadyExists", err)
 	}
-	if _, err := owner.DefineDish(ctx, contract.DefineDishRequest{CommandID: "dish-d-2", DishID: "d", Name: "Pear 2", Ingredients: want.Ingredients}); !errors.Is(err, contract.ErrDishAlreadyExists) {
+	if _, err := owner.DefineDish(ctx, contract.DefineDishRequest{CommandID: "dish-d-2", DishID: "d", Name: "Pear 2", Ingredients: want.Dish.Ingredients}); !errors.Is(err, contract.ErrDishAlreadyExists) {
 		t.Fatalf("DefineDish duplicate error = %v; want DishAlreadyExists", err)
 	}
 }
@@ -245,6 +254,152 @@ func TestDuplicateDeliveryIDPrecedesBodyValidation(t *testing.T) {
 		if _, err := owner.ReceiveDelivery(ctx, request); !errors.Is(err, contract.ErrDeliveryAlreadyReceived) {
 			t.Fatalf("ReceiveDelivery(duplicate with invalid body %d) error = %v; want DeliveryAlreadyReceived", index, err)
 		}
+	}
+}
+
+func TestExactAndDuplicateDeliveryRetriesDoNotProcessDueStock(t *testing.T) {
+	ctx := context.Background()
+	initial := moscowTime(2026, time.April, 2, 10)
+	owner, store, clock := newCatalogOwner(t, initial)
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	request := validDeliveryRequest("delivery-cmd-1", "delivery-1", initial)
+	request.Lines[0].ManufacturedAt = initial
+	request.Lines[0].ShelfLife = contract.ShelfLife{Value: 1, Unit: contract.ShelfLifeDay}
+	if _, err := owner.ReceiveDelivery(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	versionBefore, err := store.Version(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Set(initial.Add(24 * time.Hour))
+
+	if _, err := owner.ReceiveDelivery(ctx, request); err != nil {
+		t.Fatalf("exact delivery retry at expiry = %v; want recorded receipt", err)
+	}
+	duplicate := request
+	duplicate.CommandID = "delivery-cmd-2"
+	if _, err := owner.ReceiveDelivery(ctx, duplicate); !errors.Is(err, contract.ErrDeliveryAlreadyReceived) {
+		t.Fatalf("duplicate deliveryID at expiry error = %v; want DeliveryAlreadyReceived", err)
+	}
+	versionAfter, err := store.Version(ctx)
+	if err != nil || versionAfter != versionBefore {
+		t.Fatalf("version after exact/duplicate retries = %d, %v; want unchanged %d", versionAfter, err, versionBefore)
+	}
+	if _, found, err := store.FindCommand(ctx, "expiration/owner-event-2"); err != nil || found {
+		t.Fatalf("expiry command after retries found=%v err=%v; want no extra expiration side effect", found, err)
+	}
+	if results, err := owner.ProcessDueExpirations(ctx); err != nil || len(results) != 1 {
+		t.Fatalf("ProcessDueExpirations() after retries = %#v, %v; want one due task", results, err)
+	}
+}
+
+func TestDeliveryAcceptsExactMaxAndRejectsUnrepresentableLiveTotal(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, store, _ := newCatalogOwner(t, now)
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+
+	maximum := validDeliveryRequest("delivery-max", "delivery-max", now)
+	maximum.Lines[0].Quantity = contract.Quantity(math.MaxInt64)
+	if _, err := owner.ReceiveDelivery(ctx, maximum); err != nil {
+		t.Fatalf("ReceiveDelivery(MaxInt64) error = %v; exact maximum should be accepted", err)
+	}
+	versionBefore, err := store.Version(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	additional := validDeliveryRequest("delivery-overflow", "delivery-overflow", now)
+	additional.Lines[0].Quantity = 1
+	if _, err := owner.ReceiveDelivery(ctx, additional); !errors.Is(err, domain.ErrQuantityOverflow) {
+		t.Fatalf("ReceiveDelivery(MaxInt64 + 1) error = %v; want domain.ErrQuantityOverflow", err)
+	}
+	versionAfter, err := store.Version(ctx)
+	if err != nil || versionAfter != versionBefore {
+		t.Fatalf("version after rejected delivery = %d, %v; want unchanged %d", versionAfter, err, versionBefore)
+	}
+	if _, found, err := store.FindCommand(ctx, additional.CommandID); err != nil || found {
+		t.Fatalf("rejected delivery command found=%v err=%v; want no receipt facts", found, err)
+	}
+	inventory, err := owner.GetInventory(ctx)
+	if err != nil || inventory.StateVersion != versionBefore || len(inventory.Products) != 1 || inventory.Products[0].Quantity != contract.Quantity(math.MaxInt64) {
+		t.Fatalf("inventory after rejected delivery = %#v, %v; want original MaxInt64 stock usable", inventory, err)
+	}
+}
+
+func TestDeliveryAllowsOverflowingTemporaryTotalWrittenOffBySameCommand(t *testing.T) {
+	ctx := context.Background()
+	now := moscowTime(2026, time.April, 2, 10)
+	owner, store, _ := newCatalogOwner(t, now)
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	future := validDeliveryRequest("delivery-max", "delivery-max", now)
+	future.Lines[0].Quantity = contract.Quantity(math.MaxInt64)
+	if _, err := owner.ReceiveDelivery(ctx, future); err != nil {
+		t.Fatalf("ReceiveDelivery(MaxInt64) error = %v", err)
+	}
+
+	immediate := deliveryRequest("delivery-immediate", "delivery-immediate", now, []contract.DeliveryLine{{
+		ProductID: "p", ManufacturedAt: now.Add(-24 * time.Hour), ShelfLife: contract.ShelfLife{Value: 1, Unit: contract.ShelfLifeDay}, ReceivedAt: now, Quantity: 1,
+	}})
+	receipt, err := owner.ReceiveDelivery(ctx, immediate)
+	if err != nil || len(receipt.BatchIDs) != 1 {
+		t.Fatalf("ReceiveDelivery(temporary overflow then expiry) = %#v, %v; want successful receipt", receipt, err)
+	}
+	version, err := store.Version(ctx)
+	if err != nil || version != 4 {
+		t.Fatalf("version after compound delivery = %d, %v; want delivery plus immediate expiry", version, err)
+	}
+	batches, err := store.ReadBatches(ctx, 1)
+	if err != nil || len(batches) != 2 || batches[1].CommandID != immediate.CommandID || len(batches[1].Events) != 2 || batches[1].Events[0].Type != domain.EventDeliveryReceived || batches[1].Events[1].Type != domain.EventBatchExpired {
+		t.Fatalf("compound command batches = %#v, %v; want receipt and expiry together", batches, err)
+	}
+	inventory, err := owner.GetInventory(ctx)
+	if err != nil || len(inventory.Products) != 1 || inventory.Products[0].Quantity != contract.Quantity(math.MaxInt64) {
+		t.Fatalf("inventory after compensated temporary overflow = %#v, %v; want MaxInt64", inventory, err)
+	}
+}
+
+func TestDeliveryPreparesExistingDueStockBeforeFinalQuantityCheck(t *testing.T) {
+	ctx := context.Background()
+	initial := moscowTime(2026, time.April, 2, 10)
+	owner, store, clock := newCatalogOwner(t, initial)
+	if _, err := owner.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "product-p", ProductID: "p", Name: "Pear", BaseUnit: contract.BaseUnitG}); err != nil {
+		t.Fatal(err)
+	}
+	due := validDeliveryRequest("delivery-due", "delivery-due", initial)
+	due.Lines[0].ManufacturedAt = initial
+	due.Lines[0].ShelfLife = contract.ShelfLife{Value: 1, Unit: contract.ShelfLifeDay}
+	due.Lines[0].Quantity = contract.Quantity(math.MaxInt64)
+	if _, err := owner.ReceiveDelivery(ctx, due); err != nil {
+		t.Fatalf("ReceiveDelivery(due stock setup) error = %v", err)
+	}
+	now := initial.Add(24 * time.Hour)
+	clock.Set(now)
+	newStock := validDeliveryRequest("delivery-after-due", "delivery-after-due", now)
+	newStock.Lines[0].Quantity = 1
+	if _, err := owner.ReceiveDelivery(ctx, newStock); err != nil {
+		t.Fatalf("ReceiveDelivery(after shared due preparation) error = %v; expired stock should no longer contribute", err)
+	}
+	history, err := owner.GetHistory(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history.StateVersion != 4 || len(history.Events) != 4 || history.Events[2].Type != contract.EventBatchExpired || history.Events[3].Type != contract.EventDeliveryReceived {
+		t.Fatalf("history after delivery = version %d events %#v; want due expiry before new receipt", history.StateVersion, history.Events)
+	}
+	inventory, err := owner.GetInventory(ctx)
+	if err != nil || len(inventory.Products) != 1 || inventory.Products[0].Quantity != 1 {
+		t.Fatalf("inventory after due preparation and new stock = %#v, %v; want 1", inventory, err)
+	}
+	if _, found, err := store.FindCommand(ctx, "expiration/owner-event-2"); err != nil || !found {
+		t.Fatalf("due stock expiration command found=%v err=%v; want shared admission expiry", found, err)
 	}
 }
 

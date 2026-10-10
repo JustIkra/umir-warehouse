@@ -84,7 +84,7 @@ func (r *Runtime) GetDishCatalog(ctx context.Context) (contract.DishCatalog, err
 	return r.owner.GetDishCatalog(ctx)
 }
 
-func (r *Runtime) GetDish(ctx context.Context, dishID string) (contract.Dish, error) {
+func (r *Runtime) GetDish(ctx context.Context, dishID string) (contract.DishDetails, error) {
 	return r.owner.GetDish(ctx, dishID)
 }
 

@@ -18,6 +18,24 @@ func AddQuantity(a, b Quantity) (Quantity, error) {
 	return Quantity(left + right), nil
 }
 
+func ValidateInventoryTotals(state InventoryState) error {
+	totals := make(map[string]Quantity)
+	for _, batch := range state.Batches {
+		if batch.RemainingQuantity < 0 {
+			return ErrInvalidQuantity
+		}
+		if batch.RemainingQuantity == 0 {
+			continue
+		}
+		total, err := AddQuantity(totals[batch.ProductID], batch.RemainingQuantity)
+		if err != nil {
+			return err
+		}
+		totals[batch.ProductID] = total
+	}
+	return nil
+}
+
 func MultiplyQuantity(quantity Quantity, portions int64) (Quantity, error) {
 	if quantity <= 0 || portions <= 0 {
 		return 0, ErrInvalidQuantity

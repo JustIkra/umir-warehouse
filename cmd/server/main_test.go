@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/JustIkra/umir-warehouse/internal/application"
 )
 
 type failingResponseWriter struct {
@@ -159,6 +161,8 @@ func TestRunServiceCancellationJoinsWorkersAndShutdown(t *testing.T) {
 	tickerFake.ticks <- time.Now()
 	expirationStarted := make(chan struct{})
 	snapshotStarted := make(chan struct{})
+	retryWaitStarted := make(chan struct{})
+	retryWaitFinished := make(chan struct{})
 	expirationDone := make(chan struct{})
 	snapshotDone := make(chan struct{})
 	shutdownDone := make(chan struct{})
@@ -181,7 +185,15 @@ func TestRunServiceCancellationJoinsWorkersAndShutdown(t *testing.T) {
 			},
 			runSnapshotWorker: func(ctx context.Context) error {
 				close(snapshotStarted)
+				return &application.SnapshotSaveError{Err: errors.New("temporary snapshot save failure")}
+			},
+			waitSnapshotRetry: func(ctx context.Context, delay time.Duration) error {
+				if delay != 7*time.Second {
+					t.Errorf("snapshot retry delay = %s; want 7s", delay)
+				}
+				close(retryWaitStarted)
 				<-ctx.Done()
+				close(retryWaitFinished)
 				close(snapshotDone)
 				return ctx.Err()
 			},
@@ -196,12 +208,14 @@ func TestRunServiceCancellationJoinsWorkersAndShutdown(t *testing.T) {
 	}()
 	<-expirationStarted
 	<-snapshotStarted
+	<-retryWaitStarted
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("runService() error = %v", err)
 	}
 	<-expirationDone
 	<-snapshotDone
+	<-retryWaitFinished
 	<-shutdownDone
 	if !tickerFake.stopped.Load() {
 		t.Fatal("ticker was not stopped")
@@ -229,6 +243,7 @@ func TestRunServiceRetriesExpirationAfterError(t *testing.T) {
 				return nil
 			},
 			runSnapshotWorker: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+			waitSnapshotRetry: func(context.Context, time.Duration) error { return nil },
 			serve:             func() error { return <-serveErr },
 			shutdown:          func(context.Context) error { serveErr <- http.ErrServerClosed; return nil },
 			logf:              func(format string, args ...any) { logs <- fmt.Sprintf(format, args...) },
@@ -251,8 +266,8 @@ func TestRunServiceRetriesExpirationAfterError(t *testing.T) {
 	}
 }
 
-func TestRunServiceSnapshotFailureShutsDownAndReturnsErrors(t *testing.T) {
-	snapshotErr := errors.New("snapshot worker failed")
+func TestRunServiceSnapshotInfrastructureFailureShutsDownAndReturnsErrors(t *testing.T) {
+	snapshotErr := errors.New("snapshot worker failed unexpectedly")
 	shutdownErr := errors.New("shutdown failed")
 	shutdownCalled := make(chan struct{})
 	tickerFake := &controlledTicker{ticks: make(chan time.Time)}
@@ -260,15 +275,112 @@ func TestRunServiceSnapshotFailureShutsDownAndReturnsErrors(t *testing.T) {
 		newTicker:             func(time.Duration) ticker { return tickerFake },
 		processDueExpirations: func(context.Context) error { return nil },
 		runSnapshotWorker:     func(context.Context) error { return snapshotErr },
-		serve:                 func() error { <-shutdownCalled; return http.ErrServerClosed },
-		shutdown:              func(context.Context) error { close(shutdownCalled); return shutdownErr },
-		logf:                  func(string, ...any) {},
+		waitSnapshotRetry: func(context.Context, time.Duration) error {
+			t.Fatal("unexpected retry for infrastructure failure")
+			return nil
+		},
+		serve:    func() error { <-shutdownCalled; return http.ErrServerClosed },
+		shutdown: func(context.Context) error { close(shutdownCalled); return shutdownErr },
+		logf:     func(string, ...any) {},
 	})
 	if !errors.Is(err, snapshotErr) || !errors.Is(err, shutdownErr) {
 		t.Fatalf("runService() error = %v; want snapshot and shutdown errors", err)
 	}
 	if !tickerFake.stopped.Load() {
 		t.Fatal("expiration ticker was not stopped after snapshot failure")
+	}
+}
+
+func TestRunServiceRetriesSnapshotSaveWhileServingAndExpiryContinue(t *testing.T) {
+	storeErr := errors.New("temporary snapshot store failure")
+	parent, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	tickerFake := &controlledTicker{ticks: make(chan time.Time, 1)}
+	retryWaiting := make(chan time.Duration, 1)
+	allowRetry := make(chan struct{})
+	expirationCalls := make(chan struct{}, 1)
+	retrySucceeded := make(chan struct{})
+	serveStarted := make(chan struct{})
+	serveExited := make(chan struct{})
+	shutdownCalled := make(chan struct{})
+	logs := make(chan string, 1)
+	done := make(chan error, 1)
+	var snapshotAttempts atomic.Int32
+	go func() {
+		done <- runService(parent, serverConfig{expirationCheckInterval: 4 * time.Second}, lifecycleDependencies{
+			newTicker: func(time.Duration) ticker { return tickerFake },
+			processDueExpirations: func(context.Context) error {
+				expirationCalls <- struct{}{}
+				return nil
+			},
+			runSnapshotWorker: func(ctx context.Context) error {
+				switch snapshotAttempts.Add(1) {
+				case 1:
+					return &application.SnapshotSaveError{Err: storeErr}
+				case 2:
+					close(retrySucceeded)
+					<-ctx.Done()
+					return ctx.Err()
+				default:
+					return errors.New("snapshot worker restarted more than once")
+				}
+			},
+			waitSnapshotRetry: func(waitCtx context.Context, delay time.Duration) error {
+				retryWaiting <- delay
+				select {
+				case <-allowRetry:
+					return nil
+				case <-waitCtx.Done():
+					return waitCtx.Err()
+				}
+			},
+			serve: func() error {
+				close(serveStarted)
+				<-shutdownCalled
+				close(serveExited)
+				return http.ErrServerClosed
+			},
+			shutdown: func(context.Context) error { close(shutdownCalled); return nil },
+			logf:     func(format string, args ...any) { logs <- fmt.Sprintf(format, args...) },
+		})
+	}()
+	<-serveStarted
+	if delay := <-retryWaiting; delay != 4*time.Second {
+		t.Fatalf("snapshot retry delay = %s, want configured interval 4s", delay)
+	}
+	if message := <-logs; !strings.Contains(message, storeErr.Error()) {
+		t.Fatalf("snapshot retry log = %q, want store failure", message)
+	}
+	select {
+	case <-serveExited:
+		t.Fatal("HTTP service stopped during snapshot retry wait")
+	default:
+	}
+
+	tickerFake.ticks <- time.Time{}
+	<-expirationCalls
+
+	close(allowRetry)
+	select {
+	case <-retrySucceeded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("snapshot worker retry did not start")
+	}
+	if snapshotAttempts.Load() != 2 {
+		t.Fatalf("snapshot worker attempts = %d, want one failed attempt and one retry", snapshotAttempts.Load())
+	}
+	select {
+	case <-serveExited:
+		t.Fatal("HTTP service stopped after snapshot retry succeeded")
+	default:
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("runService() error after cancellation = %v", err)
+	}
+	<-serveExited
+	if !tickerFake.stopped.Load() {
+		t.Fatal("expiration ticker was not stopped after cancellation")
 	}
 }
 
@@ -285,9 +397,10 @@ func TestRunServiceServeFailureCancelsWorkersAndShutsDown(t *testing.T) {
 			close(snapshotDone)
 			return ctx.Err()
 		},
-		serve:    func() error { return serveErr },
-		shutdown: func(context.Context) error { close(shutdownCalled); return nil },
-		logf:     func(string, ...any) {},
+		waitSnapshotRetry: func(context.Context, time.Duration) error { return nil },
+		serve:             func() error { return serveErr },
+		shutdown:          func(context.Context) error { close(shutdownCalled); return nil },
+		logf:              func(string, ...any) {},
 	})
 	if !errors.Is(err, serveErr) {
 		t.Fatalf("runService() error = %v; want serve error", err)

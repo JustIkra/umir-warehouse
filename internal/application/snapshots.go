@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/JustIkra/umir-warehouse/contract"
@@ -17,6 +18,19 @@ type SnapshotWorker struct {
 	savedSequence  int64
 	notify         chan struct{}
 	onSaved        func(int64)
+}
+
+// SnapshotSaveError identifies a failed SnapshotStore save and preserves its cause.
+type SnapshotSaveError struct {
+	Err error
+}
+
+func (e *SnapshotSaveError) Error() string {
+	return fmt.Sprintf("save snapshot: %v", e.Err)
+}
+
+func (e *SnapshotSaveError) Unwrap() error {
+	return e.Err
 }
 
 func NewSnapshotWorker(store SnapshotStore) *SnapshotWorker {
@@ -93,6 +107,9 @@ func (w *SnapshotWorker) Run(ctx context.Context) error {
 		}
 		worked, err := w.RunOnce(ctx)
 		if err != nil {
+			if worked {
+				return &SnapshotSaveError{Err: err}
+			}
 			return err
 		}
 		if worked {

@@ -167,20 +167,24 @@ func (o *Owner) GetDishCatalog(ctx context.Context) (contract.DishCatalog, error
 	return contract.DishCatalog{EvaluatedAt: domain.CanonicalBusinessTime(o.now()), StateVersion: o.state.StateVersion, Items: items}, nil
 }
 
-func (o *Owner) GetDish(ctx context.Context, dishID string) (contract.Dish, error) {
+func (o *Owner) GetDish(ctx context.Context, dishID string) (contract.DishDetails, error) {
 	if dishID == "" {
-		return contract.Dish{}, contract.ErrInvalidArgument
+		return contract.DishDetails{}, contract.ErrInvalidArgument
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if err := o.syncProjectionLocked(ctx); err != nil {
-		return contract.Dish{}, inventoryUnavailable(err)
+		return contract.DishDetails{}, inventoryUnavailable(err)
 	}
 	dish, exists := o.state.Dishes[dishID]
 	if !exists {
-		return contract.Dish{}, contract.ErrDishNotFound
+		return contract.DishDetails{}, contract.ErrDishNotFound
 	}
-	return toContractDish(o.state, dish), nil
+	return contract.DishDetails{
+		EvaluatedAt:  domain.CanonicalBusinessTime(o.now()),
+		StateVersion: o.state.StateVersion,
+		Dish:         toContractDish(o.state, dish),
+	}, nil
 }
 
 func (o *Owner) findCommand(ctx context.Context, commandID, commandType, fingerprint string) (domain.CommandRecord, bool, error) {

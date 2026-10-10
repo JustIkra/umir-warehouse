@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/JustIkra/umir-warehouse/internal/application"
 )
 
 type ticker interface {
@@ -25,6 +27,7 @@ type lifecycleDependencies struct {
 	newTicker             func(time.Duration) ticker
 	processDueExpirations func(context.Context) error
 	runSnapshotWorker     func(context.Context) error
+	waitSnapshotRetry     func(context.Context, time.Duration) error
 	serve                 func() error
 	shutdown              func(context.Context) error
 	logf                  func(string, ...any)
@@ -39,7 +42,7 @@ func runService(parent context.Context, cfg serverConfig, dependencies lifecycle
 	if cfg.expirationCheckInterval <= 0 {
 		return errors.New("expiration check interval must be positive")
 	}
-	if dependencies.newTicker == nil || dependencies.processDueExpirations == nil || dependencies.runSnapshotWorker == nil || dependencies.serve == nil || dependencies.shutdown == nil {
+	if dependencies.newTicker == nil || dependencies.processDueExpirations == nil || dependencies.runSnapshotWorker == nil || dependencies.waitSnapshotRetry == nil || dependencies.serve == nil || dependencies.shutdown == nil {
 		return errors.New("lifecycle dependencies are required")
 	}
 	if dependencies.logf == nil {
@@ -75,11 +78,7 @@ func runService(parent context.Context, cfg serverConfig, dependencies lifecycle
 	snapshotDone := &lifecycleResult{done: make(chan struct{})}
 	go func() {
 		defer close(snapshotDone.done)
-		err := dependencies.runSnapshotWorker(ctx)
-		if err == nil && ctx.Err() == nil {
-			err = errors.New("snapshot worker stopped unexpectedly")
-		}
-		snapshotDone.err = err
+		snapshotDone.err = runSnapshotWorkerWithRetry(ctx, cfg.expirationCheckInterval, dependencies.runSnapshotWorker, dependencies.waitSnapshotRetry, dependencies.logf)
 	}()
 
 	serveDone := &lifecycleResult{done: make(chan struct{})}
@@ -154,4 +153,35 @@ func runService(parent context.Context, cfg serverConfig, dependencies lifecycle
 		cause = errors.Join(cause, fmt.Errorf("shutdown HTTP server: %w", shutdownErr))
 	}
 	return cause
+}
+
+func runSnapshotWorkerWithRetry(ctx context.Context, retryInterval time.Duration, run func(context.Context) error, wait func(context.Context, time.Duration) error, logf func(string, ...any)) error {
+	for {
+		err := run(ctx)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err == nil {
+			return errors.New("snapshot worker stopped unexpectedly")
+		}
+		var saveErr *application.SnapshotSaveError
+		if !errors.As(err, &saveErr) {
+			return err
+		}
+		logf("snapshot save failed; retrying in %s: %v", retryInterval, err)
+		if err := wait(ctx, retryInterval); err != nil {
+			return err
+		}
+	}
+}
+
+func waitForSnapshotRetry(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

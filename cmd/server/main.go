@@ -97,6 +97,7 @@ func runMain() error {
 			return err
 		},
 		runSnapshotWorker: runtime.RunSnapshotWorker,
+		waitSnapshotRetry: waitForSnapshotRetry,
 		serve:             server.ListenAndServe,
 		shutdown:          server.Shutdown,
 	})
