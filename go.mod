@@ -1,4 +1,4 @@
 module github.com/JustIkra/umir-warehouse
 
-go 1.26.5
+go 1.26.9
 
