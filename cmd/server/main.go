@@ -91,11 +91,6 @@ func runMain() error {
 	defer stop()
 	log.Printf("umir-warehouse public listener on %s; internal listener on %s", publicServer.Addr, internalServer.Addr)
 	return runService(signals, cfg, lifecycleDependencies{
-		newTicker: func(interval time.Duration) ticker { return realTicker{ticker: time.NewTicker(interval)} },
-		processDueExpirations: func(ctx context.Context) error {
-			_, err := runtime.ProcessDueExpirations(ctx)
-			return err
-		},
 		runSnapshotWorker: runtime.RunSnapshotWorker,
 		waitSnapshotRetry: waitForSnapshotRetry,
 		serve:             func() error { return serveListeners(publicServer, internalServer) },

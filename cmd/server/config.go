@@ -7,22 +7,22 @@ import (
 )
 
 type serverConfig struct {
-	port                    string
-	internalPort            string
-	requestTimeout          time.Duration
-	maxRequestBytes         int64
-	eventsPerSnapshot       int64
-	expirationCheckInterval time.Duration
+	port                  string
+	internalPort          string
+	requestTimeout        time.Duration
+	maxRequestBytes       int64
+	eventsPerSnapshot     int64
+	snapshotRetryInterval time.Duration
 }
 
 func loadConfig(lookup func(string) (string, bool)) (serverConfig, error) {
 	cfg := serverConfig{
-		port:                    envValue(lookup, "PORT", "8080"),
-		internalPort:            envValue(lookup, "INTERNAL_PORT", "8082"),
-		requestTimeout:          8 * time.Second,
-		maxRequestBytes:         1 << 20,
-		eventsPerSnapshot:       100,
-		expirationCheckInterval: time.Second,
+		port:                  envValue(lookup, "PORT", "8080"),
+		internalPort:          envValue(lookup, "INTERNAL_PORT", "8082"),
+		requestTimeout:        8 * time.Second,
+		maxRequestBytes:       1 << 20,
+		eventsPerSnapshot:     100,
+		snapshotRetryInterval: time.Second,
 	}
 	if value, ok := lookup("EVENTS_PER_SNAPSHOT"); ok && value != "" {
 		threshold, err := strconv.ParseInt(value, 10, 64)
@@ -34,15 +34,15 @@ func loadConfig(lookup func(string) (string, bool)) (serverConfig, error) {
 		}
 		cfg.eventsPerSnapshot = threshold
 	}
-	if value, ok := lookup("EXPIRATION_CHECK_INTERVAL"); ok && value != "" {
+	if value, ok := lookup("SNAPSHOT_RETRY_INTERVAL"); ok && value != "" {
 		interval, err := time.ParseDuration(value)
 		if err != nil {
-			return serverConfig{}, fmt.Errorf("EXPIRATION_CHECK_INTERVAL: %w", err)
+			return serverConfig{}, fmt.Errorf("SNAPSHOT_RETRY_INTERVAL: %w", err)
 		}
 		if interval <= 0 {
-			return serverConfig{}, fmt.Errorf("EXPIRATION_CHECK_INTERVAL must be positive")
+			return serverConfig{}, fmt.Errorf("SNAPSHOT_RETRY_INTERVAL must be positive")
 		}
-		cfg.expirationCheckInterval = interval
+		cfg.snapshotRetryInterval = interval
 	}
 	if value, ok := lookup("REQUEST_TIMEOUT"); ok && value != "" {
 		timeout, err := time.ParseDuration(value)

@@ -109,7 +109,7 @@ func TestLoadConfigDefaultsAndPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
 	}
-	if cfg.port != "8080" || cfg.internalPort != "8082" || cfg.requestTimeout != 8*time.Second || cfg.maxRequestBytes != 1<<20 || cfg.eventsPerSnapshot != 100 || cfg.expirationCheckInterval != time.Second {
+	if cfg.port != "8080" || cfg.internalPort != "8082" || cfg.requestTimeout != 8*time.Second || cfg.maxRequestBytes != 1<<20 || cfg.eventsPerSnapshot != 100 || cfg.snapshotRetryInterval != time.Second {
 		t.Fatalf("loadConfig() = %#v; want defaults", cfg)
 	}
 
@@ -124,6 +124,31 @@ func TestLoadConfigDefaultsAndPort(t *testing.T) {
 	}
 }
 
+func TestLoadConfigUsesSnapshotRetryIntervalAndIgnoresExpirationInterval(t *testing.T) {
+	cfg, err := loadConfig(func(key string) (string, bool) {
+		switch key {
+		case "SNAPSHOT_RETRY_INTERVAL":
+			return "250ms", true
+		case "EXPIRATION_CHECK_INTERVAL":
+			return "9s", true
+		default:
+			return "", false
+		}
+	})
+	if err != nil || cfg.snapshotRetryInterval != 250*time.Millisecond {
+		t.Fatalf("loadConfig() = %#v, %v; want snapshot retry 250ms", cfg, err)
+	}
+	cfg, err = loadConfig(func(key string) (string, bool) {
+		if key == "EXPIRATION_CHECK_INTERVAL" {
+			return "9s", true
+		}
+		return "", false
+	})
+	if err != nil || cfg.snapshotRetryInterval != time.Second {
+		t.Fatalf("loadConfig(obsolete expiration setting) = %#v, %v; want 1s snapshot default", cfg, err)
+	}
+}
+
 func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -134,9 +159,9 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{name: "negative snapshot threshold", key: "EVENTS_PER_SNAPSHOT", value: "-1"},
 		{name: "non-number snapshot threshold", key: "EVENTS_PER_SNAPSHOT", value: "many"},
 		{name: "overflow snapshot threshold", key: "EVENTS_PER_SNAPSHOT", value: "9223372036854775808"},
-		{name: "zero interval", key: "EXPIRATION_CHECK_INTERVAL", value: "0s"},
-		{name: "negative interval", key: "EXPIRATION_CHECK_INTERVAL", value: "-1s"},
-		{name: "invalid interval", key: "EXPIRATION_CHECK_INTERVAL", value: "soon"},
+		{name: "zero snapshot retry interval", key: "SNAPSHOT_RETRY_INTERVAL", value: "0s"},
+		{name: "negative snapshot retry interval", key: "SNAPSHOT_RETRY_INTERVAL", value: "-1s"},
+		{name: "invalid snapshot retry interval", key: "SNAPSHOT_RETRY_INTERVAL", value: "soon"},
 		{name: "same listeners", key: "INTERNAL_PORT", value: "8080"},
 		{name: "same listeners with leading zero", key: "INTERNAL_PORT", value: "08080"},
 		{name: "invalid port", key: "PORT", value: "70000"},
@@ -221,43 +246,18 @@ func waitForHTTP(t *testing.T, client *http.Client, address string) {
 	}
 }
 
-type controlledTicker struct {
-	ticks   chan time.Time
-	stopped atomic.Bool
-}
-
-func (t *controlledTicker) C() <-chan time.Time { return t.ticks }
-func (t *controlledTicker) Stop()               { t.stopped.Store(true) }
-
-func TestRunServiceCancellationJoinsWorkersAndShutdown(t *testing.T) {
+func TestRunServiceCancellationJoinsSnapshotAndShutdown(t *testing.T) {
 	parent, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	tickerFake := &controlledTicker{ticks: make(chan time.Time, 1)}
-	tickerFake.ticks <- time.Now()
-	expirationStarted := make(chan struct{})
 	snapshotStarted := make(chan struct{})
 	retryWaitStarted := make(chan struct{})
 	retryWaitFinished := make(chan struct{})
-	expirationDone := make(chan struct{})
 	snapshotDone := make(chan struct{})
 	shutdownDone := make(chan struct{})
 	serveErr := make(chan error, 1)
-
 	done := make(chan error, 1)
 	go func() {
-		done <- runService(parent, serverConfig{expirationCheckInterval: 7 * time.Second}, lifecycleDependencies{
-			newTicker: func(interval time.Duration) ticker {
-				if interval != 7*time.Second {
-					t.Errorf("ticker interval = %s; want 7s", interval)
-				}
-				return tickerFake
-			},
-			processDueExpirations: func(ctx context.Context) error {
-				close(expirationStarted)
-				<-ctx.Done()
-				close(expirationDone)
-				return ctx.Err()
-			},
+		done <- runService(parent, serverConfig{snapshotRetryInterval: 7 * time.Second}, lifecycleDependencies{
 			runSnapshotWorker: func(ctx context.Context) error {
 				close(snapshotStarted)
 				return &application.SnapshotSaveError{Err: errors.New("temporary snapshot save failure")}
@@ -281,75 +281,23 @@ func TestRunServiceCancellationJoinsWorkersAndShutdown(t *testing.T) {
 			logf: func(string, ...any) {},
 		})
 	}()
-	<-expirationStarted
 	<-snapshotStarted
 	<-retryWaitStarted
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("runService() error = %v", err)
 	}
-	<-expirationDone
 	<-snapshotDone
 	<-retryWaitFinished
 	<-shutdownDone
-	if !tickerFake.stopped.Load() {
-		t.Fatal("ticker was not stopped")
-	}
-}
-
-func TestRunServiceRetriesExpirationAfterError(t *testing.T) {
-	parent, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	tickerFake := &controlledTicker{ticks: make(chan time.Time, 2)}
-	called := make(chan int, 2)
-	var calls atomic.Int32
-	logs := make(chan string, 1)
-	serveErr := make(chan error, 1)
-	finished := make(chan error, 1)
-	go func() {
-		finished <- runService(parent, serverConfig{expirationCheckInterval: time.Second}, lifecycleDependencies{
-			newTicker: func(time.Duration) ticker { return tickerFake },
-			processDueExpirations: func(context.Context) error {
-				count := int(calls.Add(1))
-				called <- count
-				if count == 1 {
-					return errors.New("temporary expiration failure")
-				}
-				return nil
-			},
-			runSnapshotWorker: func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
-			waitSnapshotRetry: func(context.Context, time.Duration) error { return nil },
-			serve:             func() error { return <-serveErr },
-			shutdown:          func(context.Context) error { serveErr <- http.ErrServerClosed; return nil },
-			logf:              func(format string, args ...any) { logs <- fmt.Sprintf(format, args...) },
-		})
-	}()
-	tickerFake.ticks <- time.Now()
-	if got := <-called; got != 1 {
-		t.Fatalf("first expiration call = %d; want 1", got)
-	}
-	if got := <-logs; !strings.Contains(got, "temporary expiration failure") {
-		t.Fatalf("expiration log = %q; want callback error", got)
-	}
-	tickerFake.ticks <- time.Now()
-	if got := <-called; got != 2 {
-		t.Fatalf("second expiration call = %d; want retry", got)
-	}
-	cancel()
-	if err := <-finished; err != nil {
-		t.Fatalf("runService() error = %v", err)
-	}
 }
 
 func TestRunServiceSnapshotInfrastructureFailureShutsDownAndReturnsErrors(t *testing.T) {
 	snapshotErr := errors.New("snapshot worker failed unexpectedly")
 	shutdownErr := errors.New("shutdown failed")
 	shutdownCalled := make(chan struct{})
-	tickerFake := &controlledTicker{ticks: make(chan time.Time)}
-	err := runService(context.Background(), serverConfig{expirationCheckInterval: time.Second}, lifecycleDependencies{
-		newTicker:             func(time.Duration) ticker { return tickerFake },
-		processDueExpirations: func(context.Context) error { return nil },
-		runSnapshotWorker:     func(context.Context) error { return snapshotErr },
+	err := runService(context.Background(), serverConfig{snapshotRetryInterval: time.Second}, lifecycleDependencies{
+		runSnapshotWorker: func(context.Context) error { return snapshotErr },
 		waitSnapshotRetry: func(context.Context, time.Duration) error {
 			t.Fatal("unexpected retry for infrastructure failure")
 			return nil
@@ -361,19 +309,14 @@ func TestRunServiceSnapshotInfrastructureFailureShutsDownAndReturnsErrors(t *tes
 	if !errors.Is(err, snapshotErr) || !errors.Is(err, shutdownErr) {
 		t.Fatalf("runService() error = %v; want snapshot and shutdown errors", err)
 	}
-	if !tickerFake.stopped.Load() {
-		t.Fatal("expiration ticker was not stopped after snapshot failure")
-	}
 }
 
-func TestRunServiceRetriesSnapshotSaveWhileServingAndExpiryContinue(t *testing.T) {
+func TestRunServiceRetriesSnapshotSaveWhileServing(t *testing.T) {
 	storeErr := errors.New("temporary snapshot store failure")
 	parent, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	tickerFake := &controlledTicker{ticks: make(chan time.Time, 1)}
 	retryWaiting := make(chan time.Duration, 1)
 	allowRetry := make(chan struct{})
-	expirationCalls := make(chan struct{}, 1)
 	retrySucceeded := make(chan struct{})
 	serveStarted := make(chan struct{})
 	serveExited := make(chan struct{})
@@ -382,12 +325,7 @@ func TestRunServiceRetriesSnapshotSaveWhileServingAndExpiryContinue(t *testing.T
 	done := make(chan error, 1)
 	var snapshotAttempts atomic.Int32
 	go func() {
-		done <- runService(parent, serverConfig{expirationCheckInterval: 4 * time.Second}, lifecycleDependencies{
-			newTicker: func(time.Duration) ticker { return tickerFake },
-			processDueExpirations: func(context.Context) error {
-				expirationCalls <- struct{}{}
-				return nil
-			},
+		done <- runService(parent, serverConfig{snapshotRetryInterval: 4 * time.Second}, lifecycleDependencies{
 			runSnapshotWorker: func(ctx context.Context) error {
 				switch snapshotAttempts.Add(1) {
 				case 1:
@@ -431,10 +369,6 @@ func TestRunServiceRetriesSnapshotSaveWhileServingAndExpiryContinue(t *testing.T
 		t.Fatal("HTTP service stopped during snapshot retry wait")
 	default:
 	}
-
-	tickerFake.ticks <- time.Time{}
-	<-expirationCalls
-
 	close(allowRetry)
 	select {
 	case <-retrySucceeded:
@@ -454,19 +388,13 @@ func TestRunServiceRetriesSnapshotSaveWhileServingAndExpiryContinue(t *testing.T
 		t.Fatalf("runService() error after cancellation = %v", err)
 	}
 	<-serveExited
-	if !tickerFake.stopped.Load() {
-		t.Fatal("expiration ticker was not stopped after cancellation")
-	}
 }
 
-func TestRunServiceServeFailureCancelsWorkersAndShutsDown(t *testing.T) {
+func TestRunServiceServeFailureCancelsWorkerAndShutsDown(t *testing.T) {
 	serveErr := errors.New("listen failed")
 	snapshotDone := make(chan struct{})
 	shutdownCalled := make(chan struct{})
-	tickerFake := &controlledTicker{ticks: make(chan time.Time)}
-	err := runService(context.Background(), serverConfig{expirationCheckInterval: time.Second}, lifecycleDependencies{
-		newTicker:             func(time.Duration) ticker { return tickerFake },
-		processDueExpirations: func(context.Context) error { return nil },
+	err := runService(context.Background(), serverConfig{snapshotRetryInterval: time.Second}, lifecycleDependencies{
 		runSnapshotWorker: func(ctx context.Context) error {
 			<-ctx.Done()
 			close(snapshotDone)
@@ -482,7 +410,22 @@ func TestRunServiceServeFailureCancelsWorkersAndShutsDown(t *testing.T) {
 	}
 	<-snapshotDone
 	<-shutdownCalled
-	if !tickerFake.stopped.Load() {
-		t.Fatal("expiration ticker was not stopped after serve failure")
+}
+
+func TestRunServiceJoinsServeAndSnapshotFailures(t *testing.T) {
+	serveErr := errors.New("listen failed")
+	snapshotErr := errors.New("snapshot worker failed during shutdown")
+	err := runService(context.Background(), serverConfig{snapshotRetryInterval: time.Second}, lifecycleDependencies{
+		runSnapshotWorker: func(ctx context.Context) error {
+			<-ctx.Done()
+			return snapshotErr
+		},
+		waitSnapshotRetry: func(context.Context, time.Duration) error { return nil },
+		serve:             func() error { return serveErr },
+		shutdown:          func(context.Context) error { return nil },
+		logf:              func(string, ...any) {},
+	})
+	if !errors.Is(err, serveErr) || !errors.Is(err, snapshotErr) {
+		t.Fatalf("runService() error = %v; want serve and snapshot failures", err)
 	}
 }

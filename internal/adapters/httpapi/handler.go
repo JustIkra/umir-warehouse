@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 )
 
 type Runtime interface {
+	RunExpirations(context.Context) (contract.ExpirationRun, error)
 	RegisterProduct(context.Context, contract.RegisterProductRequest) (contract.Product, error)
 	DefineDish(context.Context, contract.DefineDishRequest) (contract.Dish, error)
 	ReceiveDelivery(context.Context, contract.ReceiveDeliveryRequest) (contract.DeliveryReceipt, error)
@@ -57,6 +59,23 @@ func (h *handlers) servePublic(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	r = r.WithContext(ctx)
 	switch r.URL.Path {
+	case "/expiration-runs":
+		if !method(w, r, http.MethodPost) {
+			return
+		}
+		if noQuery(w, r) != nil {
+			return
+		}
+		if hasRequestBody(r) {
+			writeError(w, contract.ErrInvalidArgument, true)
+			return
+		}
+		value, err := h.runtime.RunExpirations(ctx)
+		if err != nil {
+			writeError(w, err, true)
+			return
+		}
+		writeJSON(w, http.StatusOK, wireExpirationRun(value))
 	case "/healthz":
 		if !method(w, r, http.MethodGet) || noQuery(w, r) != nil {
 			return
@@ -133,6 +152,11 @@ func (h *handlers) servePublic(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeFailure(w, http.StatusNotFound, "NotFound", "Route was not found.", "unavailable")
 	}
+}
+
+func hasRequestBody(r *http.Request) bool {
+	data, err := io.ReadAll(io.LimitReader(r.Body, 1))
+	return len(data) != 0 || err != nil
 }
 
 func (h *handlers) serveInternal(w http.ResponseWriter, r *http.Request) {

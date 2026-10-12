@@ -104,6 +104,10 @@ func (r *Runtime) ProcessDueExpirations(ctx context.Context) ([]contract.ExpiryR
 	return r.owner.ProcessDueExpirations(ctx)
 }
 
+func (r *Runtime) RunExpirations(ctx context.Context) (contract.ExpirationRun, error) {
+	return r.owner.RunExpirations(ctx)
+}
+
 func (r *Runtime) ExpireBatch(ctx context.Context, request contract.ExpireBatchRequest) (contract.ExpiryResult, error) {
 	var result contract.ExpiryResult
 	err := r.attempts.RunOtherCommand(ctx, request.CommandID, func() error {

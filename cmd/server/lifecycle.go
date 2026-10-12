@@ -9,26 +9,12 @@ import (
 	"time"
 )
 
-type ticker interface {
-	C() <-chan time.Time
-	Stop()
-}
-
-type realTicker struct {
-	ticker *time.Ticker
-}
-
-func (t realTicker) C() <-chan time.Time { return t.ticker.C }
-func (t realTicker) Stop()               { t.ticker.Stop() }
-
 type lifecycleDependencies struct {
-	newTicker             func(time.Duration) ticker
-	processDueExpirations func(context.Context) error
-	runSnapshotWorker     func(context.Context) error
-	waitSnapshotRetry     func(context.Context, time.Duration) error
-	serve                 func() error
-	shutdown              func(context.Context) error
-	logf                  func(string, ...any)
+	runSnapshotWorker func(context.Context) error
+	waitSnapshotRetry func(context.Context, time.Duration) error
+	serve             func() error
+	shutdown          func(context.Context) error
+	logf              func(string, ...any)
 }
 
 type lifecycleResult struct {
@@ -41,46 +27,22 @@ type retryableSnapshotSaveError interface {
 }
 
 func runService(parent context.Context, cfg serverConfig, dependencies lifecycleDependencies) error {
-	if cfg.expirationCheckInterval <= 0 {
-		return errors.New("expiration check interval must be positive")
+	if cfg.snapshotRetryInterval <= 0 {
+		return errors.New("snapshot retry interval must be positive")
 	}
-	if dependencies.newTicker == nil || dependencies.processDueExpirations == nil || dependencies.runSnapshotWorker == nil || dependencies.waitSnapshotRetry == nil || dependencies.serve == nil || dependencies.shutdown == nil {
+	if dependencies.runSnapshotWorker == nil || dependencies.waitSnapshotRetry == nil || dependencies.serve == nil || dependencies.shutdown == nil {
 		return errors.New("lifecycle dependencies are required")
 	}
 	if dependencies.logf == nil {
 		dependencies.logf = log.Printf
 	}
-	expirationTicker := dependencies.newTicker(cfg.expirationCheckInterval)
-	if expirationTicker == nil {
-		return errors.New("ticker factory returned nil")
-	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-
-	expirationDone := &lifecycleResult{done: make(chan struct{})}
-	go func() {
-		defer close(expirationDone.done)
-		defer expirationTicker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case _, ok := <-expirationTicker.C():
-				if !ok {
-					expirationDone.err = errors.New("expiration ticker stopped unexpectedly")
-					return
-				}
-				if err := dependencies.processDueExpirations(ctx); err != nil && ctx.Err() == nil {
-					dependencies.logf("process due expirations: %v", err)
-				}
-			}
-		}
-	}()
 
 	snapshotDone := &lifecycleResult{done: make(chan struct{})}
 	go func() {
 		defer close(snapshotDone.done)
-		snapshotDone.err = runSnapshotWorkerWithRetry(ctx, cfg.expirationCheckInterval, dependencies.runSnapshotWorker, dependencies.waitSnapshotRetry, dependencies.logf)
+		snapshotDone.err = runSnapshotWorkerWithRetry(ctx, cfg.snapshotRetryInterval, dependencies.runSnapshotWorker, dependencies.waitSnapshotRetry, dependencies.logf)
 	}()
 
 	serveDone := &lifecycleResult{done: make(chan struct{})}
@@ -99,8 +61,8 @@ func runService(parent context.Context, cfg serverConfig, dependencies lifecycle
 	}()
 
 	var cause error
-	var serveErr, snapshotErr, expirationErr error
-	var serveFinished, snapshotFinished, expirationFinished bool
+	var serveErr, snapshotErr error
+	var serveFinished, snapshotFinished bool
 	var snapshotErrorReported bool
 	select {
 	case <-parent.Done():
@@ -110,17 +72,10 @@ func runService(parent context.Context, cfg serverConfig, dependencies lifecycle
 	case <-snapshotDone.done:
 		snapshotErr = snapshotDone.err
 		snapshotFinished = true
-		snapshotErrorShouldStop := snapshotErr != nil
-		if parent.Err() != nil && errors.Is(snapshotErr, context.Canceled) {
-			snapshotErrorShouldStop = false
-		}
-		if snapshotErrorShouldStop {
+		if snapshotErr != nil && (parent.Err() == nil || !errors.Is(snapshotErr, context.Canceled)) {
 			cause = fmt.Errorf("run snapshot worker: %w", snapshotErr)
 			snapshotErrorReported = true
 		}
-	case <-expirationDone.done:
-		expirationErr = expirationDone.err
-		expirationFinished = true
 	}
 	cancel()
 
@@ -134,22 +89,14 @@ func runService(parent context.Context, cfg serverConfig, dependencies lifecycle
 		<-snapshotDone.done
 		snapshotErr = snapshotDone.err
 	}
-	if !expirationFinished {
-		<-expirationDone.done
-		expirationErr = expirationDone.err
-	}
 	if serveErr == nil {
 		cause = errors.Join(cause, errors.New("HTTP server stopped unexpectedly"))
 	} else if !errors.Is(serveErr, http.ErrServerClosed) {
 		cause = errors.Join(cause, fmt.Errorf("serve HTTP: %w", serveErr))
 	}
-	snapshotFailed := snapshotErr != nil
 	canceledNormally := ctx.Err() != nil && errors.Is(snapshotErr, context.Canceled)
-	if snapshotFailed && !snapshotErrorReported && !canceledNormally {
+	if snapshotErr != nil && !snapshotErrorReported && !canceledNormally {
 		cause = errors.Join(cause, fmt.Errorf("run snapshot worker: %w", snapshotErr))
-	}
-	if expirationErr != nil {
-		cause = errors.Join(cause, fmt.Errorf("expiration worker: %w", expirationErr))
 	}
 	if shutdownErr != nil {
 		cause = errors.Join(cause, fmt.Errorf("shutdown HTTP server: %w", shutdownErr))
@@ -161,6 +108,9 @@ func runSnapshotWorkerWithRetry(ctx context.Context, retryInterval time.Duration
 	for {
 		err := run(ctx)
 		if ctx.Err() != nil {
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
 			return ctx.Err()
 		}
 		if err == nil {
