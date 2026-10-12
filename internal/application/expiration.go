@@ -26,13 +26,18 @@ func (o *Owner) nextDueBatch(now time.Time) (string, bool) {
 }
 
 func (o *Owner) ProcessDueExpirations(ctx context.Context) ([]contract.ExpiryResult, error) {
+	run, err := o.RunExpirations(ctx)
+	return run.Expired, err
+}
+
+func (o *Owner) RunExpirations(ctx context.Context) (contract.ExpirationRun, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	_, results, err := o.prepareLocked(ctx)
+	state, results, err := o.prepareLocked(ctx)
 	if err != nil {
-		return results, inventoryUnavailable(err)
+		return contract.ExpirationRun{Expired: results}, inventoryUnavailable(err)
 	}
-	return results, nil
+	return contract.ExpirationRun{EvaluatedAt: state.EvaluatedAt, StateVersion: state.StateVersion, Expired: results}, nil
 }
 
 func (o *Owner) ExpireBatch(ctx context.Context, request contract.ExpireBatchRequest) (contract.ExpiryResult, error) {

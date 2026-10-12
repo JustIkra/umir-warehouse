@@ -43,6 +43,25 @@ func TestMissedTick(t *testing.T) {
 	}
 }
 
+func TestRunExpirationsReturnsAtomicObservationAndRepeatsIdempotently(t *testing.T) {
+	dueAt := moscowTime(2026, time.April, 2, 10)
+	owner, _, _ := newSeededOwner(t, dueAt, 10000, 0)
+	first, err := owner.RunExpirations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.EvaluatedAt.Equal(dueAt) || first.StateVersion != 4 || len(first.Expired) != 1 || first.Expired[0].BatchID != "batch" {
+		t.Fatalf("RunExpirations() = %#v; want dueAt/version 4/one batch", first)
+	}
+	second, err := owner.RunExpirations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.EvaluatedAt.Equal(dueAt) || second.StateVersion != first.StateVersion || len(second.Expired) != 0 {
+		t.Fatalf("repeat RunExpirations() = %#v; want unchanged version and no expirations", second)
+	}
+}
+
 func TestDueDuringPreparation(t *testing.T) {
 	firstDue := moscowTime(2026, time.April, 2, 10)
 	store := seedStore(t, firstDue, 10000, 0)

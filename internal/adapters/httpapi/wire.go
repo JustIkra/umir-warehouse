@@ -259,6 +259,12 @@ type expiryWire struct {
 	ProcessedAt        string `json:"processedAt"`
 }
 
+type expirationRunWire struct {
+	EvaluatedAt  string       `json:"evaluatedAt"`
+	StateVersion string       `json:"stateVersion"`
+	Expired      []expiryWire `json:"expired"`
+}
+
 type eventPayloadWire struct {
 	Product  *productWire  `json:"product,omitempty"`
 	Dish     *dishWire     `json:"dish,omitempty"`
@@ -415,6 +421,14 @@ func wireBatch(value contract.Batch) batchWire {
 
 func wireExpiry(value contract.ExpiryResult) expiryWire {
 	return expiryWire{BatchID: value.BatchID, ProductID: value.ProductID, WrittenOffQuantity: wireInt(int64(value.WrittenOffQuantity)), Reason: value.Reason, ExpiresAt: wireTime(value.ExpiresAt), ProcessedAt: wireTime(value.ProcessedAt)}
+}
+
+func wireExpirationRun(value contract.ExpirationRun) expirationRunWire {
+	result := expirationRunWire{EvaluatedAt: wireTime(value.EvaluatedAt), StateVersion: wireInt(value.StateVersion), Expired: make([]expiryWire, len(value.Expired))}
+	for index, expiry := range value.Expired {
+		result.Expired[index] = wireExpiry(expiry)
+	}
+	return result
 }
 
 func wireProducts(value contract.Products) productsWire {

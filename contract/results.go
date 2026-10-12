@@ -57,6 +57,12 @@ type ExpiryResult struct {
 	ProcessedAt        time.Time
 }
 
+type ExpirationRun struct {
+	EvaluatedAt  time.Time
+	StateVersion int64
+	Expired      []ExpiryResult
+}
+
 type Menu struct {
 	EvaluatedAt  time.Time
 	StateVersion int64

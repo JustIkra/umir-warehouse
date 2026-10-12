@@ -40,6 +40,86 @@ func TestHTTPHandlersSeparatePublicAndInternalRoutes(t *testing.T) {
 	}
 }
 
+func TestExpirationRunsPublicRouteRequiresEmptyBodyAndReturnsAggregate(t *testing.T) {
+	runtime := newRuntime(t)
+	public, internal := newHandlers(t, runtime)
+	request := httptest.NewRequest(http.MethodPost, "/expiration-runs", nil)
+	response := httptest.NewRecorder()
+	public.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("POST /expiration-runs = %d %s; want 200", response.Code, response.Body.String())
+	}
+	var body struct {
+		EvaluatedAt  string            `json:"evaluatedAt"`
+		StateVersion string            `json:"stateVersion"`
+		Expired      []json.RawMessage `json:"expired"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("expiration run body %q: %v", response.Body.String(), err)
+	}
+	if body.EvaluatedAt != "2026-10-11T12:00:00+03:00" || body.StateVersion != "0" || body.Expired == nil || len(body.Expired) != 0 {
+		t.Fatalf("expiration run response = %#v; want fixed observation and empty array", body)
+	}
+	response = httptest.NewRecorder()
+	public.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/expiration-runs", nil))
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /expiration-runs = %d %s; want 405", response.Code, response.Body.String())
+	}
+	for _, path := range []string{"/expiration-runs?x=1"} {
+		response := httptest.NewRecorder()
+		public.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("POST %s = %d %s; want 400", path, response.Code, response.Body.String())
+		}
+	}
+	for _, body := range []string{"{}", " ", "unexpected"} {
+		request := httptest.NewRequest(http.MethodPost, "/expiration-runs", strings.NewReader(body))
+		request.ContentLength = -1
+		response := httptest.NewRecorder()
+		public.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Errorf("POST with body %q = %d %s; want 400", body, response.Code, response.Body.String())
+		}
+	}
+	response = httptest.NewRecorder()
+	internal.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/expiration-runs", nil))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("internal POST /expiration-runs = %d; want 404", response.Code)
+	}
+}
+
+type failedExpirationRuntime struct {
+	httpapi.Runtime
+	err error
+}
+
+func (r failedExpirationRuntime) RunExpirations(context.Context) (contract.ExpirationRun, error) {
+	return contract.ExpirationRun{}, r.err
+}
+
+func TestExpirationRunsInventoryFailureHasUnknownWriteOutcome(t *testing.T) {
+	public, _, err := httpapi.NewHandlers(failedExpirationRuntime{Runtime: newRuntime(t), err: contract.ErrInventoryUnavailable}, httpapi.Options{RequestTimeout: time.Second, MaxRequestBytes: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	public.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/expiration-runs", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST /expiration-runs failure = %d %s; want 503", response.Code, response.Body.String())
+	}
+	var body struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Outcome string `json:"outcome"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("expiration error body %q: %v", response.Body.String(), err)
+	}
+	if body.Code != "InventoryUnavailable" || body.Outcome != "unknown" {
+		t.Fatalf("expiration error = %#v; want InventoryUnavailable/unknown", body)
+	}
+}
+
 func TestHTTPHandlersRejectDuplicateFieldsBeforeMutation(t *testing.T) {
 	runtime, err := bootstrap.NewInMemory(bootstrap.Options{Now: time.Now, NewID: func() string { return "id" }, EventsPerSnapshot: 10})
 	if err != nil {
