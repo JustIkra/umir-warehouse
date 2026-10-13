@@ -54,16 +54,20 @@ type Delivery struct {
 }
 
 type Batch struct {
-	BatchID           string
-	DeliveryID        string
-	LineNo            int64
-	ProductID         string
-	ManufacturedAt    time.Time
-	ShelfLife         ShelfLife
-	ReceivedAt        time.Time
-	ExpiresAt         time.Time
-	ReceivedQuantity  Quantity
-	RemainingQuantity Quantity
+	AppliedTimeZone        string
+	AppliedSettingsVersion string
+	TZDataVersion          string
+	PendingWriteoff        bool
+	BatchID                string
+	DeliveryID             string
+	LineNo                 int64
+	ProductID              string
+	ManufacturedAt         time.Time
+	ShelfLife              ShelfLife
+	ReceivedAt             time.Time
+	ExpiresAt              time.Time
+	ReceivedQuantity       Quantity
+	RemainingQuantity      Quantity
 }
 
 type Position struct {
@@ -138,10 +142,14 @@ type MenuEvaluation struct {
 }
 
 type ProductInventory struct {
-	ProductID string
-	BaseUnit  BaseUnit
-	Quantity  Quantity
-	Batches   []Batch
+	Name                    string
+	AvailableQuantity       Quantity
+	PendingWriteoffQuantity Quantity
+	ExpiringQuantity        Quantity
+	ProductID               string
+	BaseUnit                BaseUnit
+	Quantity                Quantity
+	Batches                 []Batch
 }
 
 type InventoryView struct {
@@ -161,6 +169,8 @@ type ExpiringBatch struct {
 }
 
 type Event struct {
+	TenantID           string
+	RuntimeEpoch       string
 	EventID            string
 	StreamID           string
 	Sequence           int64
@@ -175,11 +185,13 @@ type Event struct {
 type EventType string
 
 const (
-	EventProductRegistered EventType = "ProductRegistered"
-	EventDishDefined       EventType = "DishDefined"
-	EventDeliveryReceived  EventType = "DeliveryReceived"
-	EventOrderPlaced       EventType = "OrderPlaced"
-	EventBatchExpired      EventType = "BatchExpired"
+	EventProductRegistered      EventType = "ProductRegistered"
+	EventDishDefined            EventType = "DishDefined"
+	EventDeliveryReceived       EventType = "DeliveryReceived"
+	EventOrderPlaced            EventType = "OrderPlaced"
+	EventBatchExpiryPending     EventType = "BatchExpiryPending"
+	EventBatchWriteoffConfirmed EventType = "BatchWriteoffConfirmed"
+	EventBatchExpired           EventType = "BatchExpired"
 )
 
 type EventPayload struct {
@@ -188,5 +200,7 @@ type EventPayload struct {
 	Delivery *Delivery
 	Batches  []Batch
 	Order    *Order
+	Pending  *PendingResult
+	Writeoff *WriteoffResult
 	Expiry   *ExpiryResult
 }

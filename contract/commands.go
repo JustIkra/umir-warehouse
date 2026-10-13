@@ -17,11 +17,14 @@ type DefineDishRequest struct {
 }
 
 type ReceiveDeliveryRequest struct {
-	CommandID  string
-	DeliveryID string
-	Number     string
-	CreatedAt  time.Time
-	Lines      []DeliveryLine
+	Scope                   Scope
+	ExpectedSettingsVersion string
+	TimeInputs              *DeliveryTimeInputs
+	CommandID               string
+	DeliveryID              string
+	Number                  string
+	CreatedAt               time.Time
+	Lines                   []DeliveryLine
 }
 
 type EvaluateOrderRequest struct {

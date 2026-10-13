@@ -64,7 +64,7 @@ func TestSnapshotAuditRejectsExpiryBeforeLaterOrder(t *testing.T) {
 		batches[i].Events[0].Sequence = int64(i + 1)
 		batches[i].FinalSequence = int64(i + 1)
 	}
-	if err := validateJournal(batches, 5); err != nil {
+	if err := validateJournalContext(context.Background(), batches, 5); err != nil {
 		t.Fatalf("structural journal validation = %v; want sequence-valid reordered prefix", err)
 	}
 	fullReplay := domain.InventoryState{}

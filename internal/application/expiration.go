@@ -35,15 +35,15 @@ func (o *Owner) RunExpirations(ctx context.Context) (contract.ExpirationRun, err
 	defer o.mu.Unlock()
 	state, results, err := o.prepareLocked(ctx)
 	if err != nil {
-		return contract.ExpirationRun{Expired: results}, inventoryUnavailable(err)
+		return contract.ExpirationRun{Scope: o.scope, StateVersion: o.state.StateVersion, Expired: results}, inventoryUnavailable(err)
 	}
-	return contract.ExpirationRun{EvaluatedAt: state.EvaluatedAt, StateVersion: state.StateVersion, Expired: results}, nil
+	return contract.ExpirationRun{Scope: o.scope, EvaluatedAt: state.EvaluatedAt, StateVersion: state.StateVersion, Expired: results}, nil
 }
 
 func (o *Owner) ExpireBatch(ctx context.Context, request contract.ExpireBatchRequest) (contract.ExpiryResult, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if request.CommandID == "" || request.BatchID == "" {
+	if o.scope.RestaurantID != "" || request.CommandID == "" || request.BatchID == "" {
 		return contract.ExpiryResult{}, contract.ErrInvalidArgument
 	}
 	if request.CommandID != "expiration/"+request.BatchID {
@@ -64,7 +64,7 @@ func (o *Owner) ExpireBatch(ctx context.Context, request contract.ExpireBatchReq
 	if !ok {
 		return contract.ExpiryResult{}, domain.ErrBatchNotFound
 	}
-	if batch.RemainingQuantity <= 0 {
+	if batch.RemainingQuantity <= 0 || batch.PendingWriteoff {
 		return contract.ExpiryResult{}, contract.ErrNotDue
 	}
 	now := domain.CanonicalBusinessTime(o.now())
@@ -88,6 +88,9 @@ func (o *Owner) expireDueLocked(ctx context.Context, batchID string, now time.Ti
 }
 
 func (o *Owner) writeExpiryLocked(ctx context.Context, commandID, fingerprint string, batch domain.Batch, now time.Time) (domain.ExpiryResult, error) {
+	if o.scope.RestaurantID != "" {
+		return o.writePendingLocked(ctx, batch, now)
+	}
 	result := domain.ExpiryResult{BatchID: batch.BatchID, ProductID: batch.ProductID, WrittenOffQuantity: batch.RemainingQuantity, Reason: domain.ExpiryReasonExpiration, ExpiresAt: batch.ExpiresAt, ProcessedAt: now}
 	event := domain.Event{EventID: o.newID(), RecordedAt: now, Type: domain.EventBatchExpired, Payload: domain.EventPayload{Expiry: &result}}
 	command := domain.CommandBatch{ExpectedVersion: o.state.StateVersion, CommandID: commandID, CommandType: "ExpireBatch", CommandFingerprint: fingerprint, Events: []domain.Event{event}}

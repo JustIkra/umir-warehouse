@@ -30,7 +30,7 @@ linters:
       rules:
         production-boundaries:
           list-mode: lax
-          files: ["$all", "!$test"]
+          files: ["$all", "!$test", "!**/tests/fixtures/**"]
           deny:
             - pkg: "github.com/JustIkra/umir-warehouse/tests/"
               desc: "Production must not import test support."
@@ -40,6 +40,16 @@ linters:
               desc: "Service modules interact through their declared boundary."
             - pkg: "github.com/JustIkra/umir-factory"
               desc: "Service code must not import the factory."
+        fixture-boundaries:
+          list-mode: lax
+          files: ["**/tests/fixtures/**"]
+          deny:
+            - pkg: "github.com/JustIkra/umir-serving"
+              desc: "Fixtures consume public Warehouse surfaces and local peer doubles."
+            - pkg: "github.com/JustIkra/umir-gateway"
+              desc: "Fixtures consume public Warehouse surfaces and local peer doubles."
+            - pkg: "github.com/JustIkra/umir-factory"
+              desc: "Fixtures must not import Factory."
         domain:
           list-mode: strict
           files:
@@ -86,6 +96,8 @@ linters:
             - "time$"
             - "unicode$"
             - "unicode/utf8$"
+            - "crypto/sha256$"
+            - "encoding/hex$"
             - "github.com/JustIkra/umir-warehouse/contract/"
             - "github.com/JustIkra/umir-warehouse/contract$"
         application:
@@ -109,6 +121,8 @@ linters:
             - "time$"
             - "unicode$"
             - "unicode/utf8$"
+            - "golang.org/x/text/cases$"
+            - "golang.org/x/text/unicode/norm$"
             - "context$"
             - "sync$"
             - "sync/atomic$"

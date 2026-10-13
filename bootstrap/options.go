@@ -1,8 +1,15 @@
 package bootstrap
 
-import "time"
+import (
+	"time"
+
+	"github.com/JustIkra/umir-warehouse/contract"
+)
 
 type Options struct {
+	CoverageFrom      time.Time
+	Scope             contract.Scope
+	TZDataVersion     string
 	Now               func() time.Time
 	NewID             func() string
 	EventsPerSnapshot int64

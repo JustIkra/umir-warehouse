@@ -82,20 +82,49 @@ func ResultForBatch(batch RecordedBatch) (CommandResult, error) {
 			return CommandResult{}, ErrInvalidEventBatch
 		}
 		for _, event := range batch.Events[1:] {
-			if event.Type != EventBatchExpired || event.Payload.Expiry == nil {
+			if (event.Type != EventBatchExpired || event.Payload.Expiry == nil) && (event.Type != EventBatchExpiryPending || event.Payload.Pending == nil) {
 				return CommandResult{}, ErrInvalidEventBatch
 			}
-			if _, ok := seen[event.Payload.Expiry.BatchID]; !ok {
+			id := ""
+			if event.Payload.Expiry != nil {
+				id = event.Payload.Expiry.BatchID
+			}
+			if event.Payload.Pending != nil {
+				id = event.Payload.Pending.BatchID
+			}
+			if _, ok := seen[id]; !ok {
 				return CommandResult{}, ErrInvalidEventBatch
 			}
 		}
-		return CommandResult{Kind: CommandResultDeliveryReceived, Delivery: &DeliveryReceipt{DeliveryID: delivery.DeliveryID, BatchIDs: batchIDs}}, nil
+		receipt := &DeliveryReceipt{DeliveryID: delivery.DeliveryID, BatchIDs: batchIDs}
+		if batch.Events[0].SchemaVersion == InventorySchemaV2 {
+			receipt.OrganizationID = delivery.OrganizationID
+			receipt.RestaurantID = batch.Events[0].TenantID
+			receipt.RuntimeEpoch = batch.Events[0].RuntimeEpoch
+			receipt.LifecycleVersion = delivery.LifecycleVersion
+			receipt.EvaluatedAt = batch.Events[0].RecordedAt
+			receipt.StateVersion = batch.FinalSequence
+			receipt.Batches = append([]Batch(nil), batch.Events[0].Payload.Batches...)
+		}
+		return CommandResult{Kind: CommandResultDeliveryReceived, Delivery: receipt}, nil
 	case "ConfirmOrder":
 		if len(batch.Events) != 1 || batch.Events[0].Type != EventOrderPlaced || batch.Events[0].Payload.Order == nil || batch.Events[0].Payload.Order.OrderID == "" || batch.Events[0].Payload.Order.ProposalID == "" {
 			return CommandResult{}, ErrInvalidEventBatch
 		}
 		order := CloneOrder(*batch.Events[0].Payload.Order)
 		return CommandResult{Kind: CommandResultOrderPlaced, Order: &order}, nil
+	case "PrepareExpiry":
+		if len(batch.Events) != 1 || batch.Events[0].Type != EventBatchExpiryPending || batch.Events[0].Payload.Pending == nil {
+			return CommandResult{}, ErrInvalidEventBatch
+		}
+		p := *batch.Events[0].Payload.Pending
+		return CommandResult{Kind: CommandResultBatchExpiryPending, Pending: &p}, nil
+	case "ConfirmWriteoff":
+		if len(batch.Events) != 1 || batch.Events[0].Type != EventBatchWriteoffConfirmed || batch.Events[0].Payload.Writeoff == nil {
+			return CommandResult{}, ErrInvalidEventBatch
+		}
+		v := *batch.Events[0].Payload.Writeoff
+		return CommandResult{Kind: CommandResultBatchWriteoffConfirmed, Writeoff: &v}, nil
 	case "ExpireBatch":
 		if len(batch.Events) != 1 || batch.Events[0].Type != EventBatchExpired || batch.Events[0].Payload.Expiry == nil {
 			return CommandResult{}, ErrInvalidEventBatch
@@ -108,7 +137,7 @@ func ResultForBatch(batch RecordedBatch) (CommandResult, error) {
 }
 
 func ValidateRecordedEvent(event Event, batch RecordedBatch, expectedSequence int64) error {
-	if event.SchemaVersion != InventorySchemaV1 {
+	if event.SchemaVersion != InventorySchemaV1 && event.SchemaVersion != InventorySchemaV2 {
 		return ErrUnsupportedSchema
 	}
 	if event.EventID == "" || event.StreamID != InventoryStreamID || event.Sequence != expectedSequence || event.CommandID != batch.CommandID || event.CommandFingerprint != batch.CommandFingerprint || event.RecordedAt.IsZero() {
@@ -117,8 +146,16 @@ func ValidateRecordedEvent(event Event, batch RecordedBatch, expectedSequence in
 	if !isBusinessTime(event.RecordedAt) {
 		return ErrInvalidBusinessTime
 	}
+	newType := event.Type == EventBatchExpiryPending || event.Type == EventBatchWriteoffConfirmed
+	v2Delivery := event.Type == EventDeliveryReceived && event.SchemaVersion == InventorySchemaV2
+	if !v2Delivery && newType != (event.SchemaVersion == InventorySchemaV2) {
+		return ErrUnsupportedSchema
+	}
+	if (newType || v2Delivery) && (event.TenantID == "" || event.RuntimeEpoch == "") {
+		return ErrInvalidRecordedBatch
+	}
 	payloadCount := 0
-	for _, present := range []bool{event.Payload.Product != nil, event.Payload.Dish != nil, event.Payload.Delivery != nil, event.Payload.Order != nil, event.Payload.Expiry != nil} {
+	for _, present := range []bool{event.Payload.Product != nil, event.Payload.Dish != nil, event.Payload.Delivery != nil, event.Payload.Order != nil, event.Payload.Expiry != nil, event.Payload.Pending != nil, event.Payload.Writeoff != nil} {
 		if present {
 			payloadCount++
 		}
@@ -127,7 +164,7 @@ func ValidateRecordedEvent(event Event, batch RecordedBatch, expectedSequence in
 		return ErrInvalidEvent
 	}
 	switch event.Type {
-	case EventProductRegistered, EventDishDefined, EventDeliveryReceived, EventOrderPlaced, EventBatchExpired:
+	case EventProductRegistered, EventDishDefined, EventDeliveryReceived, EventOrderPlaced, EventBatchExpired, EventBatchExpiryPending, EventBatchWriteoffConfirmed:
 		return nil
 	default:
 		return ErrInvalidEvent
@@ -135,6 +172,12 @@ func ValidateRecordedEvent(event Event, batch RecordedBatch, expectedSequence in
 }
 
 func validEventPayload(event Event) bool {
+	if event.Type == EventBatchExpiryPending || event.Type == EventBatchWriteoffConfirmed {
+		return event.Payload.Product == nil && event.Payload.Dish == nil && event.Payload.Delivery == nil && len(event.Payload.Batches) == 0 && event.Payload.Order == nil && event.Payload.Expiry == nil && ((event.Type == EventBatchExpiryPending && event.Payload.Pending != nil && event.Payload.Writeoff == nil) || (event.Type == EventBatchWriteoffConfirmed && event.Payload.Writeoff != nil && event.Payload.Pending == nil))
+	}
+	if event.Payload.Pending != nil || event.Payload.Writeoff != nil {
+		return false
+	}
 	switch event.Type {
 	case EventProductRegistered:
 		return event.Payload.Product != nil && event.Payload.Dish == nil && event.Payload.Delivery == nil && len(event.Payload.Batches) == 0 && event.Payload.Order == nil && event.Payload.Expiry == nil
@@ -188,6 +231,10 @@ func applyEvent(state *InventoryState, event Event) error {
 		return applyDelivery(state, event.Payload.Delivery, event.Payload.Batches)
 	case EventOrderPlaced:
 		return applyOrder(state, event.Payload.Order)
+	case EventBatchExpiryPending:
+		return applyPending(state, event)
+	case EventBatchWriteoffConfirmed:
+		return applyWriteoff(state, event)
 	case EventBatchExpired:
 		return applyExpiry(state, event.Payload.Expiry)
 	default:
@@ -205,7 +252,7 @@ func applyDelivery(state *InventoryState, delivery *Delivery, batches []Batch) e
 	}
 	for i, registered := range batches {
 		line := delivery.Lines[i]
-		if registered.BatchID == "" || registered.DeliveryID != delivery.DeliveryID || registered.LineNo != int64(i+1) || registered.ProductID != line.ProductID || !registered.ManufacturedAt.Equal(line.ManufacturedAt) || !registered.ReceivedAt.Equal(line.ReceivedAt) || registered.ShelfLife != line.ShelfLife || registered.ReceivedQuantity != line.Quantity || registered.RemainingQuantity != line.Quantity || registered.ConsumedByOrders != 0 || registered.WrittenOffForExpiry != 0 || line.Quantity <= 0 {
+		if registered.BatchID == "" || registered.DeliveryID != delivery.DeliveryID || registered.LineNo != int64(i+1) || registered.ProductID != line.ProductID || !registered.ManufacturedAt.Equal(line.ManufacturedAt) || !registered.ReceivedAt.Equal(line.ReceivedAt) || registered.ShelfLife != line.ShelfLife || registered.ReceivedQuantity != line.Quantity || registered.RemainingQuantity != line.Quantity || registered.ConsumedByOrders != 0 || registered.WrittenOffForExpiry != 0 || registered.PendingWriteoff || line.Quantity <= 0 {
 			return ErrInvalidEvent
 		}
 		if !isBusinessTime(registered.ManufacturedAt) || !isBusinessTime(registered.ReceivedAt) || !isBusinessTime(registered.ExpiresAt) || registered.ShelfLife.Value <= 0 || registered.ShelfLife.Unit != ShelfLifeDay && registered.ShelfLife.Unit != ShelfLifeMonth || !registered.ExpiresAt.After(registered.ManufacturedAt) {
@@ -267,7 +314,7 @@ func applyOrder(state *InventoryState, order *Order) error {
 		if !exists {
 			return ErrBatchNotFound
 		}
-		if batch.ProductID != allocation.ProductID || allocation.Quantity > batch.RemainingQuantity {
+		if batch.PendingWriteoff || batch.ProductID != allocation.ProductID || allocation.Quantity > batch.RemainingQuantity {
 			return ErrInvalidEvent
 		}
 		var err error
@@ -313,6 +360,7 @@ func applyExpiry(state *InventoryState, expiry *ExpiryResult) error {
 	if batch.ProductID != expiry.ProductID || !batch.ExpiresAt.Equal(expiry.ExpiresAt) || !isBusinessTime(expiry.ProcessedAt) || !isBusinessTime(expiry.ExpiresAt) || expiry.WrittenOffQuantity != batch.RemainingQuantity {
 		return ErrInvalidEvent
 	}
+	batch.PendingWriteoff = false
 	batch.RemainingQuantity = 0
 	updated, err := AddQuantity(batch.WrittenOffForExpiry, expiry.WrittenOffQuantity)
 	if err != nil {
@@ -372,4 +420,32 @@ func isBusinessTime(value time.Time) bool {
 	}
 	_, offset := value.Zone()
 	return offset == 3*60*60
+}
+
+func applyPending(state *InventoryState, event Event) error {
+	p := event.Payload.Pending
+	b, ok := state.Batches[p.BatchID]
+	product := state.Products[p.ProductID]
+	if !ok || b.PendingWriteoff || b.RemainingQuantity <= 0 || b.ProductID != p.ProductID || b.RemainingQuantity != p.RemainingQuantity || product.BaseUnit != p.BaseUnit || !b.ExpiresAt.Equal(p.ExpiresAt) || event.RecordedAt.Before(p.ExpiresAt) {
+		return ErrInvalidEvent
+	}
+	b.PendingWriteoff = true
+	state.Batches[b.BatchID] = b
+	return nil
+}
+func applyWriteoff(state *InventoryState, event Event) error {
+	w := event.Payload.Writeoff
+	b, ok := state.Batches[w.BatchID]
+	if !ok || !b.PendingWriteoff || w.ProductID != b.ProductID || w.WrittenOffQuantity != b.RemainingQuantity || w.WrittenOffQuantity <= 0 || w.BaseUnit != state.Products[b.ProductID].BaseUnit || w.ActorUserID == "" || w.EventID != event.EventID || !w.ConfirmedAt.Equal(event.RecordedAt) || event.RecordedAt.Before(b.ExpiresAt) || w.RestaurantID != event.TenantID || w.RuntimeEpoch != event.RuntimeEpoch || w.StateVersion != event.Sequence || w.OrganizationID == "" || w.TimeZone == "" || w.SettingsVersion == "" {
+		return ErrInvalidEvent
+	}
+	b.RemainingQuantity = 0
+	b.PendingWriteoff = false
+	var err error
+	b.WrittenOffForExpiry, err = AddQuantity(b.WrittenOffForExpiry, w.WrittenOffQuantity)
+	if err != nil || !validBatchBalance(b) {
+		return ErrInvalidEvent
+	}
+	state.Batches[b.BatchID] = b
+	return nil
 }

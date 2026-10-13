@@ -12,6 +12,47 @@ import (
 	"github.com/JustIkra/umir-warehouse/internal/domain"
 )
 
+func (o *Owner) SuggestID(ctx context.Context, kind contract.CatalogKind) (contract.IDSuggestion, error) {
+	if kind != contract.CatalogProduct && kind != contract.CatalogDish {
+		return contract.IDSuggestion{}, contract.ErrInvalidArgument
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.pending != nil {
+		return contract.IDSuggestion{}, inventoryUnavailable(domain.ErrUnknownWriteOutcome)
+	}
+	if err := o.syncProjectionLocked(ctx); err != nil {
+		return contract.IDSuggestion{}, inventoryUnavailable(err)
+	}
+	id := ""
+	if kind == contract.CatalogProduct {
+		id = lowestFreeID(o.state.Products)
+	} else {
+		id = lowestFreeID(o.state.Dishes)
+	}
+	return contract.IDSuggestion{EvaluatedAt: domain.CanonicalBusinessTime(o.now()), StateVersion: o.state.StateVersion, Kind: kind, SuggestedID: id}, nil
+}
+
+func lowestFreeID[T any](catalog map[string]T) string {
+	for id := "1"; ; id = nextDecimalID(id) {
+		if _, occupied := catalog[id]; !occupied {
+			return id
+		}
+	}
+}
+
+func nextDecimalID(id string) string {
+	digits := []byte(id)
+	for index := len(digits) - 1; index >= 0; index-- {
+		if digits[index] < '9' {
+			digits[index]++
+			return string(digits)
+		}
+		digits[index] = '0'
+	}
+	return "1" + string(digits)
+}
+
 func (o *Owner) RegisterProduct(ctx context.Context, request contract.RegisterProductRequest) (contract.Product, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()

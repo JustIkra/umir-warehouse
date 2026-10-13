@@ -44,8 +44,12 @@ type OrderAttempt struct {
 }
 
 type DeliveryReceipt struct {
-	DeliveryID string
-	BatchIDs   []string
+	Scope        Scope
+	EvaluatedAt  time.Time
+	StateVersion int64
+	Batches      []Batch
+	DeliveryID   string
+	BatchIDs     []string
 }
 
 type ExpiryResult struct {
@@ -58,6 +62,7 @@ type ExpiryResult struct {
 }
 
 type ExpirationRun struct {
+	Scope        Scope
 	EvaluatedAt  time.Time
 	StateVersion int64
 	Expired      []ExpiryResult
@@ -101,14 +106,18 @@ type Recommendations struct {
 type CommandResultKind string
 
 const (
-	CommandResultProductRegistered CommandResultKind = "ProductRegistered"
-	CommandResultDishDefined       CommandResultKind = "DishDefined"
-	CommandResultDeliveryReceived  CommandResultKind = "DeliveryReceived"
-	CommandResultOrderPlaced       CommandResultKind = "OrderPlaced"
-	CommandResultBatchExpired      CommandResultKind = "BatchExpired"
+	CommandResultProductRegistered      CommandResultKind = "ProductRegistered"
+	CommandResultDishDefined            CommandResultKind = "DishDefined"
+	CommandResultDeliveryReceived       CommandResultKind = "DeliveryReceived"
+	CommandResultOrderPlaced            CommandResultKind = "OrderPlaced"
+	CommandResultBatchExpiryPending     CommandResultKind = "BatchExpiryPending"
+	CommandResultBatchWriteoffConfirmed CommandResultKind = "BatchWriteoffConfirmed"
+	CommandResultBatchExpired           CommandResultKind = "BatchExpired"
 )
 
 type CommandResult struct {
+	Pending  *PendingResult
+	Writeoff *WriteoffResult
 	Kind     CommandResultKind
 	Product  *Product
 	Dish     *Dish
@@ -152,4 +161,27 @@ type History struct {
 	EvaluatedAt  time.Time
 	StateVersion int64
 	Events       []Event
+}
+
+type PendingResult struct {
+	BatchID           string
+	ProductID         string
+	RemainingQuantity Quantity
+	BaseUnit          BaseUnit
+	ExpiresAt         time.Time
+}
+type WriteoffResult struct {
+	BatchID            string
+	ProductID          string
+	WrittenOffQuantity Quantity
+	BaseUnit           BaseUnit
+	ActorUserID        string
+	ConfirmedAt        time.Time
+	EventID            string
+	OrganizationID     string
+	RestaurantID       string
+	RuntimeEpoch       string
+	TimeZone           string
+	SettingsVersion    string
+	StateVersion       int64
 }

@@ -13,6 +13,9 @@ import (
 var ErrNotDue = contract.ErrNotDue
 
 type Owner struct {
+	loadZone          func(string) (*time.Location, error)
+	tzdataVersion     string
+	scope             contract.Scope
 	mu                sync.Mutex
 	events            EventStore
 	now               func() time.Time
@@ -38,7 +41,7 @@ func NewOwner(events EventStore, now func() time.Time, newID func() string) (*Ow
 	if events == nil || now == nil || newID == nil {
 		return nil, contract.ErrInvalidArgument
 	}
-	return &Owner{events: events, now: now, newID: newID}, nil
+	return &Owner{events: events, now: now, newID: newID, loadZone: domain.LoadZone}, nil
 }
 
 func (o *Owner) Recover(ctx context.Context) error {
@@ -133,4 +136,49 @@ func (o *Owner) prepareLocked(ctx context.Context) (ReadState, []contract.Expiry
 			}
 		}
 	}
+}
+
+func (o *Owner) ConfigureScope(scope contract.Scope) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.started || o.scope.RestaurantID != "" {
+		return contract.ErrInvalidArgument
+	}
+	if err := scope.Validate(); err != nil {
+		return err
+	}
+	o.scope = scope
+	return nil
+}
+
+func (o *Owner) ConfigureTZData(version string) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.started {
+		return contract.ErrInvalidArgument
+	}
+	o.tzdataVersion = version
+	return nil
+}
+
+func (o *Owner) ConfigureZoneLoader(loader func(string) (*time.Location, error)) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.started || loader == nil {
+		return contract.ErrInvalidArgument
+	}
+	o.loadZone = loader
+	return nil
+}
+
+func (o *Owner) ValidateAnalyticsScope(scope contract.Scope) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if scope.Validate() != nil || scope.OrganizationID != o.scope.OrganizationID || scope.RestaurantID != o.scope.RestaurantID || scope.LifecycleVersion != o.scope.LifecycleVersion {
+		return contract.ErrForbidden
+	}
+	if scope.RuntimeEpoch != o.scope.RuntimeEpoch {
+		return contract.ErrRuntimeReset
+	}
+	return nil
 }

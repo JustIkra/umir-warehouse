@@ -295,3 +295,44 @@ func TestInvalidOwnerCommitShapeRemainsPending(t *testing.T) {
 		t.Fatalf("attempt = (%+v, %v), want Pending", attempt, err)
 	}
 }
+
+func TestW6CommandOnlyAttemptUsesRetainedCoordinator(t *testing.T) {
+	ctx := context.Background()
+	owner := &attemptOwner{started: make(chan struct{}), release: make(chan struct{}), result: contract.CommitResult{Kind: contract.CommitResultRecheckRequired, Evaluation: &contract.OrderEvaluation{StateVersion: 7}}}
+	c := NewOrderAttemptCoordinator(owner)
+	if v, err := c.FindOrderAttemptByCommand(ctx, "absent"); err != nil || v.State != contract.OrderAttemptUnseen {
+		t.Fatal(v, err)
+	}
+	request := contract.CommitOrderRequest{CommandID: "c", ProposalID: "p", AcceptedPositions: []contract.AcceptedPosition{{LineNo: 1, DishID: "D", Portions: 1}}}
+	done := make(chan error, 1)
+	go func() { _, err := c.CommitAcceptedOrder(ctx, request); done <- err }()
+	<-owner.started
+	v, err := c.FindOrderAttemptByCommand(ctx, "c")
+	if err != nil || v.State != contract.OrderAttemptPending {
+		t.Fatal(v, err)
+	}
+	close(owner.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	v, err = c.FindOrderAttemptByCommand(ctx, "c")
+	if err != nil || v.State != contract.OrderAttemptCompleted || v.Result.Evaluation.StateVersion != 7 {
+		t.Fatal(v, err)
+	}
+	v.Result.Evaluation.StateVersion = 99
+	v, err = c.FindOrderAttemptByCommand(ctx, "c")
+	if err != nil || v.Result.Evaluation.StateVersion != 7 {
+		t.Fatal("retained alias", v, err)
+	}
+	if _, err = c.FindOrderAttempt(ctx, "c", "wrong"); !errors.Is(err, contract.ErrCommandIdentityConflict) {
+		t.Fatal("legacy proposal check", err)
+	}
+	rejected := NewOrderAttemptCoordinator(&attemptOwner{err: contract.ErrDishNotFound})
+	if _, err = rejected.CommitAcceptedOrder(ctx, request); !errors.Is(err, contract.ErrDishNotFound) {
+		t.Fatal(err)
+	}
+	v, err = rejected.FindOrderAttemptByCommand(ctx, "c")
+	if err != nil || v.State != contract.OrderAttemptRejected || v.Error.Outcome != contract.OutcomeNotCommitted {
+		t.Fatal(v, err)
+	}
+}

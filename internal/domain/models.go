@@ -36,25 +36,30 @@ type DeliveryLine struct {
 }
 
 type Delivery struct {
-	DeliveryID string
-	Number     string
-	CreatedAt  time.Time
-	Lines      []DeliveryLine
+	OrganizationID, LifecycleVersion string
+	DeliveryID                       string
+	Number                           string
+	CreatedAt                        time.Time
+	Lines                            []DeliveryLine
 }
 
 type Batch struct {
-	BatchID             string
-	DeliveryID          string
-	LineNo              int64
-	ProductID           string
-	ManufacturedAt      time.Time
-	ShelfLife           ShelfLife
-	ReceivedAt          time.Time
-	ExpiresAt           time.Time
-	ReceivedQuantity    Quantity
-	RemainingQuantity   Quantity
-	ConsumedByOrders    Quantity
-	WrittenOffForExpiry Quantity
+	AppliedTimeZone        string
+	AppliedSettingsVersion string
+	TZDataVersion          string
+	BatchID                string
+	DeliveryID             string
+	LineNo                 int64
+	ProductID              string
+	ManufacturedAt         time.Time
+	ShelfLife              ShelfLife
+	ReceivedAt             time.Time
+	ExpiresAt              time.Time
+	ReceivedQuantity       Quantity
+	RemainingQuantity      Quantity
+	ConsumedByOrders       Quantity
+	PendingWriteoff        bool
+	WrittenOffForExpiry    Quantity
 }
 
 type Position struct {

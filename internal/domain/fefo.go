@@ -29,7 +29,7 @@ func AllocateFEFO(batches []Batch, required Quantity) ([]Allocation, error) {
 	remaining := required
 	allocations := make([]Allocation, 0, len(ordered))
 	for _, batch := range ordered {
-		if batch.RemainingQuantity <= 0 {
+		if batch.RemainingQuantity <= 0 || batch.PendingWriteoff {
 			continue
 		}
 		allocated := batch.RemainingQuantity
@@ -71,7 +71,9 @@ func evaluatePositions(state InventoryState, positions []Position) (OrderEvaluat
 	}
 	working := make(map[string]Quantity, len(state.Batches))
 	for id, batch := range state.Batches {
-		working[id] = batch.RemainingQuantity
+		if !batch.PendingWriteoff {
+			working[id] = batch.RemainingQuantity
+		}
 	}
 	allocations := make([]Allocation, 0)
 	seenLines := make(map[int64]struct{}, len(positions))

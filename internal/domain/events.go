@@ -7,23 +7,35 @@ import (
 	"time"
 )
 
+func EventSchemaVersion(event Event) int64 {
+	if event.Type == EventBatchExpiryPending || event.Type == EventBatchWriteoffConfirmed || event.Type == EventDeliveryReceived && event.TenantID != "" {
+		return InventorySchemaV2
+	}
+	return InventorySchemaV1
+}
+
 const (
 	InventoryStreamID      = "inventory"
 	InventorySchemaV1      = int64(1)
+	InventorySchemaV2      = int64(2)
 	ExpiryReasonExpiration = "EXPIRATION"
 )
 
 type EventType string
 
 const (
-	EventProductRegistered EventType = "ProductRegistered"
-	EventDishDefined       EventType = "DishDefined"
-	EventDeliveryReceived  EventType = "DeliveryReceived"
-	EventOrderPlaced       EventType = "OrderPlaced"
-	EventBatchExpired      EventType = "BatchExpired"
+	EventProductRegistered      EventType = "ProductRegistered"
+	EventDishDefined            EventType = "DishDefined"
+	EventDeliveryReceived       EventType = "DeliveryReceived"
+	EventOrderPlaced            EventType = "OrderPlaced"
+	EventBatchExpiryPending     EventType = "BatchExpiryPending"
+	EventBatchWriteoffConfirmed EventType = "BatchWriteoffConfirmed"
+	EventBatchExpired           EventType = "BatchExpired"
 )
 
 type Event struct {
+	TenantID           string
+	RuntimeEpoch       string
 	EventID            string
 	StreamID           string
 	Sequence           int64
@@ -41,6 +53,8 @@ type EventPayload struct {
 	Delivery *Delivery
 	Batches  []Batch
 	Order    *Order
+	Pending  *PendingResult
+	Writeoff *WriteoffResult
 	Expiry   *ExpiryResult
 }
 
@@ -54,21 +68,29 @@ type ExpiryResult struct {
 }
 
 type DeliveryReceipt struct {
-	DeliveryID string
-	BatchIDs   []string
+	OrganizationID, RestaurantID, RuntimeEpoch, LifecycleVersion string
+	EvaluatedAt                                                  time.Time
+	StateVersion                                                 int64
+	Batches                                                      []Batch
+	DeliveryID                                                   string
+	BatchIDs                                                     []string
 }
 
 type CommandResultKind string
 
 const (
-	CommandResultProductRegistered CommandResultKind = "ProductRegistered"
-	CommandResultDishDefined       CommandResultKind = "DishDefined"
-	CommandResultDeliveryReceived  CommandResultKind = "DeliveryReceived"
-	CommandResultOrderPlaced       CommandResultKind = "OrderPlaced"
-	CommandResultBatchExpired      CommandResultKind = "BatchExpired"
+	CommandResultProductRegistered      CommandResultKind = "ProductRegistered"
+	CommandResultDishDefined            CommandResultKind = "DishDefined"
+	CommandResultDeliveryReceived       CommandResultKind = "DeliveryReceived"
+	CommandResultOrderPlaced            CommandResultKind = "OrderPlaced"
+	CommandResultBatchExpiryPending     CommandResultKind = "BatchExpiryPending"
+	CommandResultBatchWriteoffConfirmed CommandResultKind = "BatchWriteoffConfirmed"
+	CommandResultBatchExpired           CommandResultKind = "BatchExpired"
 )
 
 type CommandResult struct {
+	Pending  *PendingResult
+	Writeoff *WriteoffResult
 	Kind     CommandResultKind
 	Product  *Product
 	Dish     *Dish
@@ -141,4 +163,27 @@ func CanonicalBusinessTime(value time.Time) time.Time {
 
 func CanonicalBusinessTimeString(value time.Time) string {
 	return CanonicalBusinessTime(value).Format("2006-01-02T15:04:05.999999999-07:00")
+}
+
+type PendingResult struct {
+	BatchID           string
+	ProductID         string
+	RemainingQuantity Quantity
+	BaseUnit          BaseUnit
+	ExpiresAt         time.Time
+}
+type WriteoffResult struct {
+	BatchID            string
+	ProductID          string
+	WrittenOffQuantity Quantity
+	BaseUnit           BaseUnit
+	ActorUserID        string
+	ConfirmedAt        time.Time
+	EventID            string
+	OrganizationID     string
+	RestaurantID       string
+	RuntimeEpoch       string
+	TimeZone           string
+	SettingsVersion    string
+	StateVersion       int64
 }

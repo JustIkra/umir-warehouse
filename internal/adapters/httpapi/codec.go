@@ -23,7 +23,7 @@ func decodeRequest(r *http.Request, limit int64, target any) error {
 		return errInvalidJSON
 	}
 	data, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
-	if err != nil || int64(len(data)) > limit || !utf8.Valid(data) {
+	if err != nil || int64(len(data)) > limit || (!utf8.Valid(data) || !validJSONScalars(data)) {
 		return errInvalidJSON
 	}
 	if err := rejectDuplicateFields(data); err != nil {
@@ -209,3 +209,51 @@ var (
 )
 
 var moscowTimestamp = regexp.MustCompile(`^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]{1,9})?\+03:00$`)
+
+func validJSONScalars(data []byte) bool {
+	for i := 0; i < len(data); i++ {
+		if data[i] != '"' {
+			continue
+		}
+		i++
+		for i < len(data) && data[i] != '"' {
+			if data[i] != '\\' {
+				i++
+				continue
+			}
+			i++
+			if i >= len(data) {
+				return false
+			}
+			if data[i] != 'u' {
+				i++
+				continue
+			}
+			code, ok := jsonCodeUnit(data, i+1)
+			if !ok {
+				return false
+			}
+			i += 5
+			if code >= 0xd800 && code <= 0xdbff {
+				if i+6 > len(data) || data[i] != '\\' || data[i+1] != 'u' {
+					return false
+				}
+				low, ok := jsonCodeUnit(data, i+2)
+				if !ok || low < 0xdc00 || low > 0xdfff {
+					return false
+				}
+				i += 6
+			} else if code >= 0xdc00 && code <= 0xdfff {
+				return false
+			}
+		}
+	}
+	return true
+}
+func jsonCodeUnit(data []byte, start int) (uint64, bool) {
+	if start+4 > len(data) {
+		return 0, false
+	}
+	value, err := strconv.ParseUint(string(data[start:start+4]), 16, 16)
+	return value, err == nil
+}

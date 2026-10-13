@@ -14,3 +14,11 @@ type ConfirmOrderRequest struct {
 type GetExpiringBatchesRequest struct {
 	CutoffAt time.Time
 }
+
+type StockPreparation struct {
+	EvaluatedAt          time.Time
+	StateVersion         int64
+	InvalidationRequired bool
+	Products             []Product
+	Batches              []Batch
+}

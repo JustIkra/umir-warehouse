@@ -172,10 +172,21 @@ func (c *OrderAttemptCoordinator) RunOtherCommand(ctx context.Context, commandID
 }
 
 func (c *OrderAttemptCoordinator) FindOrderAttempt(ctx context.Context, commandID, proposalID string) (contract.OrderAttempt, error) {
+	if proposalID == "" {
+		return contract.OrderAttempt{}, contract.ErrInvalidArgument
+	}
+	return c.findOrderAttempt(ctx, commandID, proposalID)
+}
+
+func (c *OrderAttemptCoordinator) FindOrderAttemptByCommand(ctx context.Context, commandID string) (contract.OrderAttempt, error) {
+	return c.findOrderAttempt(ctx, commandID, "")
+}
+
+func (c *OrderAttemptCoordinator) findOrderAttempt(ctx context.Context, commandID, proposalID string) (contract.OrderAttempt, error) {
 	if err := ctx.Err(); err != nil {
 		return contract.OrderAttempt{}, err
 	}
-	if commandID == "" || proposalID == "" {
+	if commandID == "" {
 		return contract.OrderAttempt{}, contract.ErrInvalidArgument
 	}
 	c.mu.Lock()
@@ -187,7 +198,7 @@ func (c *OrderAttemptCoordinator) FindOrderAttempt(ctx context.Context, commandI
 	entry.mu.Lock()
 	c.mu.Unlock()
 	defer entry.mu.Unlock()
-	if entry.proposal != proposalID {
+	if proposalID != "" && entry.proposal != proposalID {
 		return contract.OrderAttempt{}, contract.ErrCommandIdentityConflict
 	}
 	if entry.running || entry.state == contract.OrderAttemptPending {

@@ -2,11 +2,17 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"strconv"
 	"time"
 )
 
 type serverConfig struct {
+	apiMode               string
+	authJWKSURL           string
+	authServiceKey        string
+	callerKeys            map[string]string
+	allowPlainHTTP        bool
 	port                  string
 	internalPort          string
 	requestTimeout        time.Duration
@@ -17,6 +23,7 @@ type serverConfig struct {
 
 func loadConfig(lookup func(string) (string, bool)) (serverConfig, error) {
 	cfg := serverConfig{
+		apiMode:               envValue(lookup, "WAREHOUSE_API_MODE", "legacy"),
 		port:                  envValue(lookup, "PORT", "8080"),
 		internalPort:          envValue(lookup, "INTERNAL_PORT", "8082"),
 		requestTimeout:        8 * time.Second,
@@ -68,6 +75,29 @@ func loadConfig(lookup func(string) (string, bool)) (serverConfig, error) {
 	}
 	if publicPort == internalPort {
 		return serverConfig{}, fmt.Errorf("INTERNAL_PORT must differ from PORT")
+	}
+	if cfg.apiMode != "legacy" && cfg.apiMode != "v2" {
+		return serverConfig{}, fmt.Errorf("WAREHOUSE_API_MODE must be legacy or v2")
+	}
+	if cfg.apiMode == "v2" {
+		cfg.authJWKSURL = envValue(lookup, "AUTH_JWKS_URL", "")
+		cfg.authServiceKey = envValue(lookup, "AUTH_SERVICE_KEY", "")
+		cfg.allowPlainHTTP = envValue(lookup, "AUTH_ALLOW_PLAIN_HTTP", "false") == "true"
+		if cfg.maxRequestBytes > 1<<20 {
+			return serverConfig{}, fmt.Errorf("v2 MAX_REQUEST_BYTES must be at most 1048576")
+		}
+		cfg.callerKeys = map[string]string{"umir-auth": envValue(lookup, "AUTH_RUNTIME_SERVICE_KEY", ""), "umir-gateway": envValue(lookup, "GATEWAY_SERVICE_KEY", ""), "umir-serving": envValue(lookup, "SERVING_SERVICE_KEY", "")}
+		seen := make(map[string]bool)
+		for _, key := range cfg.callerKeys {
+			if key == "" || seen[key] {
+				return serverConfig{}, fmt.Errorf("v2 requires distinct caller transport keys")
+			}
+			seen[key] = true
+		}
+		address, err := url.Parse(cfg.authJWKSURL)
+		if err != nil || address.Host == "" || address.User != nil || address.Path != "/internal/auth/v1/jwks" || address.RawQuery != "" || address.Fragment != "" || (address.Scheme != "https" && (!cfg.allowPlainHTTP || address.Scheme != "http")) || cfg.authServiceKey == "" {
+			return serverConfig{}, fmt.Errorf("v2 requires authenticated Auth JWKS with HTTPS or explicit isolated-network HTTP")
+		}
 	}
 	return cfg, nil
 }

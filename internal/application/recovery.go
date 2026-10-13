@@ -15,13 +15,13 @@ func (o *Owner) syncProjectionLocked(ctx context.Context) error {
 		_, _, err := o.resolvePendingLocked(ctx)
 		if err != nil {
 			if errors.Is(err, domain.ErrConcurrentModification) {
-				return o.recoverLocked(ctx)
+				return o.recoverCurrentLocked(ctx)
 			}
 			return err
 		}
 	}
 	if !o.usable {
-		return o.recoverLocked(ctx)
+		return o.recoverCurrentLocked(ctx)
 	}
 	version, err := o.events.Version(ctx)
 	if err != nil {
@@ -30,7 +30,7 @@ func (o *Owner) syncProjectionLocked(ctx context.Context) error {
 	}
 	if version < o.state.StateVersion {
 		o.usable = false
-		return o.recoverLocked(ctx)
+		return o.recoverCurrentLocked(ctx)
 	}
 	if version == o.state.StateVersion {
 		return nil
@@ -46,15 +46,28 @@ func (o *Owner) syncProjectionLocked(ctx context.Context) error {
 		state, index, err = applyProjectionBatch(state, index, batch)
 		if err != nil {
 			o.usable = false
-			return o.recoverLocked(ctx)
+			return o.recoverCurrentLocked(ctx)
 		}
 	}
 	if state.StateVersion != version {
 		o.usable = false
-		return o.recoverLocked(ctx)
+		return o.recoverCurrentLocked(ctx)
 	}
 	o.publishProjection(state, index)
 	return nil
+}
+
+func (o *Owner) recoverCurrentLocked(ctx context.Context) error {
+	for range 3 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := o.recoverLocked(ctx)
+		if !errors.Is(err, domain.ErrConcurrentModification) {
+			return err
+		}
+	}
+	return domain.ErrConcurrentModification
 }
 
 func (o *Owner) recoverLocked(ctx context.Context) error {
@@ -68,8 +81,18 @@ func (o *Owner) recoverLocked(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := validateJournal(batches, version); err != nil {
+	prefixVersion := int64(0)
+	if len(batches) > 0 {
+		prefixVersion = batches[len(batches)-1].FinalSequence
+	}
+	if err := validateJournalContext(ctx, batches, prefixVersion); err != nil {
 		return err
+	}
+	if version < prefixVersion {
+		return domain.ErrInvalidRecordedBatch
+	}
+	if version > prefixVersion {
+		return domain.ErrConcurrentModification
 	}
 	var candidate domain.Snapshot
 	hasCandidate := false
@@ -123,7 +146,7 @@ func (o *Owner) publishProjection(state domain.InventoryState, index map[string]
 	o.offerSnapshotLocked()
 }
 
-func validateJournal(batches []domain.RecordedBatch, version int64) error {
+func validateJournalContext(ctx context.Context, batches []domain.RecordedBatch, version int64) error {
 	if version < 0 {
 		return domain.ErrInvalidRecordedBatch
 	}
@@ -131,6 +154,9 @@ func validateJournal(batches []domain.RecordedBatch, version int64) error {
 	commands := make(map[string]struct{}, len(batches))
 	eventIDs := make(map[string]struct{})
 	for _, batch := range batches {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if len(batch.Events) == 0 || batch.CommandID == "" || batch.CommandType == "" || batch.CommandFingerprint == "" || batch.FinalSequence != batch.Events[len(batch.Events)-1].Sequence {
 			return domain.ErrInvalidRecordedBatch
 		}
@@ -142,6 +168,9 @@ func validateJournal(batches []domain.RecordedBatch, version int64) error {
 			return domain.ErrInvalidRecordedBatch
 		}
 		for _, event := range batch.Events {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if event.EventID == "" {
 				return domain.ErrInvalidRecordedBatch
 			}
@@ -174,7 +203,7 @@ func expirationIndex(state domain.InventoryState) (map[string]time.Time, error) 
 		if batchID == "" || batch.BatchID != batchID || batch.RemainingQuantity < 0 {
 			return nil, domain.ErrInvalidRecordedBatch
 		}
-		if batch.RemainingQuantity > 0 {
+		if batch.RemainingQuantity > 0 && !batch.PendingWriteoff {
 			index[batchID] = batch.ExpiresAt
 		}
 	}
@@ -191,7 +220,7 @@ func applyProjectionBatch(state domain.InventoryState, index map[string]time.Tim
 		switch event.Type {
 		case domain.EventDeliveryReceived:
 			for _, registered := range event.Payload.Batches {
-				if batch, exists := next.Batches[registered.BatchID]; exists && batch.RemainingQuantity > 0 {
+				if batch, exists := next.Batches[registered.BatchID]; exists && batch.RemainingQuantity > 0 && !batch.PendingWriteoff {
 					updated[registered.BatchID] = batch.ExpiresAt
 				} else {
 					delete(updated, registered.BatchID)
@@ -199,12 +228,16 @@ func applyProjectionBatch(state domain.InventoryState, index map[string]time.Tim
 			}
 		case domain.EventOrderPlaced:
 			for _, allocation := range event.Payload.Order.Allocations {
-				if batch, exists := next.Batches[allocation.BatchID]; exists && batch.RemainingQuantity > 0 {
+				if batch, exists := next.Batches[allocation.BatchID]; exists && batch.RemainingQuantity > 0 && !batch.PendingWriteoff {
 					updated[allocation.BatchID] = batch.ExpiresAt
 				} else {
 					delete(updated, allocation.BatchID)
 				}
 			}
+		case domain.EventBatchExpiryPending:
+			delete(updated, event.Payload.Pending.BatchID)
+		case domain.EventBatchWriteoffConfirmed:
+			delete(updated, event.Payload.Writeoff.BatchID)
 		case domain.EventBatchExpired:
 			delete(updated, event.Payload.Expiry.BatchID)
 		}
