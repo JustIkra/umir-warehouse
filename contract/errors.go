@@ -15,3 +15,9 @@ var ErrConcurrentModification = errors.New("concurrent modification")
 var ErrUnknownWriteOutcome = errors.New("unknown write outcome")
 var ErrNotDue = errors.New("batch is not due")
 var ErrUnsupportedSchema = errors.New("unsupported schema")
+
+var (
+	ErrAlreadyWrittenOff  = errors.New("batch already written off")
+	ErrNotPendingWriteoff = errors.New("batch is not pending writeoff")
+	ErrBatchNotFound      = errors.New("batch not found")
+)

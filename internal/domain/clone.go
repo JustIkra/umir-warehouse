@@ -38,6 +38,14 @@ func CloneEvent(value Event) Event {
 		order := CloneOrder(*value.Payload.Order)
 		value.Payload.Order = &order
 	}
+	if value.Payload.Pending != nil {
+		v := *value.Payload.Pending
+		value.Payload.Pending = &v
+	}
+	if value.Payload.Writeoff != nil {
+		v := *value.Payload.Writeoff
+		value.Payload.Writeoff = &v
+	}
 	if value.Payload.Expiry != nil {
 		expiry := CloneExpiryResult(*value.Payload.Expiry)
 		value.Payload.Expiry = &expiry
@@ -57,11 +65,20 @@ func CloneCommandResult(value CommandResult) CommandResult {
 	if value.Delivery != nil {
 		receipt := *value.Delivery
 		receipt.BatchIDs = append([]string(nil), receipt.BatchIDs...)
+		receipt.Batches = append([]Batch(nil), receipt.Batches...)
 		value.Delivery = &receipt
 	}
 	if value.Order != nil {
 		order := CloneOrder(*value.Order)
 		value.Order = &order
+	}
+	if value.Pending != nil {
+		v := *value.Pending
+		value.Pending = &v
+	}
+	if value.Writeoff != nil {
+		v := *value.Writeoff
+		value.Writeoff = &v
 	}
 	if value.Expiry != nil {
 		expiry := CloneExpiryResult(*value.Expiry)

@@ -57,23 +57,12 @@ func runMain() error {
 	if err != nil {
 		return err
 	}
-	runtime, err := bootstrap.NewInMemory(bootstrap.Options{
-		Now:               time.Now,
-		NewID:             rand.Text,
-		EventsPerSnapshot: cfg.eventsPerSnapshot,
-	})
+	backend, err := buildBackend(cfg)
 	if err != nil {
-		return fmt.Errorf("create in-memory runtime: %w", err)
+		return fmt.Errorf("create backend: %w", err)
 	}
-	if err := runtime.Recover(context.Background()); err != nil {
-		return fmt.Errorf("recover in-memory runtime: %w", err)
-	}
-	publicHandler, internalHandler, err := bootstrap.NewHTTPHandlers(runtime, bootstrap.HTTPOptions{RequestTimeout: cfg.requestTimeout, MaxRequestBytes: cfg.maxRequestBytes})
-	if err != nil {
-		return fmt.Errorf("create HTTP handlers: %w", err)
-	}
-	publicServer := newHTTPServer(cfg.port, publicHandler, cfg.requestTimeout)
-	internalServer := newHTTPServer(cfg.internalPort, internalHandler, cfg.requestTimeout)
+	publicServer := newHTTPServer(cfg.port, backend.public, cfg.requestTimeout)
+	internalServer := newHTTPServer(cfg.internalPort, backend.internal, cfg.requestTimeout)
 	servers := []*http.Server{publicServer, internalServer}
 	shutdown := func(ctx context.Context) error {
 		var shutdownErr error
@@ -91,7 +80,7 @@ func runMain() error {
 	defer stop()
 	log.Printf("umir-warehouse public listener on %s; internal listener on %s", publicServer.Addr, internalServer.Addr)
 	return runService(signals, cfg, lifecycleDependencies{
-		runSnapshotWorker: runtime.RunSnapshotWorker,
+		runSnapshotWorker: backend.snapshots,
 		waitSnapshotRetry: waitForSnapshotRetry,
 		serve:             func() error { return serveListeners(publicServer, internalServer) },
 		shutdown:          shutdown,
@@ -119,4 +108,54 @@ func serveListeners(publicServer, internalServer *http.Server) error {
 	}
 	second := <-results
 	return errors.Join(first, second)
+}
+
+type backendHandlers struct {
+	public, internal http.Handler
+	snapshots        func(context.Context) error
+}
+
+func buildBackend(cfg serverConfig) (backendHandlers, error) {
+	options := bootstrap.Options{Now: time.Now, NewID: rand.Text, EventsPerSnapshot: cfg.eventsPerSnapshot}
+	if cfg.apiMode == "legacy" {
+		runtime, err := bootstrap.NewInMemory(options)
+		if err != nil {
+			return backendHandlers{}, err
+		}
+		if err := runtime.Recover(context.Background()); err != nil {
+			return backendHandlers{}, err
+		}
+		public, internal, err := bootstrap.NewHTTPHandlers(runtime, bootstrap.HTTPOptions{RequestTimeout: cfg.requestTimeout, MaxRequestBytes: cfg.maxRequestBytes})
+		return backendHandlers{public, internal, runtime.RunSnapshotWorker}, err
+	}
+	id, err := newEpoch()
+	if err != nil {
+		return backendHandlers{}, err
+	}
+	registry, err := bootstrap.NewRegistry(options, id)
+	if err != nil {
+		return backendHandlers{}, err
+	}
+	keys, err := bootstrap.NewAuthSigningKeys(bootstrap.AuthKeyOptions{URL: cfg.authJWKSURL, ServiceKey: cfg.authServiceKey, Now: time.Now, HTTP: &http.Client{Timeout: cfg.requestTimeout, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}, AllowPlainHTTP: cfg.allowPlainHTTP})
+	if err != nil {
+		return backendHandlers{}, err
+	}
+	verifier, err := bootstrap.NewJWTVerifier(bootstrap.JWTOptions{Now: time.Now, Keys: keys})
+	if err != nil {
+		return backendHandlers{}, err
+	}
+	internal, err := bootstrap.NewScopedHTTPHandler(registry, bootstrap.ScopedHTTPOptions{RequestTimeout: cfg.requestTimeout, MaxRequestBytes: cfg.maxRequestBytes, Verifier: verifier, CallerKeys: cfg.callerKeys})
+	if err != nil {
+		return backendHandlers{}, err
+	}
+	return backendHandlers{bootstrap.NewHealthOnlyHandler(), internal, registry.RunSnapshotWorker}, nil
+}
+func newEpoch() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	id[6] = (id[6] & 15) | 64
+	id[8] = (id[8] & 63) | 128
+	return fmt.Sprintf("%x-%x-%x-%x-%x", id[:4], id[4:6], id[6:8], id[8:10], id[10:]), nil
 }

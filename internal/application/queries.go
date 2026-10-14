@@ -11,45 +11,11 @@ import (
 )
 
 func (o *Owner) GetInventory(ctx context.Context) (contract.InventoryView, error) {
-	prepared, err := o.Prepare(ctx)
+	prepared, err := o.PrepareStock(ctx)
 	if err != nil {
 		return contract.InventoryView{}, err
 	}
-	productIDs := make([]string, 0, len(prepared.State.Products))
-	for productID := range prepared.State.Products {
-		productIDs = append(productIDs, productID)
-	}
-	sort.Strings(productIDs)
-	view := contract.InventoryView{EvaluatedAt: prepared.EvaluatedAt, StateVersion: prepared.StateVersion, Products: make([]contract.ProductInventory, 0, len(productIDs))}
-	for _, productID := range productIDs {
-		product := prepared.State.Products[productID]
-		batches := make([]domain.Batch, 0)
-		for _, batch := range prepared.State.Batches {
-			if batch.ProductID == productID && batch.RemainingQuantity > 0 {
-				batches = append(batches, batch)
-			}
-		}
-		sort.Slice(batches, func(i, j int) bool {
-			if !batches[i].ExpiresAt.Equal(batches[j].ExpiresAt) {
-				return batches[i].ExpiresAt.Before(batches[j].ExpiresAt)
-			}
-			if !batches[i].ReceivedAt.Equal(batches[j].ReceivedAt) {
-				return batches[i].ReceivedAt.Before(batches[j].ReceivedAt)
-			}
-			return batches[i].BatchID < batches[j].BatchID
-		})
-		item := contract.ProductInventory{ProductID: productID, BaseUnit: contract.BaseUnit(product.BaseUnit), Batches: make([]contract.Batch, 0, len(batches))}
-		for _, batch := range batches {
-			total, err := domain.AddQuantity(domain.Quantity(item.Quantity), batch.RemainingQuantity)
-			if err != nil {
-				return contract.InventoryView{}, inventoryUnavailable(err)
-			}
-			item.Quantity = contract.Quantity(total)
-			item.Batches = append(item.Batches, toContractBatch(batch))
-		}
-		view.Products = append(view.Products, item)
-	}
-	return view, nil
+	return CalculateStock(ctx, prepared)
 }
 
 func (o *Owner) GetExpiringBatches(ctx context.Context, cutoffAt time.Time) (contract.ExpiringBatches, error) {
@@ -65,7 +31,7 @@ func (o *Owner) GetExpiringBatches(ctx context.Context, cutoffAt time.Time) (con
 	}
 	items := make([]contract.ExpiringBatch, 0)
 	for _, batch := range prepared.State.Batches {
-		if batch.RemainingQuantity <= 0 || batch.ExpiresAt.After(cutoffAt) {
+		if batch.RemainingQuantity <= 0 || batch.PendingWriteoff || batch.ExpiresAt.After(cutoffAt) {
 			continue
 		}
 		product := prepared.State.Products[batch.ProductID]
@@ -123,6 +89,8 @@ func remainingSeconds(expiresAt, evaluatedAt time.Time) int64 {
 
 func toContractBatch(value domain.Batch) contract.Batch {
 	return contract.Batch{
+		AppliedTimeZone: value.AppliedTimeZone, AppliedSettingsVersion: value.AppliedSettingsVersion, TZDataVersion: value.TZDataVersion,
+		PendingWriteoff:   value.PendingWriteoff,
 		BatchID:           value.BatchID,
 		DeliveryID:        value.DeliveryID,
 		LineNo:            value.LineNo,
@@ -180,5 +148,15 @@ func toContractEvent(value domain.Event) contract.Event {
 		expiry := contract.ExpiryResult{BatchID: value.Payload.Expiry.BatchID, ProductID: value.Payload.Expiry.ProductID, WrittenOffQuantity: contract.Quantity(value.Payload.Expiry.WrittenOffQuantity), Reason: value.Payload.Expiry.Reason, ExpiresAt: value.Payload.Expiry.ExpiresAt, ProcessedAt: value.Payload.Expiry.ProcessedAt}
 		result.Payload.Expiry = &expiry
 	}
+	if value.Payload.Pending != nil {
+		v := value.Payload.Pending
+		result.Payload.Pending = &contract.PendingResult{BatchID: v.BatchID, ProductID: v.ProductID, RemainingQuantity: contract.Quantity(v.RemainingQuantity), BaseUnit: contract.BaseUnit(v.BaseUnit), ExpiresAt: v.ExpiresAt}
+	}
+	if value.Payload.Writeoff != nil {
+		v := toContractWriteoff(*value.Payload.Writeoff)
+		result.Payload.Writeoff = &v
+	}
+	result.TenantID = value.TenantID
+	result.RuntimeEpoch = value.RuntimeEpoch
 	return result
 }

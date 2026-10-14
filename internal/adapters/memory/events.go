@@ -76,7 +76,7 @@ func (s *EventStore) AppendBatch(ctx context.Context, batch domain.CommandBatch)
 		event := domain.CloneEvent(source)
 		event.StreamID = domain.InventoryStreamID
 		event.Sequence = s.version + int64(i) + 1
-		event.SchemaVersion = domain.InventorySchemaV1
+		event.SchemaVersion = domain.EventSchemaVersion(event)
 		event.CommandID = batch.CommandID
 		event.CommandFingerprint = batch.CommandFingerprint
 		event.RecordedAt = event.RecordedAt.Round(0)
@@ -190,7 +190,8 @@ func validateCommandBatch(batch domain.CommandBatch) error {
 		if event.EventID == "" || event.RecordedAt.IsZero() {
 			return domain.ErrInvalidEventBatch
 		}
-		if event.SchemaVersion != 0 && event.SchemaVersion != domain.InventorySchemaV1 {
+		expectedSchema := domain.EventSchemaVersion(event)
+		if event.SchemaVersion != 0 && event.SchemaVersion != expectedSchema {
 			return domain.ErrUnsupportedSchema
 		}
 		if event.StreamID != "" && event.StreamID != domain.InventoryStreamID || event.Sequence < 0 || event.CommandID != "" && event.CommandID != batch.CommandID || event.CommandFingerprint != "" && event.CommandFingerprint != batch.CommandFingerprint {

@@ -6,6 +6,8 @@ allow:
   ignoreNotFoundComponents: true
 excludeFiles:
   - "^.*_test\\.go$"
+vendors:
+  unicode-text: {in: [golang.org/x/text/cases, golang.org/x/text/unicode/norm]}
 components:
   domain: {in: "internal/domain/**"}
   contract: {in: "contract/**"}
@@ -24,6 +26,7 @@ deps:
   contract:
     mayDependOn: [contract]
   application:
+    canUse: [unicode-text]
     mayDependOn: [application, domain, contract]
   adapters:
     mayDependOn: [adapters, application, domain, contract]

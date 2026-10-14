@@ -16,6 +16,12 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 	if request.CommandID == "" || isReservedCommandID(request.CommandID) {
 		return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
 	}
+	if request.Scope.RestaurantID == "" {
+		request.Scope = o.scope
+	}
+	if request.Scope.RestaurantID != "" && (request.Scope.Validate() != nil || request.Scope.OrganizationID != o.scope.OrganizationID || request.Scope.RestaurantID != o.scope.RestaurantID || request.Scope.RuntimeEpoch != o.scope.RuntimeEpoch || request.Scope.LifecycleVersion != o.scope.LifecycleVersion) {
+		return contract.DeliveryReceipt{}, contract.ErrForbidden
+	}
 	fingerprint := fingerprintDelivery(request)
 	for {
 		record, found, err := o.findCommand(ctx, request.CommandID, "ReceiveDelivery", fingerprint)
@@ -24,6 +30,22 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 		}
 		if found {
 			return recordedDelivery(record, fingerprint)
+		}
+		if request.TimeInputs != nil {
+			if request.Scope.Validate() != nil || request.Scope.OrganizationID != o.scope.OrganizationID || request.Scope.RestaurantID != o.scope.RestaurantID || request.Scope.RuntimeEpoch != o.scope.RuntimeEpoch || request.Scope.LifecycleVersion != o.scope.LifecycleVersion {
+				return contract.DeliveryReceipt{}, contract.ErrForbidden
+			}
+			if request.ExpectedSettingsVersion != request.Scope.SettingsVersion {
+				return contract.DeliveryReceipt{}, contract.ErrSettingsChanged
+			}
+			if o.tzdataVersion == "" {
+				return contract.DeliveryReceipt{}, contract.ErrTimeZoneDataUnavailable
+			}
+			resolved, err := resolveDeliveryTimes(ctx, request, o.loadZone)
+			if err != nil {
+				return contract.DeliveryReceipt{}, err
+			}
+			request = resolved
 		}
 		if request.DeliveryID == "" {
 			return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
@@ -41,7 +63,7 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 		if request.CreatedAt.After(validationTime) {
 			return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
 		}
-		if _, _, err := validateDelivery(o.state, request, validationTime); err != nil {
+		if _, _, err := validateDelivery(o.state, request, validationTime, o.loadZone); err != nil {
 			return contract.DeliveryReceipt{}, err
 		}
 		prepared, _, err := o.prepareLocked(ctx)
@@ -58,7 +80,7 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 		if request.CreatedAt.After(now) {
 			return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
 		}
-		delivery, batches, err := validateDelivery(prepared.State, request, now)
+		delivery, batches, err := validateDelivery(prepared.State, request, now, o.loadZone)
 		if err != nil {
 			return contract.DeliveryReceipt{}, err
 		}
@@ -76,6 +98,14 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 			}
 			batchIDs[batchID] = struct{}{}
 			batches[index].BatchID = batchID
+			if o.scope.RestaurantID != "" {
+				batches[index].AppliedTimeZone = request.Scope.TimeZone
+				batches[index].AppliedSettingsVersion = request.Scope.SettingsVersion
+				batches[index].TZDataVersion = o.tzdataVersion
+				if batches[index].TZDataVersion == "" {
+					batches[index].TZDataVersion = "unknown"
+				}
+			}
 		}
 		eventID := o.newID()
 		if eventID == "" {
@@ -83,6 +113,11 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 		}
 		seenEventIDs := map[string]struct{}{eventID: {}}
 		deliveryEvent := domain.Event{EventID: eventID, RecordedAt: now, Type: domain.EventDeliveryReceived, Payload: domain.EventPayload{Delivery: &delivery, Batches: batches}}
+		if o.scope.RestaurantID != "" {
+			deliveryEvent.TenantID = o.scope.RestaurantID
+			deliveryEvent.RuntimeEpoch = o.scope.RuntimeEpoch
+			deliveryEvent.SchemaVersion = domain.InventorySchemaV2
+		}
 		temporary, err := deliveryProjection(prepared.State, request.CommandID, fingerprint, deliveryEvent)
 		if err != nil {
 			return contract.DeliveryReceipt{}, err
@@ -110,7 +145,12 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 			}
 			seenEventIDs[expiryEventID] = struct{}{}
 			expiry := domain.ExpiryResult{BatchID: batch.BatchID, ProductID: batch.ProductID, WrittenOffQuantity: batch.RemainingQuantity, Reason: domain.ExpiryReasonExpiration, ExpiresAt: batch.ExpiresAt, ProcessedAt: now}
-			events = append(events, domain.Event{EventID: expiryEventID, RecordedAt: now, Type: domain.EventBatchExpired, Payload: domain.EventPayload{Expiry: &expiry}})
+			if o.scope.RestaurantID != "" {
+				p := pendingResult(batch, prepared.State.Products[batch.ProductID])
+				events = append(events, domain.Event{EventID: expiryEventID, TenantID: o.scope.RestaurantID, RuntimeEpoch: o.scope.RuntimeEpoch, SchemaVersion: domain.InventorySchemaV2, RecordedAt: now, Type: domain.EventBatchExpiryPending, Payload: domain.EventPayload{Pending: &p}})
+			} else {
+				events = append(events, domain.Event{EventID: expiryEventID, RecordedAt: now, Type: domain.EventBatchExpired, Payload: domain.EventPayload{Expiry: &expiry}})
+			}
 		}
 		command := domain.CommandBatch{ExpectedVersion: prepared.StateVersion, CommandID: request.CommandID, CommandType: "ReceiveDelivery", CommandFingerprint: fingerprint, Events: events}
 		candidate, err := domain.ApplyRecordedBatch(prepared.State, asRecordedBatch(command))
@@ -134,8 +174,12 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 	}
 }
 
-func validateDelivery(state domain.InventoryState, request contract.ReceiveDeliveryRequest, now time.Time) (domain.Delivery, []domain.Batch, error) {
+func validateDelivery(state domain.InventoryState, request contract.ReceiveDeliveryRequest, now time.Time, loadZone func(string) (*time.Location, error)) (domain.Delivery, []domain.Batch, error) {
 	delivery := domain.Delivery{DeliveryID: request.DeliveryID, Number: request.Number, CreatedAt: domain.CanonicalBusinessTime(request.CreatedAt), Lines: make([]domain.DeliveryLine, len(request.Lines))}
+	if request.Scope.RestaurantID != "" {
+		delivery.OrganizationID = request.Scope.OrganizationID
+		delivery.LifecycleVersion = request.Scope.LifecycleVersion
+	}
 	batches := make([]domain.Batch, len(request.Lines))
 	for index, input := range request.Lines {
 		if input.ProductID == "" || input.Quantity <= 0 || input.ShelfLife.Value <= 0 || input.ShelfLife.Unit != contract.ShelfLifeDay && input.ShelfLife.Unit != contract.ShelfLifeMonth {
@@ -155,6 +199,13 @@ func validateDelivery(state domain.InventoryState, request contract.ReceiveDeliv
 		}
 		life := domain.ShelfLife{Value: input.ShelfLife.Value, Unit: domain.ShelfLifeUnit(input.ShelfLife.Unit)}
 		expiresAt, err := domain.CalculateExpiresAt(manufacturedAt, life)
+		if request.Scope.RestaurantID != "" {
+			zone, zoneErr := loadZone(request.Scope.TimeZone)
+			if zoneErr != nil {
+				return domain.Delivery{}, nil, calendarError(zoneErr)
+			}
+			expiresAt, err = domain.CalculateExpiresAtInZone(manufacturedAt, life, zone)
+		}
 		if err != nil {
 			return domain.Delivery{}, nil, contract.ErrInvalidArgument
 		}
@@ -180,7 +231,7 @@ func asRecordedBatch(command domain.CommandBatch) domain.RecordedBatch {
 		event := domain.CloneEvent(source)
 		event.StreamID = domain.InventoryStreamID
 		event.Sequence = command.ExpectedVersion + int64(index) + 1
-		event.SchemaVersion = domain.InventorySchemaV1
+		event.SchemaVersion = domain.EventSchemaVersion(event)
 		event.CommandID = command.CommandID
 		event.CommandFingerprint = command.CommandFingerprint
 		events[index] = event
@@ -195,7 +246,16 @@ func recordedDelivery(record domain.CommandRecord, fingerprint string) (contract
 	if record.Result.Kind != domain.CommandResultDeliveryReceived || record.Result.Delivery == nil || record.Result.Delivery.DeliveryID == "" || len(record.Result.Delivery.BatchIDs) == 0 {
 		return contract.DeliveryReceipt{}, domain.ErrInvalidRecordedBatch
 	}
-	return contract.DeliveryReceipt{DeliveryID: record.Result.Delivery.DeliveryID, BatchIDs: append([]string(nil), record.Result.Delivery.BatchIDs...)}, nil
+	value := record.Result.Delivery
+	result := contract.DeliveryReceipt{DeliveryID: value.DeliveryID, BatchIDs: append([]string(nil), value.BatchIDs...), EvaluatedAt: value.EvaluatedAt, StateVersion: value.StateVersion}
+	for _, b := range value.Batches {
+		result.Batches = append(result.Batches, toContractBatch(b))
+	}
+	if len(result.Batches) > 0 {
+		b := result.Batches[0]
+		result.Scope = contract.Scope{OrganizationID: value.OrganizationID, RestaurantID: value.RestaurantID, RuntimeEpoch: value.RuntimeEpoch, LifecycleVersion: value.LifecycleVersion, TimeZone: b.AppliedTimeZone, SettingsVersion: b.AppliedSettingsVersion}
+	}
+	return result, nil
 }
 
 func businessTime(value time.Time) bool {
@@ -207,6 +267,22 @@ func businessTime(value time.Time) bool {
 }
 
 func fingerprintDelivery(request contract.ReceiveDeliveryRequest) string {
+	if request.TimeInputs != nil {
+		type line struct {
+			ProductID string
+			ShelfLife contract.ShelfLife
+			Quantity  contract.Quantity
+		}
+		lines := make([]line, len(request.Lines))
+		for i, v := range request.Lines {
+			lines[i] = line{v.ProductID, v.ShelfLife, v.Quantity}
+		}
+		return fingerprintJSON("ReceiveDeliveryV2", struct {
+			DeliveryID, Number, ExpectedSettingsVersion string
+			Times                                       contract.DeliveryTimeInputs
+			Lines                                       []line
+		}{request.DeliveryID, request.Number, request.ExpectedSettingsVersion, *request.TimeInputs, lines})
+	}
 	type lineInput struct {
 		ProductID      string
 		ManufacturedAt string

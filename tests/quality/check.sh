@@ -80,12 +80,23 @@ printf 'package testsupport\n\nconst Value = 1\n' > "$fixture/tests/testsupport/
 printf 'package main\n\nimport "%s/tests/testsupport"\n\nfunc main() { _ = testsupport.Value }\n' "$module" > "$fixture/cmd/server/main.go"
 reject lint 'depguard'
 reject arch 'testsupport'
+printf 'package main\n\nfunc main() {}\n' > "$fixture/cmd/server/main.go"
+mkdir -p "$fixture/tests/fixtures/server"
+printf 'package main\n\nimport "%s/tests/testsupport"\n\nfunc main() { _ = testsupport.Value }\n' "$module" > "$fixture/tests/fixtures/server/main.go"
+run fmt-all > "$scratch/fixture-format" 2>&1
+run lint > "$scratch/fixture-positive" 2>&1 || { cat "$scratch/fixture-positive"; exit 1; }
+passed=$((passed + 1))
+printf 'package main\n\nfunc main() {}\n' > "$fixture/tests/fixtures/server/main.go"
 cp "$fixture/go.mod" "$scratch/go.mod"
 printf 'package service\n\nconst Value = 1\n' > "$fixture/service.go"
 for service in umir-serving umir-gateway umir-factory; do
   sed "s#^module .*#module github.com/JustIkra/$service#" "$scratch/go.mod" > "$fixture/go.mod"
   printf 'package main\n\nimport service "github.com/JustIkra/%s"\n\nfunc main() { _ = service.Value }\n' "$service" > "$fixture/cmd/server/main.go"
   reject lint 'depguard'
+  printf 'package main\n\nfunc main() {}\n' > "$fixture/cmd/server/main.go"
+  printf 'package main\n\nimport service "github.com/JustIkra/%s"\n\nfunc main() { _ = service.Value }\n' "$service" > "$fixture/tests/fixtures/server/main.go"
+  reject lint 'depguard'
+  printf 'package main\n\nfunc main() {}\n' > "$fixture/tests/fixtures/server/main.go"
 done
 mv "$scratch/go.mod" "$fixture/go.mod"
 rm "$fixture/service.go"

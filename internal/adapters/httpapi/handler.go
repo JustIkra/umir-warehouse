@@ -14,6 +14,7 @@ import (
 )
 
 type Runtime interface {
+	SuggestID(context.Context, contract.CatalogKind) (contract.IDSuggestion, error)
 	RunExpirations(context.Context) (contract.ExpirationRun, error)
 	RegisterProduct(context.Context, contract.RegisterProductRequest) (contract.Product, error)
 	DefineDish(context.Context, contract.DefineDishRequest) (contract.Dish, error)

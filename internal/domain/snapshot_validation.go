@@ -90,7 +90,7 @@ func equalInventoryState(a, b InventoryState) bool {
 }
 
 func equalDelivery(a, b Delivery) bool {
-	if a.DeliveryID != b.DeliveryID || a.Number != b.Number || !a.CreatedAt.Equal(b.CreatedAt) || len(a.Lines) != len(b.Lines) {
+	if a.OrganizationID != b.OrganizationID || a.LifecycleVersion != b.LifecycleVersion || a.DeliveryID != b.DeliveryID || a.Number != b.Number || !a.CreatedAt.Equal(b.CreatedAt) || len(a.Lines) != len(b.Lines) {
 		return false
 	}
 	for i := range a.Lines {
@@ -103,25 +103,36 @@ func equalDelivery(a, b Delivery) bool {
 }
 
 func equalBatch(a, b Batch) bool {
-	return a.BatchID == b.BatchID && a.DeliveryID == b.DeliveryID && a.LineNo == b.LineNo && a.ProductID == b.ProductID && a.ManufacturedAt.Equal(b.ManufacturedAt) && a.ShelfLife == b.ShelfLife && a.ReceivedAt.Equal(b.ReceivedAt) && a.ExpiresAt.Equal(b.ExpiresAt) && a.ReceivedQuantity == b.ReceivedQuantity && a.RemainingQuantity == b.RemainingQuantity && a.ConsumedByOrders == b.ConsumedByOrders && a.WrittenOffForExpiry == b.WrittenOffForExpiry
+	return a.BatchID == b.BatchID && a.DeliveryID == b.DeliveryID && a.LineNo == b.LineNo && a.ProductID == b.ProductID && a.ManufacturedAt.Equal(b.ManufacturedAt) && a.ShelfLife == b.ShelfLife && a.ReceivedAt.Equal(b.ReceivedAt) && a.ExpiresAt.Equal(b.ExpiresAt) && a.ReceivedQuantity == b.ReceivedQuantity && a.RemainingQuantity == b.RemainingQuantity && a.ConsumedByOrders == b.ConsumedByOrders && a.WrittenOffForExpiry == b.WrittenOffForExpiry && a.PendingWriteoff == b.PendingWriteoff && a.AppliedTimeZone == b.AppliedTimeZone && a.AppliedSettingsVersion == b.AppliedSettingsVersion && a.TZDataVersion == b.TZDataVersion
 }
 
 func equalCommandResult(a, b CommandResult) bool {
-	if a.Kind != b.Kind || (a.Product == nil) != (b.Product == nil) || (a.Dish == nil) != (b.Dish == nil) || (a.Delivery == nil) != (b.Delivery == nil) || (a.Order == nil) != (b.Order == nil) || (a.Expiry == nil) != (b.Expiry == nil) {
+	if a.Kind != b.Kind || (a.Product == nil) != (b.Product == nil) || (a.Dish == nil) != (b.Dish == nil) || (a.Delivery == nil) != (b.Delivery == nil) || (a.Order == nil) != (b.Order == nil) || (a.Expiry == nil) != (b.Expiry == nil) || (a.Pending == nil) != (b.Pending == nil) || (a.Writeoff == nil) != (b.Writeoff == nil) {
 		return false
 	}
 	if a.Product != nil && !equalProduct(*a.Product, *b.Product) || a.Dish != nil && !equalDish(*a.Dish, *b.Dish) || a.Order != nil && !equalOrder(*a.Order, *b.Order) {
 		return false
 	}
 	if a.Delivery != nil {
-		if a.Delivery.DeliveryID != b.Delivery.DeliveryID || len(a.Delivery.BatchIDs) != len(b.Delivery.BatchIDs) {
+		if a.Delivery.OrganizationID != b.Delivery.OrganizationID || a.Delivery.RestaurantID != b.Delivery.RestaurantID || a.Delivery.RuntimeEpoch != b.Delivery.RuntimeEpoch || a.Delivery.LifecycleVersion != b.Delivery.LifecycleVersion || !a.Delivery.EvaluatedAt.Equal(b.Delivery.EvaluatedAt) || a.Delivery.StateVersion != b.Delivery.StateVersion || len(a.Delivery.Batches) != len(b.Delivery.Batches) || a.Delivery.DeliveryID != b.Delivery.DeliveryID || len(a.Delivery.BatchIDs) != len(b.Delivery.BatchIDs) {
 			return false
+		}
+		for i := range a.Delivery.Batches {
+			if !equalBatch(a.Delivery.Batches[i], b.Delivery.Batches[i]) {
+				return false
+			}
 		}
 		for i := range a.Delivery.BatchIDs {
 			if a.Delivery.BatchIDs[i] != b.Delivery.BatchIDs[i] {
 				return false
 			}
 		}
+	}
+	if a.Pending != nil && *a.Pending != *b.Pending {
+		return false
+	}
+	if a.Writeoff != nil && *a.Writeoff != *b.Writeoff {
+		return false
 	}
 	return a.Expiry == nil || equalExpiry(*a.Expiry, *b.Expiry)
 }
@@ -182,7 +193,7 @@ func validateDeliveriesAndBatches(state InventoryState) error {
 	}
 	counts := make(map[string]int, len(state.Deliveries))
 	for id, batch := range state.Batches {
-		if id == "" || id != batch.BatchID || batch.DeliveryID == "" || batch.ProductID == "" || batch.LineNo <= 0 || batch.ReceivedQuantity <= 0 || batch.ShelfLife.Value <= 0 || batch.ShelfLife.Unit != ShelfLifeDay && batch.ShelfLife.Unit != ShelfLifeMonth || !isBusinessTime(batch.ManufacturedAt) || !isBusinessTime(batch.ReceivedAt) || !isBusinessTime(batch.ExpiresAt) || !batch.ExpiresAt.After(batch.ManufacturedAt) || batch.WrittenOffForExpiry > 0 && batch.RemainingQuantity > 0 || !validBatchBalance(batch) {
+		if id == "" || id != batch.BatchID || batch.DeliveryID == "" || batch.ProductID == "" || batch.LineNo <= 0 || batch.ReceivedQuantity <= 0 || batch.ShelfLife.Value <= 0 || batch.ShelfLife.Unit != ShelfLifeDay && batch.ShelfLife.Unit != ShelfLifeMonth || !isBusinessTime(batch.ManufacturedAt) || !isBusinessTime(batch.ReceivedAt) || !isBusinessTime(batch.ExpiresAt) || !batch.ExpiresAt.After(batch.ManufacturedAt) || batch.PendingWriteoff && (batch.RemainingQuantity <= 0 || batch.WrittenOffForExpiry > 0) || batch.WrittenOffForExpiry > 0 && batch.RemainingQuantity > 0 || !validBatchBalance(batch) {
 			return ErrInvalidSnapshot
 		}
 		if _, exists := state.Products[batch.ProductID]; !exists {
@@ -282,6 +293,8 @@ func validateCommands(state InventoryState) error {
 	dishes := make(map[string]struct{}, len(state.Dishes))
 	deliveries := make(map[string]struct{}, len(state.Deliveries))
 	orders := make(map[string]struct{}, len(state.Orders))
+	pending := make(map[string]PendingResult)
+	confirmed := make(map[string]WriteoffResult)
 	expired := make(map[string]Quantity)
 	deliveryBatches := make(map[string]struct{}, len(state.Batches))
 	for id, record := range state.Commands {
@@ -289,7 +302,7 @@ func validateCommands(state InventoryState) error {
 			return ErrInvalidSnapshot
 		}
 		payloads := 0
-		for _, present := range []bool{record.Result.Product != nil, record.Result.Dish != nil, record.Result.Delivery != nil, record.Result.Order != nil, record.Result.Expiry != nil} {
+		for _, present := range []bool{record.Result.Product != nil, record.Result.Dish != nil, record.Result.Delivery != nil, record.Result.Order != nil, record.Result.Expiry != nil, record.Result.Pending != nil, record.Result.Writeoff != nil} {
 			if present {
 				payloads++
 			}
@@ -349,6 +362,32 @@ func validateCommands(state InventoryState) error {
 				return ErrInvalidSnapshot
 			}
 			orders[orderID] = struct{}{}
+		case CommandResultBatchExpiryPending:
+			if record.CommandType != "PrepareExpiry" || record.Result.Pending == nil {
+				return ErrInvalidSnapshot
+			}
+			p := *record.Result.Pending
+			b, ok := state.Batches[p.BatchID]
+			if !ok || p.ProductID != b.ProductID || p.RemainingQuantity <= 0 || p.BaseUnit != state.Products[b.ProductID].BaseUnit || !p.ExpiresAt.Equal(b.ExpiresAt) {
+				return ErrInvalidSnapshot
+			}
+			if _, ok := pending[p.BatchID]; ok {
+				return ErrInvalidSnapshot
+			}
+			pending[p.BatchID] = p
+		case CommandResultBatchWriteoffConfirmed:
+			if record.CommandType != "ConfirmWriteoff" || record.Result.Writeoff == nil {
+				return ErrInvalidSnapshot
+			}
+			w := *record.Result.Writeoff
+			b, ok := state.Batches[w.BatchID]
+			if !ok || w.ProductID != b.ProductID || w.WrittenOffQuantity <= 0 || w.BaseUnit != state.Products[b.ProductID].BaseUnit || w.ActorUserID == "" || w.EventID == "" || !isBusinessTime(w.ConfirmedAt) || w.ConfirmedAt.Before(b.ExpiresAt) || w.OrganizationID == "" || w.RestaurantID == "" || w.RuntimeEpoch == "" || w.TimeZone == "" || w.SettingsVersion == "" || w.StateVersion <= 0 || w.StateVersion > state.StateVersion {
+				return ErrInvalidSnapshot
+			}
+			if _, ok := confirmed[w.BatchID]; ok {
+				return ErrInvalidSnapshot
+			}
+			confirmed[w.BatchID] = w
 		case CommandResultBatchExpired:
 			if record.CommandType != "ExpireBatch" || record.Result.Expiry == nil {
 				return ErrInvalidSnapshot
@@ -394,6 +433,28 @@ func validateCommands(state InventoryState) error {
 		}
 	}
 	for id, batch := range state.Batches {
+		if w, ok := confirmed[id]; ok {
+			if batch.PendingWriteoff || batch.RemainingQuantity != 0 || batch.WrittenOffForExpiry != w.WrittenOffQuantity || expired[id] > 0 {
+				return ErrInvalidSnapshot
+			}
+			if p, ok := pending[id]; ok && p.RemainingQuantity != w.WrittenOffQuantity {
+				return ErrInvalidSnapshot
+			}
+			continue
+		}
+		if p, ok := pending[id]; ok {
+			if !batch.PendingWriteoff || batch.RemainingQuantity != p.RemainingQuantity {
+				return ErrInvalidSnapshot
+			}
+		}
+		if batch.PendingWriteoff {
+			if _, ok := pending[id]; !ok {
+				_, delivered := deliveryBatches[id]
+				if !delivered || batch.RemainingQuantity != batch.ReceivedQuantity || batch.ConsumedByOrders != 0 {
+					return ErrInvalidSnapshot
+				}
+			}
+		}
 		if expired[id] > 0 {
 			if expired[id] != batch.WrittenOffForExpiry {
 				return fmt.Errorf("%w: batch %q write-off does not match command results", ErrInvalidSnapshot, id)
