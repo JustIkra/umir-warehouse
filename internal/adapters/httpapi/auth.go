@@ -250,6 +250,9 @@ func operationPolicy(operation, caller string) (authorizationPolicy, bool) {
 	case "privateexpiringBatches":
 		p.capability = "stock.read"
 		p.operations = []string{"expiringBatches"}
+	case "privateProductBatches":
+		p.capability = "stock.read"
+		p.operations = []string{"productBatches"}
 	case "privatehistory":
 		p.capability = "stock.read"
 		p.operations = []string{"history"}

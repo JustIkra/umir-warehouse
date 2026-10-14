@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Add UA1 scoped product-batch pages with positive available/pending balances, owner FEFO ordering, atomic state/prefix capture and bounded actor-bound cursors. Preserve per-batch expiry/settings and human writeoff confirmation. Keep original C2 schemas and selected assembly unchanged.
+
 - Repair W6 scoped order commits, order-ID lookup, command-only retained attempts, bounded journal history and prepared expiring-batch dispatch against the frozen C2 contract. Add authenticated success, replay, isolation and schema regressions.
 - Separate failed JWKS retry timing from authoritative key/JWT time. Recover readiness at a fixed fixture instant without stale-key fallback; preserve immediate owner-time cache expiry refresh.
 

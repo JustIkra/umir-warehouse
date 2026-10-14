@@ -15,10 +15,11 @@ import (
 )
 
 type Runtime struct {
-	analytics *application.Analytics
-	owner     *application.Owner
-	attempts  *application.OrderAttemptCoordinator
-	gate      *runtimeGate
+	productBatches *application.ProductBatches
+	analytics      *application.Analytics
+	owner          *application.Owner
+	attempts       *application.OrderAttemptCoordinator
+	gate           *runtimeGate
 }
 
 type attemptOwnerAdapter struct{ runtime *Runtime }
@@ -73,6 +74,14 @@ func NewInMemory(options Options) (*Runtime, error) {
 		coverage = options.Now()
 	}
 	runtime := &Runtime{owner: owner, gate: newRuntimeGate()}
+	physicalNow := options.PhysicalNow
+	if physicalNow == nil {
+		physicalNow = time.Now
+	}
+	runtime.productBatches, err = application.NewProductBatches(owner, physicalNow, rand.Text, func(d time.Duration, f func()) application.PageExpiryTimer { return time.AfterFunc(d, f) })
+	if err != nil {
+		return nil, err
+	}
 	if !coverage.IsZero() {
 		runtime.analytics, err = application.NewAnalytics(runtime, owner, coverage, options.Now, rand.Text, zonedata.Load)
 		if err != nil {

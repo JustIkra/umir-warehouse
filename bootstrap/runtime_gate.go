@@ -62,6 +62,9 @@ func (r *Runtime) fence() {
 	}
 	r.gate.closed = true
 	r.gate.cancel()
+	if r.productBatches != nil {
+		r.productBatches.Close()
+	}
 	if r.gate.active == 0 {
 		close(r.gate.drained)
 	}
@@ -79,5 +82,6 @@ func (r *Runtime) cleanup(ctx context.Context) error {
 	defer r.gate.mu.Unlock()
 	r.owner = nil
 	r.attempts = nil
+	r.productBatches = nil
 	return nil
 }

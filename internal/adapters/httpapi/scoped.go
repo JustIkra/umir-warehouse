@@ -61,6 +61,10 @@ func (r scopedRoute) mutation() bool {
 }
 
 func scopedRouteFor(method, path string) (scopedRoute, bool) {
+	parts := strings.Split(path, "/")
+	if method == "GET" && len(parts) == 3 && parts[0] == "products" && parts[1] != "" && parts[2] == "batches" {
+		return scopedRoute{"privateProductBatches", false}, true
+	}
 	routes := map[string]scopedRoute{
 		"GET products": {"privateproducts", false}, "POST products": {"privateregisterProduct", true},
 		"GET dish-catalog": {"privatedishCatalog", false}, "GET dish": {"privatedishDetails", false}, "POST dishes": {"privatedefineDish", true},
@@ -121,6 +125,16 @@ func (h *scopedHandlers) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	route, ok := scopedRouteFor(r.Method, segments[1])
+	encodedSegments := strings.SplitN(strings.TrimPrefix(r.URL.EscapedPath(), prefix), "/", 2)
+	if len(encodedSegments) == 2 {
+		if encoded, matched := scopedRouteFor(r.Method, encodedSegments[1]); matched && encoded.operation == "privateProductBatches" {
+			if encodedSegments[0] != segments[0] {
+				writeScopedError(w, contract.ErrInvalidArgument, false)
+				return
+			}
+			route, ok = encoded, true
+		}
+	}
 	if !contract.ValidEntityID(segments[0]) {
 		mutation := r.Method != "GET"
 		if ok {
@@ -206,6 +220,8 @@ func (h *scopedHandlers) dispatch(w http.ResponseWriter, r *http.Request, runtim
 	scope := identity.Scope
 	mutation := scopedRoute{operation: operation}.mutation()
 	switch operation {
+	case "privateProductBatches":
+		h.productBatches(w, r, runtime, identity)
 	case "consumerCommit", "consumerOrder", "consumerAttempt":
 		h.scopedOrder(w, r, runtime, scope, operation)
 	case "privatehistory":

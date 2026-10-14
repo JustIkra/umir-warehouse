@@ -11,6 +11,7 @@ type Options struct {
 	Scope             contract.Scope
 	TZDataVersion     string
 	Now               func() time.Time
+	PhysicalNow       func() time.Time
 	NewID             func() string
 	EventsPerSnapshot int64
 }

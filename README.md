@@ -1,5 +1,7 @@
 # umir-warehouse
 
+The UA1 owner addition serves `GET /internal/warehouse/v2/r/{restaurantID}/products/{productID}/batches` with `stock.read`, the Gateway caller key and a scoped JWT for `productBatches`. It returns all positive remaining batches in FEFO order, including pending writeoff, with exact quantities and recorded batch settings. Default page size is100, maximum500. Actor/scope/product/filter-bound captures last five physical minutes; limits are128 captures,10000 rows per capture and16MiB retained per restaurant. Runtime close stops capture timers and denies cursor reuse. `bootstrap.Options.PhysicalNow` injects the page clock independently of the business clock. Gateway composition and real-service UA1 qualification are separate stages.
+
 The unpublished W1–W6 candidate implements the C2-frozen scoped backend contract `2.0.0-draft.2`. The selected legacy assembly and published versions remain separate. Sections that describe one restaurant, direct public business routes, or automatic final expiry apply to legacy mode. Scoped v2 requires an explicit restaurant, isolated in-memory state, pending expiry and authorized human confirmation. No legacy route selects a restaurant implicitly.
 
 Сервис склада одного ресторана.
