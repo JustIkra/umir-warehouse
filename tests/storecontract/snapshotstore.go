@@ -1,4 +1,4 @@
-package tests
+package storecontract
 
 import (
 	"context"
@@ -6,13 +6,38 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JustIkra/umir-warehouse/internal/adapters/memory"
 	"github.com/JustIkra/umir-warehouse/internal/domain"
 )
 
-func TestSnapshotStoreCopiesAndPublishesMonotonically(t *testing.T) {
-	store := memory.NewSnapshotStore()
+func RunSnapshotStore(t *testing.T, f Fixture) {
+	t.Helper()
+	for _, c := range []struct {
+		name string
+		run  func(*testing.T, Fixture)
+	}{
+		{"empty store has no snapshot", snapshotsEmpty},
+		{"copies on save and load and publishes monotonically", snapshotsCopyAndMonotonic},
+		{"invalid candidate does not replace the previous snapshot", snapshotsRejectInvalid},
+		{"canceled save preserves the previous snapshot", snapshotsCanceledSave},
+		{"accepts delayed delivery expiration", snapshotsDelayedExpiration},
+		{"rejects duplicate command coverage", snapshotsDuplicateCommandCoverage},
+		{"rejects remaining stock after write-off", snapshotsRemainingAfterWriteoff},
+		{"rejects invalid expiry processed time", snapshotsInvalidProcessedAt},
+		{"restaurants are isolated", snapshotsRestaurantIsolation},
+	} {
+		t.Run(c.name, func(t *testing.T) { c.run(t, f) })
+	}
+}
+
+func snapshotsEmpty(t *testing.T, f Fixture) {
+	if _, found, err := f.open(t).Snapshots.LoadLatest(context.Background()); err != nil || found {
+		t.Fatalf("LoadLatest() = found %v, err %v; want no snapshot", found, err)
+	}
+}
+
+func snapshotsCopyAndMonotonic(t *testing.T, f Fixture) {
 	ctx := context.Background()
+	store := f.open(t).Snapshots
 	candidate := validSnapshot(2)
 	candidate.State.Products["product-1"] = domain.Product{ProductID: "product-1", Name: "Tomato", BaseUnit: domain.BaseUnitG}
 	candidate.State.Dishes = map[string]domain.Dish{"dish-1": {DishID: "dish-1", Name: "Soup", Ingredients: []domain.Ingredient{{ProductID: "product-1", Quantity: 500}}}}
@@ -39,19 +64,18 @@ func TestSnapshotStoreCopiesAndPublishesMonotonically(t *testing.T) {
 		t.Fatal("LoadLatest exposed mutable store state")
 	}
 
-	older := productSnapshot()
-	if err := store.Save(ctx, older); err != nil {
+	if err := store.Save(ctx, productSnapshot()); err != nil {
 		t.Fatalf("Save(older valid candidate) error = %v", err)
 	}
 	latest, found, err := store.LoadLatest(ctx)
-	if err != nil || !found || latest.LastSequence != 2 {
-		t.Fatalf("latest after older Save() = %#v, found %v, err %v; want sequence 2", latest, found, err)
+	if err != nil || !found || latest.LastSequence != 2 || len(latest.State.Dishes) != 1 {
+		t.Fatalf("latest after older Save() = %#v, found %v, err %v; want the original sequence 2", latest, found, err)
 	}
 }
 
-func TestSnapshotStoreRejectsInvalidCandidateWithoutReplacingPrevious(t *testing.T) {
-	store := memory.NewSnapshotStore()
+func snapshotsRejectInvalid(t *testing.T, f Fixture) {
 	ctx := context.Background()
+	store := f.open(t).Snapshots
 	if err := store.Save(ctx, validSnapshot(0)); err != nil {
 		t.Fatal(err)
 	}
@@ -73,14 +97,11 @@ func TestSnapshotStoreRejectsInvalidCandidateWithoutReplacingPrevious(t *testing
 	if err := store.Save(ctx, invalid); err == nil {
 		t.Fatal("Save accepted a dish referencing an unknown product")
 	}
-	latest, found, err := store.LoadLatest(ctx)
-	if err != nil || !found || latest.LastSequence != 0 {
-		t.Fatalf("previous snapshot after rejected candidates = %#v, found %v, err %v; want sequence 0", latest, found, err)
-	}
+	assertLatestSequence(t, store, 0)
 }
 
-func TestSnapshotStoreCancellationBeforeCommitPreservesPrevious(t *testing.T) {
-	store := memory.NewSnapshotStore()
+func snapshotsCanceledSave(t *testing.T, f Fixture) {
+	store := f.open(t).Snapshots
 	if err := store.Save(context.Background(), validSnapshot(0)); err != nil {
 		t.Fatal(err)
 	}
@@ -89,15 +110,11 @@ func TestSnapshotStoreCancellationBeforeCommitPreservesPrevious(t *testing.T) {
 	if err := store.Save(ctx, validSnapshot(2)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Save(canceled context) error = %v; want context.Canceled", err)
 	}
-	latest, found, err := store.LoadLatest(context.Background())
-	if err != nil || !found || latest.LastSequence != 0 {
-		t.Fatalf("previous snapshot after canceled Save() = %#v, found %v, err %v; want sequence 0", latest, found, err)
-	}
+	assertLatestSequence(t, store, 0)
 }
 
-func TestSnapshotStoreAcceptsDelayedDeliveryExpiration(t *testing.T) {
-	store := memory.NewSnapshotStore()
-	state := domain.InventoryState{}
+func snapshotsDelayedExpiration(t *testing.T, f Fixture) {
+	store := f.open(t).Snapshots
 	registeredAt := snapshotTime(2026, time.March, 1, 12)
 	productBatch := domain.RecordedBatch{
 		CommandID: "register-product", CommandType: "RegisterProduct", CommandFingerprint: "product-fingerprint", FinalSequence: 1,
@@ -107,8 +124,7 @@ func TestSnapshotStoreAcceptsDelayedDeliveryExpiration(t *testing.T) {
 			Payload: domain.EventPayload{Product: &domain.Product{ProductID: "product-1", Name: "Tomato", BaseUnit: domain.BaseUnitG}},
 		}},
 	}
-	var err error
-	state, err = domain.ApplyRecordedBatch(state, productBatch)
+	state, err := domain.ApplyRecordedBatch(domain.InventoryState{}, productBatch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +152,7 @@ func TestSnapshotStoreAcceptsDelayedDeliveryExpiration(t *testing.T) {
 	}
 }
 
-func TestSnapshotStoreRejectsDuplicateCommandCoverageAndPreservesPrevious(t *testing.T) {
+func snapshotsDuplicateCommandCoverage(t *testing.T, f Fixture) {
 	candidate := validSnapshot(2)
 	candidate.State.Products = map[string]domain.Product{
 		"product-1": {ProductID: "product-1", Name: "Tomato", BaseUnit: domain.BaseUnitG},
@@ -144,41 +160,63 @@ func TestSnapshotStoreRejectsDuplicateCommandCoverageAndPreservesPrevious(t *tes
 	}
 	candidate.State.Commands["command-1"] = productCommand("command-1", "product-1")
 	candidate.State.Commands["command-2"] = productCommand("command-2", "product-1")
-	assertSnapshotRejectedWithoutReplacement(t, candidate)
+	assertSnapshotRejectedWithoutReplacement(t, f, candidate)
 }
 
-func TestSnapshotStoreRejectsRemainingStockAfterWriteOffAndPreservesPrevious(t *testing.T) {
-	candidate := snapshotWithExpiry(500, 500, snapshotTime(2026, time.March, 3, 12))
-	assertSnapshotRejectedWithoutReplacement(t, candidate)
+func snapshotsRemainingAfterWriteoff(t *testing.T, f Fixture) {
+	assertSnapshotRejectedWithoutReplacement(t, f, snapshotWithExpiry(500, 500, snapshotTime(2026, time.March, 3, 12)))
 }
 
-func TestSnapshotStoreRejectsInvalidExpiryProcessedAtAndPreservesPrevious(t *testing.T) {
-	for _, test := range []struct {
+func snapshotsInvalidProcessedAt(t *testing.T, f Fixture) {
+	for _, c := range []struct {
 		name        string
 		processedAt time.Time
 	}{
 		{name: "zero time", processedAt: time.Time{}},
 		{name: "unsupported offset", processedAt: time.Date(2026, time.March, 3, 12, 0, 0, 0, time.FixedZone("UTC", 0))},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			candidate := snapshotWithExpiry(0, 1000, test.processedAt)
-			assertSnapshotRejectedWithoutReplacement(t, candidate)
+		t.Run(c.name, func(t *testing.T) {
+			assertSnapshotRejectedWithoutReplacement(t, f, snapshotWithExpiry(0, 1000, c.processedAt))
 		})
 	}
 }
 
-func assertSnapshotRejectedWithoutReplacement(t *testing.T, candidate domain.Snapshot) {
+func snapshotsRestaurantIsolation(t *testing.T, f Fixture) {
+	ctx := context.Background()
+	first := f.open(t)
+	second := f.openOther(t, first)
+	if err := first.Snapshots.Save(ctx, productSnapshot()); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := second.Snapshots.LoadLatest(ctx); err != nil || found {
+		t.Fatalf("LoadLatest() in other restaurant = found %v, err %v; want no snapshot", found, err)
+	}
+	if err := second.Snapshots.Save(ctx, validSnapshot(0)); err != nil {
+		t.Fatal(err)
+	}
+	assertLatestSequence(t, first.Snapshots, 1)
+	assertLatestSequence(t, second.Snapshots, 0)
+}
+
+func assertSnapshotRejectedWithoutReplacement(t *testing.T, f Fixture, candidate domain.Snapshot) {
 	t.Helper()
-	store := memory.NewSnapshotStore()
+	store := f.open(t).Snapshots
 	if err := store.Save(context.Background(), validSnapshot(0)); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Save(context.Background(), candidate); err == nil {
 		t.Fatal("Save accepted an invalid snapshot")
 	}
-	previous, found, err := store.LoadLatest(context.Background())
-	if err != nil || !found || previous.LastSequence != 0 {
-		t.Fatalf("previous snapshot = %#v, found %v, err %v; want sequence 0", previous, found, err)
+	assertLatestSequence(t, store, 0)
+}
+
+func assertLatestSequence(t *testing.T, store interface {
+	LoadLatest(context.Context) (domain.Snapshot, bool, error)
+}, want int64) {
+	t.Helper()
+	latest, found, err := store.LoadLatest(context.Background())
+	if err != nil || !found || latest.LastSequence != want {
+		t.Fatalf("LoadLatest() = %#v, found %v, err %v; want sequence %d", latest, found, err, want)
 	}
 }
 
@@ -211,6 +249,8 @@ func productSnapshot() domain.Snapshot {
 	return snapshot
 }
 
+// validSnapshot is the single place that knows how to build an empty valid
+// snapshot of the current schema.
 func validSnapshot(sequence int64) domain.Snapshot {
 	return domain.Snapshot{
 		SchemaVersion: domain.InventorySchemaV1,
