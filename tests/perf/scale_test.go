@@ -1,0 +1,219 @@
+//go:build perf
+
+package perf
+
+import (
+	"fmt"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"text/tabwriter"
+	"time"
+
+	"github.com/JustIkra/umir-warehouse/contract"
+	"github.com/JustIkra/umir-warehouse/internal/application"
+)
+
+const (
+	products = 30
+	dishes   = 40
+	// commitSamples orders are timed at each checkpoint, after the corpus size.
+	commitSamples = 20
+	// repeats takes the best of several runs of a read so scheduling noise does
+	// not decide a ratio.
+	repeats = 5
+)
+
+type row struct {
+	orders, batches                                      int
+	build, commitAvg, commitP50, menu, supply, recInputs time.Duration
+	inventory, history, movements, recoverLive           time.Duration
+	recoverJournal, recoverSnapshot                      time.Duration
+	heapOwnerMiB, heapProcessMiB                         float64
+}
+
+func (s *stand) deliver() {
+	s.t.Helper()
+	now := s.clock.Now()
+	lines := make([]contract.DeliveryLine, 0, products)
+	for p := range products {
+		lines = append(lines, contract.DeliveryLine{ProductID: "p" + strconv.Itoa(p), ManufacturedAt: now.Add(-time.Hour), ShelfLife: contract.ShelfLife{Value: 12, Unit: contract.ShelfLifeMonth}, ReceivedAt: now, Quantity: 10_000_000})
+	}
+	if _, err := s.owner.ReceiveDelivery(s.ctx, contract.ReceiveDeliveryRequest{Scope: s.scope, CommandID: newUUID(), DeliveryID: newUUID(), Number: "N", CreatedAt: now, Lines: lines}); err != nil {
+		s.t.Fatal(err)
+	}
+	s.deliveries++
+}
+
+func (s *stand) seedCatalog() {
+	s.t.Helper()
+	for p := range products {
+		if _, err := s.owner.RegisterProduct(s.ctx, contract.RegisterProductRequest{CommandID: newUUID(), ProductID: "p" + strconv.Itoa(p), Name: "Product " + strconv.Itoa(p), BaseUnit: contract.BaseUnitG}); err != nil {
+			s.t.Fatal(err)
+		}
+	}
+	for d := range dishes {
+		ingredients := make([]contract.Ingredient, 0, 4)
+		for k := range 4 {
+			ingredients = append(ingredients, contract.Ingredient{ProductID: "p" + strconv.Itoa((d*7+k*3)%products), Quantity: contract.Quantity(1000 * (k + 1))})
+		}
+		if _, err := s.owner.DefineDish(s.ctx, contract.DefineDishRequest{CommandID: newUUID(), DishID: "d" + strconv.Itoa(d), Name: "Dish " + strconv.Itoa(d), Ingredients: ingredients}); err != nil {
+			s.t.Fatal(err)
+		}
+	}
+	s.deliver()
+}
+
+func (s *stand) commit(i int) {
+	s.t.Helper()
+	positions := []contract.AcceptedPosition{{LineNo: 1, DishID: "d" + strconv.Itoa(i%dishes), Portions: 1}, {LineNo: 2, DishID: "d" + strconv.Itoa((i*3+1)%dishes), Portions: 2}}
+	result, err := s.owner.CommitAcceptedOrder(s.ctx, contract.CommitOrderRequest{CommandID: newUUID(), ProposalID: newUUID(), AcceptedPositions: positions})
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	if result.Kind != contract.CommitResultOrderCommitted {
+		s.deliver()
+		result, err = s.owner.CommitAcceptedOrder(s.ctx, contract.CommitOrderRequest{CommandID: newUUID(), ProposalID: newUUID(), AcceptedPositions: positions})
+		if err != nil || result.Kind != contract.CommitResultOrderCommitted {
+			s.t.Fatalf("commit %d: %v %v", i, result.Kind, err)
+		}
+	}
+	s.clock.Advance(time.Minute)
+}
+
+func (s *stand) timed(name string, f func() error) time.Duration {
+	s.t.Helper()
+	start := time.Now()
+	if err := f(); err != nil {
+		s.t.Fatalf("%s: %v", name, err)
+	}
+	return time.Since(start)
+}
+
+func (s *stand) best(name string, f func() error) time.Duration {
+	s.t.Helper()
+	shortest := s.timed(name, f)
+	for range repeats - 1 {
+		shortest = min(shortest, s.timed(name, f))
+	}
+	return shortest
+}
+
+// recoverFresh times Recover of a new owner over the same journal; the owner
+// is built outside the timer. A nil snapshot store replays the whole journal.
+func (s *stand) recoverFresh(name string, withSnapshots bool) time.Duration {
+	s.t.Helper()
+	var shortest time.Duration
+	for attempt := range repeats {
+		var owner *application.Owner
+		if withSnapshots {
+			owner = s.newOwner(s.snapshots)
+		} else {
+			owner = s.newOwner(nil)
+		}
+		runtime.GC() // garbage of the previous run must not be collected inside the timer
+		elapsed := s.timed(name, func() error { return owner.Recover(s.ctx) })
+		if attempt == 0 || elapsed < shortest {
+			shortest = elapsed
+		}
+	}
+	return shortest
+}
+
+// freshOwnerHeap is the live heap a restored owner adds over the shared journal.
+func (s *stand) freshOwnerHeap() float64 {
+	s.t.Helper()
+	before := heapMiB()
+	owner := s.newOwner(s.snapshots)
+	if err := owner.Recover(s.ctx); err != nil {
+		s.t.Fatal(err)
+	}
+	after := heapMiB()
+	runtime.KeepAlive(owner)
+	return after - before
+}
+
+func TestScale(t *testing.T) {
+	s := newStand(t)
+	baseHeap := heapMiB()
+	actor := newUUID()
+	s.seedCatalog()
+	planning := contract.PlanningRequest{Scope: s.scope, Actor: actor}
+	analytics := contract.AnalyticsRequest{Scope: s.scope, Actor: actor, ExpectedSettingsVersion: "1"}
+
+	var rows []row
+	done := 0
+	start := time.Now()
+	for _, checkpoint := range []int{1000, 4000, 8000} {
+		for ; done < checkpoint; done++ {
+			if done%150 == 149 {
+				s.deliver()
+			}
+			s.commit(done)
+			s.flushSnapshots()
+		}
+		r := row{orders: done + commitSamples, batches: s.deliveries * products, build: time.Since(start)}
+		var commitTotal time.Duration
+		samples := make([]time.Duration, 0, commitSamples)
+		for range commitSamples {
+			sample := s.timed("commit", func() error { s.commit(done); return nil })
+			samples = append(samples, sample)
+			commitTotal += sample
+			s.flushSnapshots()
+			done++
+		}
+		slices.Sort(samples)
+		r.commitAvg, r.commitP50 = commitTotal/commitSamples, samples[commitSamples/2]
+		r.menu = s.timed("menu", func() error { _, err := s.owner.EvaluateMenu(s.ctx); return err })
+		r.supply = s.timed("supply", func() error { _, err := s.planning.Supply(s.ctx, planning); return err })
+		r.recInputs = s.timed("recommendations", func() error { _, err := s.planning.Recommendations(s.ctx, planning); return err })
+		r.inventory = s.timed("inventory", func() error { _, err := s.owner.GetInventory(s.ctx); return err })
+		r.history = s.timed("history", func() error { _, err := s.owner.GetHistory(s.ctx); return err })
+		r.movements = s.best("movements", func() error { _, err := s.analytics.Movements(s.ctx, analytics); return err })
+		r.recoverLive = s.timed("recover", func() error { return s.owner.Recover(s.ctx) })
+		r.recoverJournal = s.recoverFresh("recover_journal", false)
+		r.recoverSnapshot = s.recoverFresh("recover_snapshot", true)
+		r.heapOwnerMiB = s.freshOwnerHeap()
+		r.heapProcessMiB = heapMiB() - baseHeap
+		rows = append(rows, r)
+	}
+
+	var table strings.Builder
+	w := tabwriter.NewWriter(&table, 0, 0, 2, ' ', 0)
+	check := func(_ int, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(fmt.Fprintln(w, "orders\tbatches\tbuild\tcommit_avg\tcommit_p50\tmenu\tsupply\trecInputs\tinventory\thistory\tmovements\trecover\trecover_journal\trecover_snapshot\theap_owner_MiB\theap_process_MiB"))
+	for _, r := range rows {
+		check(fmt.Fprintf(w, "%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%.1f\t%.1f\n", r.orders, r.batches,
+			r.build.Round(time.Millisecond), r.commitAvg.Round(time.Microsecond), r.commitP50.Round(time.Microsecond), r.menu.Round(time.Microsecond), r.supply.Round(time.Microsecond), r.recInputs.Round(time.Microsecond),
+			r.inventory.Round(time.Microsecond), r.history.Round(time.Microsecond), r.movements.Round(time.Millisecond), r.recoverLive.Round(time.Millisecond),
+			r.recoverJournal.Round(time.Millisecond), r.recoverSnapshot.Round(time.Millisecond), r.heapOwnerMiB, r.heapProcessMiB))
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("\n%s", table.String())
+
+	first, last := rows[0], rows[len(rows)-1]
+	ratio := func(name string, small, large time.Duration, limit float64) {
+		t.Helper()
+		got := float64(large) / float64(small)
+		t.Logf("%s(%d)/%s(%d) = %.2f (limit %.0f)", name, last.orders, name, first.orders, got, limit)
+		if got >= limit {
+			t.Errorf("%s grew %.2f times from %d to %d orders; want under %.0f", name, got, first.orders, last.orders, limit)
+		}
+	}
+	ratio("recover_journal", first.recoverJournal, last.recoverJournal, 12)
+	ratio("movements", first.movements, last.movements, 12)
+	// The commit ratio is checked on the median of the timed commits: on a busy
+	// machine the mean is decided by a few preempted samples. The mean ratio is
+	// printed too.
+	t.Logf("commit_avg(%d)/commit_avg(%d) = %.2f", last.orders, first.orders, float64(last.commitAvg)/float64(first.commitAvg))
+	ratio("commit_p50", first.commitP50, last.commitP50, 3)
+}

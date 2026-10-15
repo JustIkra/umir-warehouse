@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Add `make perf`, a scale harness under `tests/perf` (build tag `perf`, linted through `run.build-tags`). It builds a restaurant with 1000, 4000 and 8000 orders over the memory stores and prints latencies of commits, menu, supply, recommendations, inventory, history, movements and recovery (live, from the journal, from a snapshot), plus the heap of a freshly restored owner. It checks only growth ratios between the first and last checkpoint.
+
 - Stop copying the projection on every read. `Owner.Prepare` returns an independent copy of products, dishes (with their ingredients) and batches only, without the delivery IDs, and the owner's own commands work on a borrowed view of its state under the lock. Offering a snapshot clones the state once. Writes to the maps returned by `Prepare` can no longer reach the owner or a snapshot.
 
 - Verify a snapshot against the journal once, when it is saved. Outside the owner lock, the snapshot worker replays the journal from the previous valid snapshot (or from the start when there is none) up to the candidate's sequence and saves the candidate only if it holds exactly that state; a diverging candidate is rejected with `ErrInvalidSnapshot`, dropped without retrying, and leaves the previous snapshot in place. If the previous snapshot itself contradicts the journal, the candidate is judged from the start so one wrong snapshot cannot block later ones.
