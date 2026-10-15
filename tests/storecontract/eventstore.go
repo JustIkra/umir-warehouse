@@ -3,6 +3,7 @@ package storecontract
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -23,6 +24,10 @@ func RunEventStore(t *testing.T, f Fixture) {
 		{"event and proposal IDs are unique", eventsUniqueEventAndProposal},
 		{"order and delivery IDs are unique", eventsUniqueOrderAndDelivery},
 		{"read batches boundaries", eventsReadBatchesBoundaries},
+		{"scan batches boundaries and callback error", eventsScanBatches},
+		{"read events window", eventsReadEvents},
+		{"read period", eventsReadPeriod},
+		{"find order placement", eventsFindOrderPlacement},
 		{"find command and order by proposal", eventsFindLookups},
 		{"canceled context leaves no trace", eventsCanceledAppend},
 		{"restaurants are isolated", eventsRestaurantIsolation},
@@ -226,6 +231,234 @@ func eventsReadBatchesBoundaries(t *testing.T, f Fixture) {
 			t.Fatalf("ReadBatches(%d) error = %v; want ErrInvalidRecordedBatch", after, err)
 		}
 	}
+}
+
+// appendTimeline records product (sequence 1), a delivery with expiry
+// (2, 3), an order (4) and a product (5), each command on its own day: March 1..4, 12:00 MSK.
+func appendTimeline(t *testing.T, events application.EventStore) {
+	t.Helper()
+	for day, batch := range []domain.CommandBatch{
+		productBatch("cmd-1", "fp-1", "e-1", "p1", 0),
+		deliveryBatch("receive-1", "fp-r1", "delivery-1", "batch-1", "delivery-event-1", 1, true),
+		orderBatch("confirm-1", "order-event-1", "order-1", "proposal-1", 3),
+		productBatch("cmd-2", "fp-2", "e-2", "p2", 4),
+	} {
+		if _, err := events.AppendBatch(context.Background(), atDay(batch, day+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func eventsScanBatches(t *testing.T, f Fixture) {
+	ctx := context.Background()
+	events := f.open(t).Events
+	appendTimeline(t, events)
+	for _, c := range []struct {
+		after int64
+		want  []int64
+	}{
+		{0, []int64{1, 3, 4, 5}},
+		{1, []int64{3, 4, 5}},
+		{4, []int64{5}},
+		{5, nil},
+	} {
+		var got []int64
+		err := events.ScanBatches(ctx, c.after, func(batch domain.RecordedBatch) error {
+			got = append(got, batch.FinalSequence)
+			return nil
+		})
+		if err != nil || !slices.Equal(got, c.want) {
+			t.Fatalf("ScanBatches(%d) = %v, %v; want %v, nil", c.after, got, err, c.want)
+		}
+	}
+	for _, after := range []int64{2, -1} {
+		called := false
+		err := events.ScanBatches(ctx, after, func(domain.RecordedBatch) error { called = true; return nil })
+		if !errors.Is(err, domain.ErrInvalidRecordedBatch) || called {
+			t.Fatalf("ScanBatches(%d) error = %v, called = %v; want ErrInvalidRecordedBatch without callbacks", after, err, called)
+		}
+	}
+
+	stop := errors.New("stop")
+	calls := 0
+	err := events.ScanBatches(ctx, 0, func(domain.RecordedBatch) error {
+		calls++
+		return stop
+	})
+	if !errors.Is(err, stop) || calls != 1 {
+		t.Fatalf("ScanBatches(callback error) = %v after %d calls; want the callback error after 1 call", err, calls)
+	}
+
+	err = events.ScanBatches(ctx, 0, func(batch domain.RecordedBatch) error {
+		batch.Events[0].EventID = "mutated"
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	batches, err := events.ReadBatches(ctx, 0)
+	if err != nil || batches[0].Events[0].EventID != "e-1" {
+		t.Fatalf("ReadBatches() after callback mutation = %#v, %v; want stored events", batches, err)
+	}
+
+	// The store must not be locked while the callback runs.
+	err = events.ScanBatches(ctx, 0, func(domain.RecordedBatch) error {
+		_, err := events.Version(ctx)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("Version() inside ScanBatches callback error = %v", err)
+	}
+
+	canceled, cancel := context.WithCancel(ctx)
+	calls = 0
+	err = events.ScanBatches(canceled, 0, func(domain.RecordedBatch) error {
+		calls++
+		cancel()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatalf("ScanBatches(canceled in callback) = %v after %d calls; want context.Canceled after 1 call", err, calls)
+	}
+}
+
+func eventsReadEvents(t *testing.T, f Fixture) {
+	ctx := context.Background()
+	events := f.open(t).Events
+	appendTimeline(t, events)
+	for _, c := range []struct {
+		after int64
+		limit int
+		want  []int64
+	}{
+		{0, 100, []int64{1, 2, 3, 4, 5}},
+		{0, 2, []int64{1, 2}},
+		{1, 1, []int64{2}},
+		{2, 2, []int64{3, 4}},
+		{4, 10, []int64{5}},
+		{5, 10, nil},
+		{9, 10, nil},
+	} {
+		got, err := events.ReadEvents(ctx, c.after, c.limit)
+		if err != nil || !slices.Equal(sequences(got), c.want) {
+			t.Fatalf("ReadEvents(%d, %d) = %v, %v; want %v, nil", c.after, c.limit, sequences(got), err, c.want)
+		}
+	}
+	for _, c := range []struct {
+		after int64
+		limit int
+	}{{0, 0}, {0, -1}, {-1, 10}} {
+		if _, err := events.ReadEvents(ctx, c.after, c.limit); !errors.Is(err, domain.ErrInvalidRecordedBatch) {
+			t.Fatalf("ReadEvents(%d, %d) error = %v; want ErrInvalidRecordedBatch", c.after, c.limit, err)
+		}
+	}
+	got, err := events.ReadEvents(ctx, 0, 1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("ReadEvents() = %v, %v", got, err)
+	}
+	got[0].EventID = "mutated"
+	again, err := events.ReadEvents(ctx, 0, 1)
+	if err != nil || again[0].EventID != "e-1" {
+		t.Fatalf("ReadEvents() after caller mutation = %#v, %v; want stored event", again, err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := events.ReadEvents(canceled, 0, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadEvents(canceled) error = %v; want context.Canceled", err)
+	}
+}
+
+func eventsReadPeriod(t *testing.T, f Fixture) {
+	ctx := context.Background()
+	events := f.open(t).Events
+	appendTimeline(t, events)
+	day := func(d int) time.Time { return moscowTime(2026, time.March, d) }
+	for _, c := range []struct {
+		name string
+		q    application.PeriodQuery
+		want []int64
+	}{
+		{"all", application.PeriodQuery{From: day(1), To: day(5), UpToSequence: 5}, []int64{1, 2, 3, 4, 5}},
+		{"from is inclusive", application.PeriodQuery{From: day(2), To: day(5), UpToSequence: 5}, []int64{2, 3, 4, 5}},
+		{"to is exclusive", application.PeriodQuery{From: day(1), To: day(3), UpToSequence: 5}, []int64{1, 2, 3}},
+		{"single instant window", application.PeriodQuery{From: day(2), To: day(2).Add(time.Nanosecond), UpToSequence: 5}, []int64{2, 3}},
+		{"empty window", application.PeriodQuery{From: day(2), To: day(2), UpToSequence: 5}, nil},
+		{"instant compared across zones", application.PeriodQuery{From: day(2).UTC(), To: day(3).UTC(), UpToSequence: 5}, []int64{2, 3}},
+		{"types", application.PeriodQuery{From: day(1), To: day(5), UpToSequence: 5, Types: []domain.EventType{domain.EventBatchExpired, domain.EventOrderPlaced}}, []int64{3, 4}},
+		{"type outside window", application.PeriodQuery{From: day(1), To: day(2), UpToSequence: 5, Types: []domain.EventType{domain.EventOrderPlaced}}, nil},
+		{"up to sequence inside a batch", application.PeriodQuery{From: day(1), To: day(5), UpToSequence: 2}, []int64{1, 2}},
+		{"up to sequence and window", application.PeriodQuery{From: day(2), To: day(5), UpToSequence: 4}, []int64{2, 3, 4}},
+		{"up to sequence beyond the head", application.PeriodQuery{From: day(1), To: day(5), UpToSequence: 99}, []int64{1, 2, 3, 4, 5}},
+	} {
+		got, err := events.ReadPeriod(ctx, c.q)
+		if err != nil || !slices.Equal(sequences(got), c.want) {
+			t.Fatalf("ReadPeriod(%s) = %v, %v; want %v, nil", c.name, sequences(got), err, c.want)
+		}
+	}
+	for _, upTo := range []int64{0, -1} {
+		q := application.PeriodQuery{From: day(1), To: day(5), UpToSequence: upTo}
+		if _, err := events.ReadPeriod(ctx, q); !errors.Is(err, domain.ErrInvalidRecordedBatch) {
+			t.Fatalf("ReadPeriod(UpToSequence=%d) error = %v; want ErrInvalidRecordedBatch", upTo, err)
+		}
+	}
+	q := application.PeriodQuery{From: day(1), To: day(2), UpToSequence: 5}
+	got, err := events.ReadPeriod(ctx, q)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("ReadPeriod() = %v, %v", got, err)
+	}
+	got[0].Payload.Product.Name = "mutated"
+	again, err := events.ReadPeriod(ctx, q)
+	if err != nil || again[0].Payload.Product.Name != "Tomato" {
+		t.Fatalf("ReadPeriod() after caller mutation = %#v, %v; want stored product", again, err)
+	}
+}
+
+func eventsFindOrderPlacement(t *testing.T, f Fixture) {
+	ctx := context.Background()
+	events := f.open(t).Events
+	if _, ok, err := events.FindOrderPlacement(ctx, "order-1"); err != nil || ok {
+		t.Fatalf("FindOrderPlacement(empty store) = %v, %v; want absent", ok, err)
+	}
+	appendTimeline(t, events)
+	placement, ok, err := events.FindOrderPlacement(ctx, "order-1")
+	if err != nil || !ok || placement.Sequence != 4 || !placement.RecordedAt.Equal(moscowTime(2026, time.March, 3)) {
+		t.Fatalf("FindOrderPlacement(order-1) = %#v, %v, %v; want sequence 4 at March 3 12:00 MSK", placement, ok, err)
+	}
+	if _, offset := placement.RecordedAt.Zone(); offset != 3*60*60 {
+		t.Fatalf("FindOrderPlacement(order-1).RecordedAt zone offset = %d; want MSK as recorded", offset)
+	}
+	if _, ok, err := events.FindOrderPlacement(ctx, "unknown"); err != nil || ok {
+		t.Fatalf("FindOrderPlacement(unknown) = %v, %v; want absent", ok, err)
+	}
+	other := f.openOther(t, f.open(t))
+	if _, ok, err := other.Events.FindOrderPlacement(ctx, "order-1"); err != nil || ok {
+		t.Fatalf("FindOrderPlacement() in other restaurant = %v, %v; want absent", ok, err)
+	}
+}
+
+func sequences(events []domain.Event) []int64 {
+	var result []int64
+	for _, event := range events {
+		result = append(result, event.Sequence)
+	}
+	return result
+}
+
+// atDay moves the batch to 12:00 MSK on the given day of March 2026, keeping
+// the business time inside the payloads equal to the recorded time.
+func atDay(batch domain.CommandBatch, day int) domain.CommandBatch {
+	at := moscowTime(2026, time.March, day)
+	for i := range batch.Events {
+		event := &batch.Events[i]
+		event.RecordedAt = at
+		if event.Payload.Order != nil {
+			event.Payload.Order.PlacedAt = at
+		}
+		if event.Payload.Expiry != nil {
+			event.Payload.Expiry.ProcessedAt = at
+		}
+	}
+	return batch
 }
 
 func eventsFindLookups(t *testing.T, f Fixture) {

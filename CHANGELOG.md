@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Add bounded reads to the EventStore port and the memory store: `ScanBatches` for streaming, `ReadEvents` for a window of events, `ReadPeriod` for events of a time range up to a captured sequence, and `FindOrderPlacement` for the sequence and time of an order's `OrderPlaced` event. Cover them in the shared store contract suite. The memory store now finds batch boundaries by binary search.
+
 - Reject duplicate order and delivery IDs in the memory event store with `ErrInvalidEvent`, as it already does for proposal IDs, so the store keeps these identities unique without relying on the reducer.
 
 - Add a shared EventStore and SnapshotStore contract suite in `tests/storecontract` and run it against the memory stores. It replaces the earlier per-store contract tests and is reusable by the PostgreSQL stores.

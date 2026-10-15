@@ -187,3 +187,17 @@ type WriteoffResult struct {
 	SettingsVersion    string
 	StateVersion       int64
 }
+
+// PeriodQuery selects events recorded in [From, To) with Sequence <= UpToSequence.
+// Empty Types means every type. UpToSequence must be positive.
+type PeriodQuery struct {
+	From, To     time.Time
+	Types        []EventType
+	UpToSequence int64
+}
+
+// OrderPlacement locates the OrderPlaced event of an order.
+type OrderPlacement struct {
+	Sequence   int64
+	RecordedAt time.Time
+}

@@ -1,8 +1,10 @@
 package memory
 
 import (
+	"cmp"
 	"context"
 	"math"
+	"slices"
 	"sync"
 
 	"github.com/JustIkra/umir-warehouse/internal/domain"
@@ -15,7 +17,7 @@ type EventStore struct {
 	commands  map[string]storedCommand
 	eventIDs  map[string]struct{}
 	proposals map[string]domain.Order
-	orderIDs  map[string]struct{}
+	orders    map[string]domain.OrderPlacement
 	delivered map[string]struct{}
 }
 
@@ -29,7 +31,7 @@ func NewEventStore() *EventStore {
 		commands:  map[string]storedCommand{},
 		eventIDs:  map[string]struct{}{},
 		proposals: map[string]domain.Order{},
-		orderIDs:  map[string]struct{}{},
+		orders:    map[string]domain.OrderPlacement{},
 		delivered: map[string]struct{}{},
 	}
 }
@@ -99,7 +101,7 @@ func (s *EventStore) AppendBatch(ctx context.Context, batch domain.CommandBatch)
 		if _, exists := s.proposals[proposalID]; exists {
 			return domain.AppendResult{}, domain.ErrInvalidEvent
 		}
-		if _, exists := s.orderIDs[result.Order.OrderID]; exists {
+		if _, exists := s.orders[result.Order.OrderID]; exists {
 			return domain.AppendResult{}, domain.ErrInvalidEvent
 		}
 	}
@@ -123,7 +125,11 @@ func (s *EventStore) AppendBatch(ctx context.Context, batch domain.CommandBatch)
 	}
 	if proposalID != "" {
 		s.proposals[proposalID] = domain.CloneOrder(*result.Order)
-		s.orderIDs[result.Order.OrderID] = struct{}{}
+		for _, event := range recorded.Events {
+			if event.Type == domain.EventOrderPlaced {
+				s.orders[result.Order.OrderID] = domain.OrderPlacement{Sequence: event.Sequence, RecordedAt: event.RecordedAt}
+			}
+		}
 	}
 	if result.Delivery != nil {
 		s.delivered[result.Delivery.DeliveryID] = struct{}{}
@@ -141,25 +147,125 @@ func (s *EventStore) ReadBatches(ctx context.Context, afterSequence int64) ([]do
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if afterSequence > 0 && afterSequence < s.version {
-		boundary := false
-		for _, batch := range s.batches {
-			if batch.FinalSequence == afterSequence {
-				boundary = true
-				break
-			}
-		}
-		if !boundary {
-			return nil, domain.ErrInvalidRecordedBatch
-		}
+	if err := s.checkBoundaryLocked(afterSequence); err != nil {
+		return nil, err
 	}
 	result := make([]domain.RecordedBatch, 0, len(s.batches))
-	for _, batch := range s.batches {
-		if batch.FinalSequence > afterSequence {
-			result = append(result, domain.CloneRecordedBatch(batch))
-		}
+	for _, batch := range s.batches[s.firstAfterLocked(afterSequence):] {
+		result = append(result, domain.CloneRecordedBatch(batch))
 	}
 	return result, nil
+}
+
+// checkBoundaryLocked rejects a position inside a batch.
+func (s *EventStore) checkBoundaryLocked(afterSequence int64) error {
+	if afterSequence > 0 && afterSequence < s.version {
+		if _, found := slices.BinarySearchFunc(s.batches, afterSequence, compareFinalSequence); !found {
+			return domain.ErrInvalidRecordedBatch
+		}
+	}
+	return nil
+}
+
+// firstAfterLocked returns the index of the first batch ending after afterSequence.
+func (s *EventStore) firstAfterLocked(afterSequence int64) int {
+	index, found := slices.BinarySearchFunc(s.batches, afterSequence, compareFinalSequence)
+	if found {
+		index++
+	}
+	return index
+}
+
+func compareFinalSequence(batch domain.RecordedBatch, sequence int64) int {
+	return cmp.Compare(batch.FinalSequence, sequence)
+}
+
+func (s *EventStore) ScanBatches(ctx context.Context, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if afterSequence < 0 {
+		return domain.ErrInvalidRecordedBatch
+	}
+	s.mu.RLock()
+	if err := s.checkBoundaryLocked(afterSequence); err != nil {
+		s.mu.RUnlock()
+		return err
+	}
+	// The journal is append-only and recorded batches are never modified, so
+	// the slice of references stays valid after the lock is released.
+	batches := slices.Clone(s.batches[s.firstAfterLocked(afterSequence):])
+	s.mu.RUnlock()
+	for _, batch := range batches {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn(domain.CloneRecordedBatch(batch)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *EventStore) ReadEvents(ctx context.Context, afterSequence int64, limit int) ([]domain.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if afterSequence < 0 || limit <= 0 {
+		return nil, domain.ErrInvalidRecordedBatch
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var events []domain.Event
+	for _, batch := range s.batches[s.firstAfterLocked(afterSequence):] {
+		for _, event := range batch.Events {
+			if event.Sequence <= afterSequence {
+				continue
+			}
+			if len(events) == limit {
+				return events, nil
+			}
+			events = append(events, domain.CloneEvent(event))
+		}
+	}
+	return events, nil
+}
+
+func (s *EventStore) ReadPeriod(ctx context.Context, q domain.PeriodQuery) ([]domain.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if q.UpToSequence <= 0 {
+		return nil, domain.ErrInvalidRecordedBatch
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var events []domain.Event
+	for _, batch := range s.batches {
+		for _, event := range batch.Events {
+			if event.Sequence > q.UpToSequence {
+				return events, nil
+			}
+			if event.RecordedAt.Before(q.From) || !event.RecordedAt.Before(q.To) {
+				continue
+			}
+			if len(q.Types) > 0 && !slices.Contains(q.Types, event.Type) {
+				continue
+			}
+			events = append(events, domain.CloneEvent(event))
+		}
+	}
+	return events, nil
+}
+
+func (s *EventStore) FindOrderPlacement(ctx context.Context, orderID string) (domain.OrderPlacement, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.OrderPlacement{}, false, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	placement, ok := s.orders[orderID]
+	return placement, ok, nil
 }
 
 func (s *EventStore) FindCommand(ctx context.Context, commandID string) (domain.CommandRecord, bool, error) {
