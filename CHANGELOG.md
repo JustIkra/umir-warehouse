@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Stop copying the projection on every read. `Owner.Prepare` returns an independent copy of products, dishes (with their ingredients) and batches only, without the delivery IDs, and the owner's own commands work on a borrowed view of its state under the lock. Offering a snapshot clones the state once. Writes to the maps returned by `Prepare` can no longer reach the owner or a snapshot.
+
 - Verify a snapshot against the journal once, when it is saved. Outside the owner lock, the snapshot worker replays the journal from the previous valid snapshot (or from the start when there is none) up to the candidate's sequence and saves the candidate only if it holds exactly that state; a diverging candidate is rejected with `ErrInvalidSnapshot`, dropped without retrying, and leaves the previous snapshot in place. If the previous snapshot itself contradicts the journal, the candidate is judged from the start so one wrong snapshot cannot block later ones.
 
 - Recover the projection from a streamed journal. The owner builds the candidate in local variables from the latest snapshot plus `ScanBatches` of the tail, so a start from a snapshot no longer reads the journal prefix or holds per-journal ID maps. A snapshot that is invalid or does not fit the tail is logged and replaced by a walk from the start. The candidate is published only after the whole rebuild and the store version agree, so a failed or cancelled recovery keeps the previous projection usable, and catching up on the journal tail applies batches one by one and no longer marks the projection unusable on a cancelled context. The legacy full history keeps walking the journal from the start.

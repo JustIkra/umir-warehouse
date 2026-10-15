@@ -105,16 +105,32 @@ func CloneRecordedBatch(value RecordedBatch) RecordedBatch {
 
 func CloneInventoryState(value InventoryState) InventoryState {
 	value.Products = maps.Clone(value.Products)
-	if value.Dishes != nil {
-		dishes := make(map[string]Dish, len(value.Dishes))
-		for id, dish := range value.Dishes {
-			dishes[id] = CloneDish(dish)
-		}
-		value.Dishes = dishes
-	}
+	value.Dishes = cloneDishes(value.Dishes)
 	value.DeliveryIDs = maps.Clone(value.DeliveryIDs)
 	value.Batches = maps.Clone(value.Batches)
 	return value
+}
+
+// CloneReadView copies what a reader of the current inventory needs:
+// products, dishes and batches. DeliveryIDs is left out and nil.
+func CloneReadView(value InventoryState) InventoryState {
+	return InventoryState{
+		Products:     maps.Clone(value.Products),
+		Dishes:       cloneDishes(value.Dishes),
+		Batches:      maps.Clone(value.Batches),
+		StateVersion: value.StateVersion,
+	}
+}
+
+func cloneDishes(dishes map[string]Dish) map[string]Dish {
+	if dishes == nil {
+		return nil
+	}
+	cloned := make(map[string]Dish, len(dishes))
+	for id, dish := range dishes {
+		cloned[id] = CloneDish(dish)
+	}
+	return cloned
 }
 
 func CloneSnapshot(value Snapshot) Snapshot {

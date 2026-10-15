@@ -258,7 +258,8 @@ func (o *Owner) offerSnapshotLocked() {
 		SchemaVersion: domain.SnapshotSchemaV2,
 		StreamID:      domain.InventoryStreamID,
 		LastSequence:  o.state.StateVersion,
-		State:         domain.CloneInventoryState(o.state),
+		State:         o.state,
 	}
+	// Offer copies the snapshot before returning, while the lock is held.
 	o.snapshotWorker.Offer(snapshot)
 }

@@ -31,6 +31,9 @@ type Owner struct {
 	lastSavedSequence int64
 }
 
+// ReadState is the inventory a caller evaluates. Owner.Prepare returns an
+// independent copy. prepareLocked returns a borrowed view of the Owner's own
+// state, valid only while the caller holds the lock: do not keep or change it.
 type ReadState struct {
 	State        domain.InventoryState
 	EvaluatedAt  time.Time
@@ -74,6 +77,7 @@ func (o *Owner) Prepare(ctx context.Context) (ReadState, error) {
 	if err != nil {
 		return ReadState{}, inventoryUnavailable(err)
 	}
+	state.State = domain.CloneReadView(state.State)
 	return state, nil
 }
 
@@ -93,6 +97,9 @@ func (o *Owner) FindOrderByProposal(ctx context.Context, proposalID string) (dom
 	return domain.CloneOrder(order), found, nil
 }
 
+// prepareLocked returns a borrowed ReadState: State shares the Owner's maps and
+// is valid only while o.mu is held. Callers must not keep it past the unlock,
+// change it, or use it after a write that applies a batch.
 func (o *Owner) prepareLocked(ctx context.Context) (ReadState, []contract.ExpiryResult, error) {
 	if err := o.syncProjectionLocked(ctx); err != nil {
 		return ReadState{}, nil, err
@@ -117,7 +124,7 @@ func (o *Owner) prepareLocked(ctx context.Context) (ReadState, []contract.Expiry
 			if _, due := o.nextDueBatch(evaluatedAt); due {
 				continue
 			}
-			return ReadState{State: domain.CloneInventoryState(o.state), EvaluatedAt: evaluatedAt, StateVersion: o.state.StateVersion}, results, nil
+			return ReadState{State: o.state, EvaluatedAt: evaluatedAt, StateVersion: o.state.StateVersion}, results, nil
 		}
 		result, err := o.expireDueLocked(ctx, batchID, now)
 		if err != nil {

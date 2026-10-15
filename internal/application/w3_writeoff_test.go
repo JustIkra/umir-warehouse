@@ -51,7 +51,7 @@ func TestW3BoundaryBeforeSchedulerAndConcurrentWriteoff(t *testing.T) {
 	if !b.PendingWriteoff || b.RemainingQuantity != 4000 || b.WrittenOffForExpiry != 0 || state.StateVersion != before+1 {
 		t.Fatalf("pending: %+v", b)
 	}
-	snapshot := domain.Snapshot{SchemaVersion: domain.SnapshotSchemaV2, StreamID: domain.InventoryStreamID, LastSequence: state.StateVersion, State: state.State}
+	snapshot := snapshotFor(owner.state)
 	if err := domain.ValidateSnapshot(snapshot); err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestW3BoundaryBeforeSchedulerAndConcurrentWriteoff(t *testing.T) {
 	if b.RemainingQuantity != 0 || b.WrittenOffForExpiry != 4000 || b.ConsumedByOrders != 6000 {
 		t.Fatalf("replay conservation=%+v", b)
 	}
-	snapshot = domain.Snapshot{SchemaVersion: domain.SnapshotSchemaV2, StreamID: domain.InventoryStreamID, LastSequence: state.StateVersion, State: state.State}
+	snapshot = snapshotFor(restored.state)
 	if err := domain.ValidateSnapshot(snapshot); err != nil {
 		t.Fatal(err)
 	}
