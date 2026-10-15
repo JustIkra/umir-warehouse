@@ -31,6 +31,10 @@ func (o *Owner) EvaluateMenu(ctx context.Context) (contract.MenuEvaluation, erro
 	if err != nil {
 		return contract.MenuEvaluation{}, err
 	}
+	return evaluateMenu(ctx, prepared)
+}
+
+func evaluateMenu(ctx context.Context, prepared ReadState) (contract.MenuEvaluation, error) {
 	dishIDs := make([]string, 0, len(prepared.State.Dishes))
 	for dishID := range prepared.State.Dishes {
 		dishIDs = append(dishIDs, dishID)
@@ -38,6 +42,9 @@ func (o *Owner) EvaluateMenu(ctx context.Context) (contract.MenuEvaluation, erro
 	sort.Strings(dishIDs)
 	evaluation := contract.MenuEvaluation{EvaluatedAt: prepared.EvaluatedAt, StateVersion: prepared.StateVersion, Dishes: make([]contract.DishEvaluation, 0, len(dishIDs))}
 	for _, dishID := range dishIDs {
+		if err := ctx.Err(); err != nil {
+			return contract.MenuEvaluation{}, err
+		}
 		dish := prepared.State.Dishes[dishID]
 		positions := []domain.Position{{LineNo: 1, DishID: dishID, Portions: 1}}
 		result, allocations, err := domain.EvaluatePositionsWithAllocations(prepared.State, positions)

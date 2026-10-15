@@ -15,6 +15,7 @@ import (
 )
 
 type Runtime struct {
+	planning       *application.Planning
 	productBatches *application.ProductBatches
 	analytics      *application.Analytics
 	owner          *application.Owner
@@ -83,6 +84,10 @@ func NewInMemory(options Options) (*Runtime, error) {
 		return nil, err
 	}
 	if !coverage.IsZero() {
+		runtime.planning, err = application.NewPlanning(owner, coverage)
+		if err != nil {
+			return nil, err
+		}
 		runtime.analytics, err = application.NewAnalytics(runtime, owner, coverage, options.Now, rand.Text, zonedata.Load)
 		if err != nil {
 			return nil, err

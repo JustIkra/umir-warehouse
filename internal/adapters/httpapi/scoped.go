@@ -66,6 +66,7 @@ func scopedRouteFor(method, path string) (scopedRoute, bool) {
 		return scopedRoute{"privateProductBatches", false}, true
 	}
 	routes := map[string]scopedRoute{
+		"GET supply-suggestions": {"privateSupplySuggestions", false}, "GET recommendation-inputs": {"consumerRecommendations", false},
 		"GET products": {"privateproducts", false}, "POST products": {"privateregisterProduct", true},
 		"GET dish-catalog": {"privatedishCatalog", false}, "GET dish": {"privatedishDetails", false}, "POST dishes": {"privatedefineDish", true},
 		"POST deliveries": {"privatereceiveDelivery", true}, "GET inventory": {"privateinventory", false}, "GET expiring-batches": {"privateexpiringBatches", false}, "GET history": {"privatehistory", false},
@@ -220,6 +221,8 @@ func (h *scopedHandlers) dispatch(w http.ResponseWriter, r *http.Request, runtim
 	scope := identity.Scope
 	mutation := scopedRoute{operation: operation}.mutation()
 	switch operation {
+	case "privateSupplySuggestions", "consumerRecommendations":
+		h.planning(w, r, runtime, identity, operation)
 	case "privateProductBatches":
 		h.productBatches(w, r, runtime, identity)
 	case "consumerCommit", "consumerOrder", "consumerAttempt":

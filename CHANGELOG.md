@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Add FIN1 read-only supply suggestions and coherent private recommendation inputs. Use exact recorded consumption, eligible current stock, fixed seven-day history, three-day threshold and seven-day target, with explicit partial-history coverage. Keep ranking in Serving and require its narrow recommendation permission. Preserve human writeoff semantics and C2/UA1 source artifacts; assembly integration remains separate.
+
 - Add UA1 scoped product-batch pages with positive available/pending balances, owner FEFO ordering, atomic state/prefix capture and bounded actor-bound cursors. Preserve per-batch expiry/settings and human writeoff confirmation. Keep original C2 schemas and selected assembly unchanged.
 
 - Repair W6 scoped order commits, order-ID lookup, command-only retained attempts, bounded journal history and prepared expiring-batch dispatch against the frozen C2 contract. Add authenticated success, replay, isolation and schema regressions.
