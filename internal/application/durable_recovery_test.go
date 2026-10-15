@@ -26,6 +26,8 @@ type journalCountingStore struct {
 	scans   []int64
 	reads   []int64
 	scanErr func(after int64) error
+	// afterBatch runs after each batch is handed to the scan callback.
+	afterBatch func()
 }
 
 func (s *journalCountingStore) ScanBatches(ctx context.Context, after int64, fn func(domain.RecordedBatch) error) error {
@@ -38,7 +40,14 @@ func (s *journalCountingStore) ScanBatches(ctx context.Context, after int64, fn 
 			return err
 		}
 	}
-	return s.EventStore.ScanBatches(ctx, after, fn)
+	if s.afterBatch == nil {
+		return s.EventStore.ScanBatches(ctx, after, fn)
+	}
+	return s.EventStore.ScanBatches(ctx, after, func(batch domain.RecordedBatch) error {
+		err := fn(batch)
+		s.afterBatch()
+		return err
+	})
 }
 
 func (s *journalCountingStore) ReadBatches(ctx context.Context, after int64) ([]domain.RecordedBatch, error) {
@@ -102,6 +111,42 @@ func TestRecoveryFromSnapshotDoesNotReadPrefix(t *testing.T) {
 	}
 	if reads := counting.readsFromStart(); reads != 0 {
 		t.Fatalf("recovery from a snapshot read the journal from the start %d times; want 0", reads)
+	}
+}
+
+func TestCancelledCatchUpKeepsConsistentPrefix(t *testing.T) {
+	at := moscowTime(2026, time.April, 1, 10)
+	base := seedStore(t, moscowTime(2026, time.April, 4, 10), 10000, 0)
+	counting := &journalCountingStore{EventStore: base}
+	owner, err := NewOwner(counting, func() time.Time { return at }, nextTestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		id := fmt.Sprintf("extra-%d", i)
+		appendFixture(t, context.Background(), base, "register-"+id, "RegisterProduct", domain.Event{EventID: "event-" + id, RecordedAt: at, Type: domain.EventProductRegistered, Payload: domain.EventPayload{Product: &domain.Product{ProductID: id, Name: id, BaseUnit: domain.BaseUnitG}}})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	counting.afterBatch = cancel
+
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if err := owner.syncProjectionLocked(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("syncProjectionLocked() = %v; want context.Canceled", err)
+	}
+	if !owner.usable || owner.state.StateVersion != 4 {
+		t.Fatalf("after cancel: usable %v, version %d; want a usable prefix at version 4", owner.usable, owner.state.StateVersion)
+	}
+	counting.afterBatch = nil
+	if err := owner.syncProjectionLocked(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if owner.state.StateVersion != 6 || len(owner.state.Products) != 4 {
+		t.Fatalf("after catching up: version %d, %d products; want 6 and 4", owner.state.StateVersion, len(owner.state.Products))
 	}
 }
 
