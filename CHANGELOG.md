@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Reject duplicate order and delivery IDs in the memory event store with `ErrInvalidEvent`, as it already does for proposal IDs, so the store keeps these identities unique without relying on the reducer.
+
 - Add a shared EventStore and SnapshotStore contract suite in `tests/storecontract` and run it against the memory stores. It replaces the earlier per-store contract tests and is reusable by the PostgreSQL stores.
 
 - Add FIN1 read-only supply suggestions and coherent private recommendation inputs. Use exact recorded consumption, eligible current stock, fixed seven-day history, three-day threshold and seven-day target, with explicit partial-history coverage. Keep ranking in Serving and require its narrow recommendation permission. Preserve human writeoff semantics and C2/UA1 source artifacts; assembly integration remains separate.

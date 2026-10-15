@@ -21,6 +21,7 @@ func RunEventStore(t *testing.T, f Fixture) {
 		{"expected version", eventsExpectedVersion},
 		{"multi-event batch is atomic and sequential", eventsAtomicBatch},
 		{"event and proposal IDs are unique", eventsUniqueEventAndProposal},
+		{"order and delivery IDs are unique", eventsUniqueOrderAndDelivery},
 		{"read batches boundaries", eventsReadBatchesBoundaries},
 		{"find command and order by proposal", eventsFindLookups},
 		{"canceled context leaves no trace", eventsCanceledAppend},
@@ -156,6 +157,34 @@ func eventsUniqueEventAndProposal(t *testing.T, f Fixture) {
 		}
 	}
 	assertVersion(t, events, 1)
+}
+
+func eventsUniqueOrderAndDelivery(t *testing.T, f Fixture) {
+	for _, c := range []struct {
+		name  string
+		batch domain.CommandBatch
+	}{
+		{"order ID", orderBatch("confirm-2", "order-event-2", "order-1", "proposal-2", 2)},
+		{"delivery ID", deliveryBatch("receive-2", "fp-r2", "delivery-1", "batch-2", "delivery-event-2", 2, false)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			events := f.open(t).Events
+			if _, err := events.AppendBatch(ctx, orderBatch("confirm-1", "order-event-1", "order-1", "proposal-1", 0)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := events.AppendBatch(ctx, deliveryBatch("receive-1", "fp-r1", "delivery-1", "batch-1", "delivery-event-1", 1, false)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := events.AppendBatch(ctx, c.batch); !errors.Is(err, domain.ErrInvalidEvent) {
+				t.Fatalf("AppendBatch(duplicate %s) error = %v; want ErrInvalidEvent", c.name, err)
+			}
+			if _, ok, err := events.FindCommand(ctx, c.batch.CommandID); err != nil || ok {
+				t.Fatalf("FindCommand(%s) = %v, %v; rejected duplicate must leave no command", c.batch.CommandID, ok, err)
+			}
+			assertVersion(t, events, 2)
+		})
+	}
 }
 
 func eventsReadBatchesBoundaries(t *testing.T, f Fixture) {

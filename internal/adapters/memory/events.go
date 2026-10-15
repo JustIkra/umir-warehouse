@@ -15,6 +15,8 @@ type EventStore struct {
 	commands  map[string]storedCommand
 	eventIDs  map[string]struct{}
 	proposals map[string]domain.Order
+	orderIDs  map[string]struct{}
+	delivered map[string]struct{}
 }
 
 type storedCommand struct {
@@ -27,6 +29,8 @@ func NewEventStore() *EventStore {
 		commands:  map[string]storedCommand{},
 		eventIDs:  map[string]struct{}{},
 		proposals: map[string]domain.Order{},
+		orderIDs:  map[string]struct{}{},
+		delivered: map[string]struct{}{},
 	}
 }
 
@@ -95,6 +99,14 @@ func (s *EventStore) AppendBatch(ctx context.Context, batch domain.CommandBatch)
 		if _, exists := s.proposals[proposalID]; exists {
 			return domain.AppendResult{}, domain.ErrInvalidEvent
 		}
+		if _, exists := s.orderIDs[result.Order.OrderID]; exists {
+			return domain.AppendResult{}, domain.ErrInvalidEvent
+		}
+	}
+	if result.Delivery != nil {
+		if _, exists := s.delivered[result.Delivery.DeliveryID]; exists {
+			return domain.AppendResult{}, domain.ErrInvalidEvent
+		}
 	}
 	record := domain.CommandRecord{
 		CommandID:          batch.CommandID,
@@ -111,6 +123,10 @@ func (s *EventStore) AppendBatch(ctx context.Context, batch domain.CommandBatch)
 	}
 	if proposalID != "" {
 		s.proposals[proposalID] = domain.CloneOrder(*result.Order)
+		s.orderIDs[result.Order.OrderID] = struct{}{}
+	}
+	if result.Delivery != nil {
+		s.delivered[result.Delivery.DeliveryID] = struct{}{}
 	}
 	s.version = recorded.FinalSequence
 	return domain.AppendResult{Batch: domain.CloneRecordedBatch(storedBatch), Command: domain.CloneCommandRecord(storedRecord)}, nil
