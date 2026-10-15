@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -18,6 +19,7 @@ type SnapshotWorker struct {
 	savedSequence  int64
 	notify         chan struct{}
 	onSaved        func(int64)
+	verify         func(context.Context, domain.Snapshot) error
 }
 
 // SnapshotSaveError identifies a failed SnapshotStore save and preserves its cause.
@@ -64,21 +66,32 @@ func (w *SnapshotWorker) RunOnce(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	candidate := domain.CloneSnapshot(*w.pending)
+	verify := w.verify
 	w.pending = nil
 	w.active = true
 	w.activeSequence = candidate.LastSequence
 	w.mu.Unlock()
 
-	err := w.store.Save(ctx, candidate)
+	var verifyErr error
+	if verify != nil {
+		verifyErr = verify(ctx, candidate)
+	}
+	err := verifyErr
+	if err == nil {
+		err = w.store.Save(ctx, candidate)
+	}
+	// A candidate that contradicts the journal is dropped, not retried: the
+	// owner offers a newer one with its next write.
+	rejected := errors.Is(verifyErr, domain.ErrInvalidSnapshot)
 	w.mu.Lock()
 	w.active = false
 	w.activeSequence = 0
 	acknowledge := w.onSaved
-	if err != nil {
+	if err != nil && !rejected {
 		if w.pending == nil || w.pending.LastSequence < candidate.LastSequence {
 			w.pending = &candidate
 		}
-	} else if candidate.LastSequence > w.savedSequence {
+	} else if err == nil && candidate.LastSequence > w.savedSequence {
 		w.savedSequence = candidate.LastSequence
 	}
 	more := w.pending != nil
@@ -131,6 +144,12 @@ func (w *SnapshotWorker) setOnSaved(callback func(int64)) {
 	w.mu.Unlock()
 }
 
+func (w *SnapshotWorker) setVerifier(verify func(context.Context, domain.Snapshot) error) {
+	w.mu.Lock()
+	w.verify = verify
+	w.mu.Unlock()
+}
+
 func (w *SnapshotWorker) observeSaved(sequence int64) {
 	w.mu.Lock()
 	if sequence > w.savedSequence {
@@ -152,6 +171,54 @@ func (o *Owner) ConfigureSnapshots(store SnapshotStore, eventsPerSnapshot int64)
 	o.snapshotEvery = eventsPerSnapshot
 	o.snapshotWorker = NewSnapshotWorker(store)
 	o.snapshotWorker.setOnSaved(o.confirmSnapshotSaved)
+	events := o.events
+	o.snapshotWorker.setVerifier(func(ctx context.Context, candidate domain.Snapshot) error {
+		return verifySnapshot(ctx, events, store, candidate)
+	})
+	return nil
+}
+
+var errCandidateReached = errors.New("candidate sequence reached")
+
+// verifySnapshot checks a candidate against the journal once, before it is
+// saved and outside the owner's lock: the previous valid snapshot plus the
+// journal up to the candidate must give the candidate's state. A previous
+// snapshot that cannot show this may itself be wrong, so the candidate is then
+// judged from the start of the journal.
+func verifySnapshot(ctx context.Context, events EventStore, snapshots SnapshotStore, candidate domain.Snapshot) error {
+	previous, found, err := snapshots.LoadLatest(ctx)
+	if err != nil {
+		return err
+	}
+	if found && previous.LastSequence <= candidate.LastSequence && domain.ValidateSnapshot(previous) == nil {
+		// The store returns a copy, so replaying onto it is safe.
+		err := replayToCandidate(ctx, events, previous.State, candidate)
+		if err == nil || isContextErr(err) {
+			return err
+		}
+	}
+	return replayToCandidate(ctx, events, domain.InventoryState{}, candidate)
+}
+
+func replayToCandidate(ctx context.Context, events EventStore, state domain.InventoryState, candidate domain.Snapshot) error {
+	target := candidate.LastSequence
+	if state.StateVersion < target {
+		err := events.ScanBatches(ctx, state.StateVersion, func(batch domain.RecordedBatch) error {
+			if err := state.ApplyBatch(batch); err != nil {
+				return err
+			}
+			if state.StateVersion >= target {
+				return errCandidateReached
+			}
+			return nil
+		})
+		if err != nil && !errors.Is(err, errCandidateReached) {
+			return err
+		}
+	}
+	if state.StateVersion != target || !domain.EqualInventoryState(state, candidate.State) {
+		return fmt.Errorf("%w: snapshot at sequence %d does not match the journal", domain.ErrInvalidSnapshot, target)
+	}
 	return nil
 }
 
