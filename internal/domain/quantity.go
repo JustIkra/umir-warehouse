@@ -18,20 +18,31 @@ func AddQuantity(a, b Quantity) (Quantity, error) {
 	return Quantity(left + right), nil
 }
 
-func ValidateInventoryTotals(state InventoryState) error {
+// ValidateInventoryTotalsWith checks the per-product stock totals of state with
+// the batches of delta substituted for the ones they replace, without copying
+// the state.
+func ValidateInventoryTotalsWith(state *InventoryState, delta StateDelta) error {
 	totals := make(map[string]Quantity)
-	for _, batch := range state.Batches {
+	add := func(batch Batch) error {
 		if batch.RemainingQuantity < 0 {
 			return ErrInvalidQuantity
 		}
-		if batch.RemainingQuantity == 0 {
+		total, err := AddQuantity(totals[batch.ProductID], batch.RemainingQuantity)
+		totals[batch.ProductID] = total
+		return err
+	}
+	for id, batch := range state.Batches {
+		if _, replaced := delta.Batches[id]; replaced {
 			continue
 		}
-		total, err := AddQuantity(totals[batch.ProductID], batch.RemainingQuantity)
-		if err != nil {
+		if err := add(batch); err != nil {
 			return err
 		}
-		totals[batch.ProductID] = total
+	}
+	for _, batch := range delta.Batches {
+		if err := add(batch); err != nil {
+			return err
+		}
 	}
 	return nil
 }

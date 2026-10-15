@@ -145,15 +145,19 @@ func (o *Owner) CommitAcceptedOrder(ctx context.Context, request contract.Commit
 			}
 			return contract.CommitResult{}, inventoryUnavailable(err)
 		}
-		if recorded, exists := prepared.State.Commands[request.CommandID]; exists {
-			return recordedCommitOrder(recorded, fingerprint)
+		result, found, err = o.findRecordedCommitOrder(ctx, request.CommandID, fingerprint)
+		if err != nil {
+			return contract.CommitResult{}, err
 		}
-		if orderID, exists := prepared.State.OrdersByProposal[request.ProposalID]; exists {
-			order, found := prepared.State.Orders[orderID]
-			if !found {
-				return contract.CommitResult{}, domain.ErrInvalidRecordedBatch
-			}
-			publicOrder := toContractOrder(order)
+		if found {
+			return result, nil
+		}
+		existing, found, err = o.events.FindOrderByProposal(ctx, request.ProposalID)
+		if err != nil {
+			return contract.CommitResult{}, err
+		}
+		if found {
+			publicOrder := toContractOrder(existing)
 			return contract.CommitResult{Kind: contract.CommitResultOrderCommitted, Order: &publicOrder}, nil
 		}
 		evaluation, allocations, err := domain.EvaluatePositionsWithAllocations(prepared.State, acceptedAsPositions(requested))
@@ -174,7 +178,7 @@ func (o *Owner) CommitAcceptedOrder(ctx context.Context, request contract.Commit
 		order := domain.Order{OrderID: orderID, ProposalID: request.ProposalID, AcceptedPositions: accepted, Allocations: allocations, PlacedAt: prepared.EvaluatedAt}
 		event := domain.Event{EventID: eventID, RecordedAt: prepared.EvaluatedAt, Type: domain.EventOrderPlaced, Payload: domain.EventPayload{Order: &order}}
 		command := domain.CommandBatch{ExpectedVersion: prepared.State.StateVersion, CommandID: request.CommandID, CommandType: "ConfirmOrder", CommandFingerprint: fingerprint, Events: []domain.Event{event}}
-		if _, err := domain.ApplyRecordedBatch(prepared.State, asRecordedBatch(command)); err != nil {
+		if _, err := domain.PlanBatch(&o.state, asRecordedBatch(command)); err != nil {
 			if errors.Is(err, domain.ErrDishNotFound) {
 				return contract.CommitResult{}, contract.ErrDishNotFound
 			}

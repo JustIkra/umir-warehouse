@@ -59,8 +59,18 @@ func TestSnapshotFullCommandBoundary(t *testing.T) {
 	inside := domain.CloneSnapshot(snapshot)
 	inside.LastSequence = 3
 	inside.State.StateVersion = 3
-	if err := auditSnapshotPrefix(inside, batches); err == nil {
-		t.Fatal("snapshot candidate at sequence 3 inside the compound command was accepted")
+	restored, err := NewOwner(store, func() time.Time { return moscowTime(2026, time.April, 1, 10) }, nextTestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.ConfigureSnapshots(&fixedSnapshotStore{snapshot: inside, found: true}, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if restored.lastSavedSequence != 0 || restored.state.StateVersion != 4 {
+		t.Fatalf("snapshot inside the compound command: accepted sequence %d, recovered version %d; want full replay to version 4", restored.lastSavedSequence, restored.state.StateVersion)
 	}
 }
 
@@ -226,8 +236,7 @@ func (s *failOnceSnapshotStore) Save(ctx context.Context, snapshot domain.Snapsh
 
 func emptySnapshot(sequence int64) domain.Snapshot {
 	product := domain.Product{ProductID: "p", Name: "Product", BaseUnit: domain.BaseUnitG}
-	record := domain.CommandRecord{CommandID: "c", CommandType: "RegisterProduct", CommandFingerprint: "fingerprint", Result: domain.CommandResult{Kind: domain.CommandResultProductRegistered, Product: &product}}
-	return domain.Snapshot{SchemaVersion: domain.InventorySchemaV1, StreamID: domain.InventoryStreamID, LastSequence: sequence, State: domain.InventoryState{Products: map[string]domain.Product{"p": product}, Dishes: map[string]domain.Dish{}, Deliveries: map[string]domain.Delivery{}, Batches: map[string]domain.Batch{}, Orders: map[string]domain.Order{}, OrdersByProposal: map[string]string{}, Commands: map[string]domain.CommandRecord{"c": record}, StateVersion: sequence}}
+	return domain.Snapshot{SchemaVersion: domain.SnapshotSchemaV2, StreamID: domain.InventoryStreamID, LastSequence: sequence, State: domain.InventoryState{Products: map[string]domain.Product{"p": product}, Dishes: map[string]domain.Dish{}, DeliveryIDs: map[string]struct{}{}, Batches: map[string]domain.Batch{}, StateVersion: sequence}}
 }
 
 func storeWithCompoundDeliveryExpiry(t *testing.T) *memory.EventStore {

@@ -51,14 +51,15 @@ func TestW3BoundaryBeforeSchedulerAndConcurrentWriteoff(t *testing.T) {
 	if !b.PendingWriteoff || b.RemainingQuantity != 4000 || b.WrittenOffForExpiry != 0 || state.StateVersion != before+1 {
 		t.Fatalf("pending: %+v", b)
 	}
-	snapshot := domain.Snapshot{SchemaVersion: 1, StreamID: domain.InventoryStreamID, LastSequence: state.StateVersion, State: state.State}
+	snapshot := domain.Snapshot{SchemaVersion: domain.SnapshotSchemaV2, StreamID: domain.InventoryStreamID, LastSequence: state.StateVersion, State: state.State}
 	if err := domain.ValidateSnapshot(snapshot); err != nil {
 		t.Fatal(err)
 	}
 	clone := domain.CloneSnapshot(snapshot)
-	v := clone.State.Commands["expiration/pending/batch"]
-	v.Result.Pending.RemainingQuantity = 1
-	if snapshot.State.Commands["expiration/pending/batch"].Result.Pending.RemainingQuantity != 4000 {
+	corrupt := clone.State.Batches["batch"]
+	corrupt.RemainingQuantity = 1
+	clone.State.Batches["batch"] = corrupt
+	if snapshot.State.Batches["batch"].RemainingQuantity != 4000 {
 		t.Fatal("pending alias")
 	}
 	if err := domain.ValidateSnapshot(clone); err == nil {
@@ -125,7 +126,7 @@ func TestW3BoundaryBeforeSchedulerAndConcurrentWriteoff(t *testing.T) {
 	if b.RemainingQuantity != 0 || b.WrittenOffForExpiry != 4000 || b.ConsumedByOrders != 6000 {
 		t.Fatalf("replay conservation=%+v", b)
 	}
-	snapshot = domain.Snapshot{SchemaVersion: 1, StreamID: domain.InventoryStreamID, LastSequence: state.StateVersion, State: state.State}
+	snapshot = domain.Snapshot{SchemaVersion: domain.SnapshotSchemaV2, StreamID: domain.InventoryStreamID, LastSequence: state.StateVersion, State: state.State}
 	if err := domain.ValidateSnapshot(snapshot); err != nil {
 		t.Fatal(err)
 	}

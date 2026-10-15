@@ -188,7 +188,7 @@ func (o *Owner) offerSnapshotLocked() {
 		return
 	}
 	snapshot := domain.Snapshot{
-		SchemaVersion: domain.InventorySchemaV1,
+		SchemaVersion: domain.SnapshotSchemaV2,
 		StreamID:      domain.InventoryStreamID,
 		LastSequence:  o.state.StateVersion,
 		State:         domain.CloneInventoryState(o.state),

@@ -40,20 +40,17 @@ func (o *Owner) syncProjectionLocked(ctx context.Context) error {
 		o.usable = false
 		return err
 	}
-	state := domain.CloneInventoryState(o.state)
-	index := cloneExpirationIndex(o.expirations)
 	for _, batch := range batches {
-		state, index, err = applyProjectionBatch(state, index, batch)
-		if err != nil {
+		if err := o.applyBatchLocked(batch); err != nil {
 			o.usable = false
 			return o.recoverCurrentLocked(ctx)
 		}
 	}
-	if state.StateVersion != version {
+	if o.state.StateVersion != version {
 		o.usable = false
 		return o.recoverCurrentLocked(ctx)
 	}
-	o.publishProjection(state, index)
+	o.publishProjection()
 	return nil
 }
 
@@ -102,33 +99,36 @@ func (o *Owner) recoverLocked(ctx context.Context) error {
 			return err
 		}
 	}
-	state := domain.InventoryState{}
-	startSequence := int64(0)
-	if hasCandidate && candidate.LastSequence <= version && auditSnapshotPrefix(candidate, batches) == nil {
-		state = domain.CloneInventoryState(candidate.State)
-		startSequence = candidate.LastSequence
-		o.lastSavedSequence = max(o.lastSavedSequence, candidate.LastSequence)
-		o.snapshotWorker.observeSaved(candidate.LastSequence)
-	}
-	for _, batch := range batches {
-		if batch.FinalSequence <= startSequence {
-			continue
+	state, usedSnapshot := domain.InventoryState{}, false
+	if hasCandidate && candidate.LastSequence <= version && domain.ValidateSnapshot(candidate) == nil {
+		fromSnapshot := domain.CloneInventoryState(candidate.State)
+		if replayAfter(&fromSnapshot, batches, candidate.LastSequence) == nil && fromSnapshot.StateVersion == version {
+			state, usedSnapshot = fromSnapshot, true
+			o.lastSavedSequence = max(o.lastSavedSequence, candidate.LastSequence)
+			o.snapshotWorker.observeSaved(candidate.LastSequence)
 		}
-		state, err = domain.ApplyRecordedBatch(state, batch)
-		if err != nil {
+	}
+	if !usedSnapshot {
+		if err := replayAfter(&state, batches, 0); err != nil {
 			return err
 		}
-	}
-	if state.StateVersion != version {
-		return domain.ErrInvalidRecordedBatch
+		if state.StateVersion != version {
+			return domain.ErrInvalidRecordedBatch
+		}
 	}
 	index, err := expirationIndex(state)
 	if err != nil {
 		return err
 	}
-	o.publishProjection(state, index)
+	o.state, o.expirations = state, index
+	o.publishProjection()
 	if o.pending != nil {
-		if record, found := state.Commands[o.pending.CommandID]; found {
+		record, found, err := o.events.FindCommand(ctx, o.pending.CommandID)
+		if err != nil {
+			o.usable = false
+			return err
+		}
+		if found {
 			if record.CommandType != o.pending.CommandType || record.CommandFingerprint != o.pending.CommandFingerprint {
 				o.usable = false
 				return domain.ErrCommandIdentityConflict
@@ -139,9 +139,19 @@ func (o *Owner) recoverLocked(ctx context.Context) error {
 	return nil
 }
 
-func (o *Owner) publishProjection(state domain.InventoryState, index map[string]time.Time) {
-	o.state = state
-	o.expirations = index
+func replayAfter(state *domain.InventoryState, batches []domain.RecordedBatch, after int64) error {
+	for _, batch := range batches {
+		if batch.FinalSequence <= after {
+			continue
+		}
+		if err := state.ApplyBatch(batch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (o *Owner) publishProjection() {
 	o.usable = true
 	o.offerSnapshotLocked()
 }
@@ -193,10 +203,6 @@ func validateJournalContext(ctx context.Context, batches []domain.RecordedBatch,
 	return nil
 }
 
-func auditSnapshotPrefix(snapshot domain.Snapshot, batches []domain.RecordedBatch) error {
-	return domain.ValidateSnapshotPrefix(snapshot, batches)
-}
-
 func expirationIndex(state domain.InventoryState) (map[string]time.Time, error) {
 	index := make(map[string]time.Time)
 	for batchID, batch := range state.Batches {
@@ -210,55 +216,32 @@ func expirationIndex(state domain.InventoryState) (map[string]time.Time, error) 
 	return index, nil
 }
 
-func applyProjectionBatch(state domain.InventoryState, index map[string]time.Time, batch domain.RecordedBatch) (domain.InventoryState, map[string]time.Time, error) {
-	next, err := domain.ApplyRecordedBatch(state, batch)
-	if err != nil {
-		return domain.InventoryState{}, nil, err
-	}
-	updated := cloneExpirationIndex(index)
-	for _, event := range batch.Events {
-		switch event.Type {
-		case domain.EventDeliveryReceived:
-			for _, registered := range event.Payload.Batches {
-				if batch, exists := next.Batches[registered.BatchID]; exists && batch.RemainingQuantity > 0 && !batch.PendingWriteoff {
-					updated[registered.BatchID] = batch.ExpiresAt
-				} else {
-					delete(updated, registered.BatchID)
-				}
-			}
-		case domain.EventOrderPlaced:
-			for _, allocation := range event.Payload.Order.Allocations {
-				if batch, exists := next.Batches[allocation.BatchID]; exists && batch.RemainingQuantity > 0 && !batch.PendingWriteoff {
-					updated[allocation.BatchID] = batch.ExpiresAt
-				} else {
-					delete(updated, allocation.BatchID)
-				}
-			}
-		case domain.EventBatchExpiryPending:
-			delete(updated, event.Payload.Pending.BatchID)
-		case domain.EventBatchWriteoffConfirmed:
-			delete(updated, event.Payload.Writeoff.BatchID)
-		case domain.EventBatchExpired:
-			delete(updated, event.Payload.Expiry.BatchID)
-		}
-	}
-	return next, updated, nil
-}
-
-func cloneExpirationIndex(index map[string]time.Time) map[string]time.Time {
-	cloned := make(map[string]time.Time, len(index))
-	for batchID, dueAt := range index {
-		cloned[batchID] = dueAt
-	}
-	return cloned
-}
-
-func (o *Owner) applyCommittedBatch(batch domain.RecordedBatch) error {
-	state, index, err := applyProjectionBatch(o.state, o.expirations, batch)
+// applyBatchLocked applies one recorded batch to the state and the expiration
+// index in place. The batch is planned first, so a rejected batch changes nothing.
+func (o *Owner) applyBatchLocked(batch domain.RecordedBatch) error {
+	delta, err := domain.PlanBatch(&o.state, batch)
 	if err != nil {
 		return err
 	}
-	o.publishProjection(state, index)
+	o.state.Merge(delta)
+	if o.expirations == nil {
+		o.expirations = make(map[string]time.Time, len(delta.Batches))
+	}
+	for batchID, b := range delta.Batches {
+		if b.RemainingQuantity > 0 && !b.PendingWriteoff {
+			o.expirations[batchID] = b.ExpiresAt
+		} else {
+			delete(o.expirations, batchID)
+		}
+	}
+	return nil
+}
+
+func (o *Owner) applyCommittedBatch(batch domain.RecordedBatch) error {
+	if err := o.applyBatchLocked(batch); err != nil {
+		return err
+	}
+	o.publishProjection()
 	return nil
 }
 

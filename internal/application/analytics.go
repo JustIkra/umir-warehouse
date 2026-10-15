@@ -231,8 +231,7 @@ func (a *Analytics) Movements(ctx context.Context, request contract.AnalyticsReq
 		if err := ctx.Err(); err != nil {
 			return contract.MovementReport{}, err
 		}
-		state, err = domain.ApplyRecordedBatch(state, b)
-		if err != nil {
+		if err := state.ApplyBatch(b); err != nil {
 			return contract.MovementReport{}, inventoryUnavailable(err)
 		}
 	}

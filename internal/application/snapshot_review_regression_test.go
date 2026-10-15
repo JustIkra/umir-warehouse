@@ -41,7 +41,7 @@ func TestRunRetriesUnknownCommittedCandidate(t *testing.T) {
 	}
 }
 
-func TestSnapshotAuditRejectsExpiryBeforeLaterOrder(t *testing.T) {
+func TestReorderedJournalFailsFullReplay(t *testing.T) {
 	ctx := context.Background()
 	due := moscowTime(2026, time.April, 2, 10)
 	store := seedStore(t, due, 10000, 6000)
@@ -51,14 +51,6 @@ func TestSnapshotAuditRejectsExpiryBeforeLaterOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state := domain.InventoryState{}
-	for _, batch := range batches {
-		state, err = domain.ApplyRecordedBatch(state, batch)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	candidate := snapshotFor(state)
 	batches[3], batches[4] = batches[4], batches[3]
 	for i := 3; i < 5; i++ {
 		batches[i].Events[0].Sequence = int64(i + 1)
@@ -67,18 +59,14 @@ func TestSnapshotAuditRejectsExpiryBeforeLaterOrder(t *testing.T) {
 	if err := validateJournalContext(context.Background(), batches, 5); err != nil {
 		t.Fatalf("structural journal validation = %v; want sequence-valid reordered prefix", err)
 	}
-	fullReplay := domain.InventoryState{}
+	var fullReplay domain.InventoryState
 	for _, batch := range batches {
-		fullReplay, err = domain.ApplyRecordedBatch(fullReplay, batch)
-		if err != nil {
+		if err = fullReplay.ApplyBatch(batch); err != nil {
 			break
 		}
 	}
-	if err == nil {
-		t.Fatal("reordered journal unexpectedly passed full replay")
-	}
-	if err := auditSnapshotPrefix(candidate, batches); err == nil {
-		t.Fatal("snapshot audit accepted expiry 4000 before order 6000 from a 10000 receipt")
+	if !errors.Is(err, domain.ErrInvalidEvent) {
+		t.Fatalf("full replay error = %v; want ErrInvalidEvent for expiry 4000 before order 6000 from a 10000 receipt", err)
 	}
 }
 

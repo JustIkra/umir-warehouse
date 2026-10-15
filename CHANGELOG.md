@@ -2,6 +2,10 @@
 
 ## Не выпущено
 
+- Apply recorded batches through a change layer: `PlanBatch` validates against the state plus the earlier events of the same batch and returns a small `StateDelta`, `Merge` writes it in, and `ApplyBatch` does both. A rejected batch leaves the state untouched and applying one batch no longer copies the state or depends on the order history. The owner updates the expiration index in place and checks order and command identity through the event store instead of its state; the duplicate command, order and proposal checks leave the reducer because the store already enforces them.
+
+- **BREAKING:** Drop order and command history from `InventoryState`, which now holds products, dishes, delivery IDs and batches. Snapshots use the new `SnapshotSchemaV2` and no longer carry orders, commands or delivery lines; the structural check covers dishes, batches (balance, times, product, delivery) and delivery IDs, and recovery applies the journal tail on top of a snapshot, falling back to a full replay when it does not fit. The old snapshot schema is rejected with `ErrUnsupportedSchema`. Snapshots were only kept in memory, so there is nothing to migrate: after a restart the owner replays the journal.
+
 - Add bounded reads to the EventStore port and the memory store: `ScanBatches` for streaming, `ReadEvents` for a window of events, `ReadPeriod` for events of a time range up to a captured sequence, and `FindOrderPlacement` for the sequence and time of an order's `OrderPlaced` event. Cover them in the shared store contract suite. The memory store now finds batch boundaries by binary search.
 
 - Reject duplicate order and delivery IDs in the memory event store with `ErrInvalidEvent`, as it already does for proposal IDs, so the store keeps these identities unique without relying on the reducer.

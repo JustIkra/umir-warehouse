@@ -1,47 +1,121 @@
 package domain
 
 import (
+	"maps"
 	"math"
 	"time"
 )
 
-func ApplyRecordedBatch(state InventoryState, batch RecordedBatch) (InventoryState, error) {
+// StateDelta is the change layer one recorded batch makes to an InventoryState:
+// only the records it created or replaced.
+type StateDelta struct {
+	Products     map[string]Product
+	Dishes       map[string]Dish
+	DeliveryIDs  map[string]struct{}
+	Batches      map[string]Batch
+	StateVersion int64
+}
+
+// PlanBatch validates the batch against state and returns the change it makes.
+// It never modifies state; events see the changes of the earlier events of the
+// same batch. On error nothing is returned.
+func PlanBatch(state *InventoryState, batch RecordedBatch) (StateDelta, error) {
 	if len(batch.Events) == 0 {
-		return InventoryState{}, ErrInvalidEventBatch
+		return StateDelta{}, ErrInvalidEventBatch
 	}
 	if batch.CommandID == "" || batch.CommandType == "" || batch.CommandFingerprint == "" {
-		return InventoryState{}, ErrInvalidRecordedBatch
+		return StateDelta{}, ErrInvalidRecordedBatch
 	}
 	if state.StateVersion < 0 || state.StateVersion == math.MaxInt64 || int64(len(batch.Events)) > math.MaxInt64-state.StateVersion || batch.FinalSequence != batch.Events[len(batch.Events)-1].Sequence {
-		return InventoryState{}, ErrInvalidRecordedBatch
+		return StateDelta{}, ErrInvalidRecordedBatch
 	}
-	next := CloneInventoryState(state)
-	ensureStateMaps(&next)
-	if _, exists := next.Commands[batch.CommandID]; exists {
-		return InventoryState{}, ErrCommandIdentityConflict
-	}
-	expected := next.StateVersion + 1
+	layer := stateLayer{base: state}
+	expected := state.StateVersion + 1
 	for _, event := range batch.Events {
 		if err := ValidateRecordedEvent(event, batch, expected); err != nil {
-			return InventoryState{}, err
+			return StateDelta{}, err
 		}
-		if err := applyEvent(&next, event); err != nil {
-			return InventoryState{}, err
+		if err := applyEvent(&layer, event); err != nil {
+			return StateDelta{}, err
 		}
-		next.StateVersion = event.Sequence
+		layer.delta.StateVersion = event.Sequence
 		expected++
 	}
-	result, err := ResultForBatch(batch)
+	if _, err := ResultForBatch(batch); err != nil {
+		return StateDelta{}, err
+	}
+	return layer.delta, nil
+}
+
+// Merge writes the delta into the state.
+func (s *InventoryState) Merge(delta StateDelta) {
+	if s.Products == nil {
+		s.Products = map[string]Product{}
+	}
+	if s.Dishes == nil {
+		s.Dishes = map[string]Dish{}
+	}
+	if s.DeliveryIDs == nil {
+		s.DeliveryIDs = map[string]struct{}{}
+	}
+	if s.Batches == nil {
+		s.Batches = map[string]Batch{}
+	}
+	maps.Copy(s.Products, delta.Products)
+	maps.Copy(s.Dishes, delta.Dishes)
+	maps.Copy(s.DeliveryIDs, delta.DeliveryIDs)
+	maps.Copy(s.Batches, delta.Batches)
+	s.StateVersion = delta.StateVersion
+}
+
+// ApplyBatch plans and merges one recorded batch; a rejected batch leaves the
+// state untouched.
+func (s *InventoryState) ApplyBatch(batch RecordedBatch) error {
+	delta, err := PlanBatch(s, batch)
 	if err != nil {
-		return InventoryState{}, err
+		return err
 	}
-	next.Commands[batch.CommandID] = CommandRecord{
-		CommandID:          batch.CommandID,
-		CommandType:        batch.CommandType,
-		CommandFingerprint: batch.CommandFingerprint,
-		Result:             result,
+	s.Merge(delta)
+	return nil
+}
+
+// stateLayer reads through the delta first and the base state second, and
+// writes only to the delta.
+type stateLayer struct {
+	base  *InventoryState
+	delta StateDelta
+}
+
+func layered[V any](layer, base map[string]V, id string) (V, bool) {
+	if value, ok := layer[id]; ok {
+		return value, true
 	}
-	return next, nil
+	value, ok := base[id]
+	return value, ok
+}
+
+func put[V any](layer *map[string]V, id string, value V) {
+	if *layer == nil {
+		*layer = map[string]V{}
+	}
+	(*layer)[id] = value
+}
+
+func (l *stateLayer) product(id string) (Product, bool) {
+	return layered(l.delta.Products, l.base.Products, id)
+}
+
+func (l *stateLayer) dish(id string) (Dish, bool) {
+	return layered(l.delta.Dishes, l.base.Dishes, id)
+}
+
+func (l *stateLayer) batch(id string) (Batch, bool) {
+	return layered(l.delta.Batches, l.base.Batches, id)
+}
+
+func (l *stateLayer) hasDelivery(id string) bool {
+	_, ok := layered(l.delta.DeliveryIDs, l.base.DeliveryIDs, id)
+	return ok
 }
 
 func ResultForBatch(batch RecordedBatch) (CommandResult, error) {
@@ -194,23 +268,23 @@ func validEventPayload(event Event) bool {
 	}
 }
 
-func applyEvent(state *InventoryState, event Event) error {
+func applyEvent(state *stateLayer, event Event) error {
 	switch event.Type {
 	case EventProductRegistered:
 		product := *event.Payload.Product
 		if product.ProductID == "" || product.Name == "" || !validUnit(product.BaseUnit) {
 			return ErrInvalidEvent
 		}
-		if _, exists := state.Products[product.ProductID]; exists {
+		if _, exists := state.product(product.ProductID); exists {
 			return ErrInvalidEvent
 		}
-		state.Products[product.ProductID] = product
+		put(&state.delta.Products, product.ProductID, product)
 	case EventDishDefined:
 		dish := CloneDish(*event.Payload.Dish)
 		if dish.DishID == "" || dish.Name == "" || len(dish.Ingredients) == 0 {
 			return ErrInvalidEvent
 		}
-		if _, exists := state.Dishes[dish.DishID]; exists {
+		if _, exists := state.dish(dish.DishID); exists {
 			return ErrInvalidEvent
 		}
 		ingredientProducts := make(map[string]struct{}, len(dish.Ingredients))
@@ -219,14 +293,14 @@ func applyEvent(state *InventoryState, event Event) error {
 				return ErrInvalidEvent
 			}
 			ingredientProducts[ingredient.ProductID] = struct{}{}
-			if _, exists := state.Products[ingredient.ProductID]; !exists {
+			if _, exists := state.product(ingredient.ProductID); !exists {
 				return ErrProductNotFound
 			}
 			if ingredient.Quantity <= 0 {
 				return ErrInvalidEvent
 			}
 		}
-		state.Dishes[dish.DishID] = dish
+		put(&state.delta.Dishes, dish.DishID, dish)
 	case EventDeliveryReceived:
 		return applyDelivery(state, event.Payload.Delivery, event.Payload.Batches)
 	case EventOrderPlaced:
@@ -243,11 +317,11 @@ func applyEvent(state *InventoryState, event Event) error {
 	return nil
 }
 
-func applyDelivery(state *InventoryState, delivery *Delivery, batches []Batch) error {
+func applyDelivery(state *stateLayer, delivery *Delivery, batches []Batch) error {
 	if delivery == nil || delivery.DeliveryID == "" || delivery.Number == "" || !isBusinessTime(delivery.CreatedAt) || len(delivery.Lines) == 0 || len(delivery.Lines) != len(batches) {
 		return ErrInvalidEvent
 	}
-	if _, exists := state.Deliveries[delivery.DeliveryID]; exists {
+	if state.hasDelivery(delivery.DeliveryID) {
 		return ErrInvalidEvent
 	}
 	for i, registered := range batches {
@@ -258,31 +332,25 @@ func applyDelivery(state *InventoryState, delivery *Delivery, batches []Batch) e
 		if !isBusinessTime(registered.ManufacturedAt) || !isBusinessTime(registered.ReceivedAt) || !isBusinessTime(registered.ExpiresAt) || registered.ShelfLife.Value <= 0 || registered.ShelfLife.Unit != ShelfLifeDay && registered.ShelfLife.Unit != ShelfLifeMonth || !registered.ExpiresAt.After(registered.ManufacturedAt) {
 			return ErrInvalidEvent
 		}
-		if _, exists := state.Products[registered.ProductID]; !exists {
+		if _, exists := state.product(registered.ProductID); !exists {
 			return ErrProductNotFound
 		}
 		if registered.ExpiresAt.IsZero() || registered.BatchID == "" || !validBatchBalance(registered) {
 			return ErrInvalidEvent
 		}
-		if _, exists := state.Batches[registered.BatchID]; exists {
+		if _, exists := state.batch(registered.BatchID); exists {
 			return ErrInvalidEvent
 		}
 	}
-	state.Deliveries[delivery.DeliveryID] = CloneDelivery(*delivery)
+	put(&state.delta.DeliveryIDs, delivery.DeliveryID, struct{}{})
 	for _, batch := range batches {
-		state.Batches[batch.BatchID] = batch
+		put(&state.delta.Batches, batch.BatchID, batch)
 	}
 	return nil
 }
 
-func applyOrder(state *InventoryState, order *Order) error {
+func applyOrder(state *stateLayer, order *Order) error {
 	if order == nil || order.OrderID == "" || order.ProposalID == "" || order.PlacedAt.IsZero() || !isBusinessTime(order.PlacedAt) || len(order.AcceptedPositions) == 0 {
-		return ErrInvalidEvent
-	}
-	if _, exists := state.Orders[order.OrderID]; exists {
-		return ErrInvalidEvent
-	}
-	if _, exists := state.OrdersByProposal[order.ProposalID]; exists {
 		return ErrInvalidEvent
 	}
 	required := map[string]Quantity{}
@@ -290,7 +358,7 @@ func applyOrder(state *InventoryState, order *Order) error {
 		if position.LineNo <= 0 || position.Portions <= 0 {
 			return ErrInvalidEvent
 		}
-		dish, exists := state.Dishes[position.DishID]
+		dish, exists := state.dish(position.DishID)
 		if !exists {
 			return ErrDishNotFound
 		}
@@ -310,7 +378,7 @@ func applyOrder(state *InventoryState, order *Order) error {
 		if allocation.Quantity <= 0 {
 			return ErrInvalidEvent
 		}
-		batch, exists := state.Batches[allocation.BatchID]
+		batch, exists := state.batch(allocation.BatchID)
 		if !exists {
 			return ErrBatchNotFound
 		}
@@ -332,7 +400,7 @@ func applyOrder(state *InventoryState, order *Order) error {
 		}
 	}
 	for _, allocation := range order.Allocations {
-		batch := state.Batches[allocation.BatchID]
+		batch, _ := state.batch(allocation.BatchID)
 		remaining, err := AddQuantity(batch.RemainingQuantity, -allocation.Quantity)
 		if err != nil || remaining < 0 {
 			return ErrInvalidEvent
@@ -342,18 +410,16 @@ func applyOrder(state *InventoryState, order *Order) error {
 		if err != nil || !validBatchBalance(batch) {
 			return ErrInvalidEvent
 		}
-		state.Batches[batch.BatchID] = batch
+		put(&state.delta.Batches, batch.BatchID, batch)
 	}
-	state.Orders[order.OrderID] = CloneOrder(*order)
-	state.OrdersByProposal[order.ProposalID] = order.OrderID
 	return nil
 }
 
-func applyExpiry(state *InventoryState, expiry *ExpiryResult) error {
+func applyExpiry(state *stateLayer, expiry *ExpiryResult) error {
 	if expiry == nil || expiry.BatchID == "" || expiry.ProductID == "" || expiry.WrittenOffQuantity <= 0 || expiry.Reason != ExpiryReasonExpiration || expiry.ExpiresAt.IsZero() || expiry.ProcessedAt.IsZero() {
 		return ErrInvalidEvent
 	}
-	batch, exists := state.Batches[expiry.BatchID]
+	batch, exists := state.batch(expiry.BatchID)
 	if !exists {
 		return ErrBatchNotFound
 	}
@@ -370,7 +436,7 @@ func applyExpiry(state *InventoryState, expiry *ExpiryResult) error {
 	if !validBatchBalance(batch) {
 		return ErrInvalidEvent
 	}
-	state.Batches[batch.BatchID] = batch
+	put(&state.delta.Batches, batch.BatchID, batch)
 	return nil
 }
 
@@ -386,30 +452,6 @@ func validBatchBalance(batch Batch) bool {
 	return err == nil && total == batch.ReceivedQuantity
 }
 
-func ensureStateMaps(state *InventoryState) {
-	if state.Products == nil {
-		state.Products = map[string]Product{}
-	}
-	if state.Dishes == nil {
-		state.Dishes = map[string]Dish{}
-	}
-	if state.Deliveries == nil {
-		state.Deliveries = map[string]Delivery{}
-	}
-	if state.Batches == nil {
-		state.Batches = map[string]Batch{}
-	}
-	if state.Orders == nil {
-		state.Orders = map[string]Order{}
-	}
-	if state.OrdersByProposal == nil {
-		state.OrdersByProposal = map[string]string{}
-	}
-	if state.Commands == nil {
-		state.Commands = map[string]CommandRecord{}
-	}
-}
-
 func validUnit(unit BaseUnit) bool {
 	return unit == BaseUnitG || unit == BaseUnitML || unit == BaseUnitPCS
 }
@@ -422,21 +464,22 @@ func isBusinessTime(value time.Time) bool {
 	return offset == 3*60*60
 }
 
-func applyPending(state *InventoryState, event Event) error {
+func applyPending(state *stateLayer, event Event) error {
 	p := event.Payload.Pending
-	b, ok := state.Batches[p.BatchID]
-	product := state.Products[p.ProductID]
+	b, ok := state.batch(p.BatchID)
+	product, _ := state.product(p.ProductID)
 	if !ok || b.PendingWriteoff || b.RemainingQuantity <= 0 || b.ProductID != p.ProductID || b.RemainingQuantity != p.RemainingQuantity || product.BaseUnit != p.BaseUnit || !b.ExpiresAt.Equal(p.ExpiresAt) || event.RecordedAt.Before(p.ExpiresAt) {
 		return ErrInvalidEvent
 	}
 	b.PendingWriteoff = true
-	state.Batches[b.BatchID] = b
+	put(&state.delta.Batches, b.BatchID, b)
 	return nil
 }
-func applyWriteoff(state *InventoryState, event Event) error {
+func applyWriteoff(state *stateLayer, event Event) error {
 	w := event.Payload.Writeoff
-	b, ok := state.Batches[w.BatchID]
-	if !ok || !b.PendingWriteoff || w.ProductID != b.ProductID || w.WrittenOffQuantity != b.RemainingQuantity || w.WrittenOffQuantity <= 0 || w.BaseUnit != state.Products[b.ProductID].BaseUnit || w.ActorUserID == "" || w.EventID != event.EventID || !w.ConfirmedAt.Equal(event.RecordedAt) || event.RecordedAt.Before(b.ExpiresAt) || w.RestaurantID != event.TenantID || w.RuntimeEpoch != event.RuntimeEpoch || w.StateVersion != event.Sequence || w.OrganizationID == "" || w.TimeZone == "" || w.SettingsVersion == "" {
+	b, ok := state.batch(w.BatchID)
+	product, _ := state.product(b.ProductID)
+	if !ok || !b.PendingWriteoff || w.ProductID != b.ProductID || w.WrittenOffQuantity != b.RemainingQuantity || w.WrittenOffQuantity <= 0 || w.BaseUnit != product.BaseUnit || w.ActorUserID == "" || w.EventID != event.EventID || !w.ConfirmedAt.Equal(event.RecordedAt) || event.RecordedAt.Before(b.ExpiresAt) || w.RestaurantID != event.TenantID || w.RuntimeEpoch != event.RuntimeEpoch || w.StateVersion != event.Sequence || w.OrganizationID == "" || w.TimeZone == "" || w.SettingsVersion == "" {
 		return ErrInvalidEvent
 	}
 	b.RemainingQuantity = 0
@@ -446,6 +489,6 @@ func applyWriteoff(state *InventoryState, event Event) error {
 	if err != nil || !validBatchBalance(b) {
 		return ErrInvalidEvent
 	}
-	state.Batches[b.BatchID] = b
+	put(&state.delta.Batches, b.BatchID, b)
 	return nil
 }

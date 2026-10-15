@@ -83,7 +83,7 @@ func (o *Owner) ConfirmWriteoff(ctx context.Context, request contract.ConfirmWri
 		w := domain.WriteoffResult{BatchID: batch.BatchID, ProductID: batch.ProductID, WrittenOffQuantity: batch.RemainingQuantity, BaseUnit: prepared.State.Products[batch.ProductID].BaseUnit, ActorUserID: request.ActorUserID, ConfirmedAt: prepared.EvaluatedAt, EventID: eventID, OrganizationID: o.scope.OrganizationID, RestaurantID: o.scope.RestaurantID, RuntimeEpoch: o.scope.RuntimeEpoch, TimeZone: captured.TimeZone, SettingsVersion: captured.SettingsVersion, StateVersion: prepared.StateVersion + 1}
 		event := domain.Event{EventID: eventID, TenantID: o.scope.RestaurantID, RuntimeEpoch: o.scope.RuntimeEpoch, SchemaVersion: domain.InventorySchemaV2, RecordedAt: prepared.EvaluatedAt, Type: domain.EventBatchWriteoffConfirmed, Payload: domain.EventPayload{Writeoff: &w}}
 		command := domain.CommandBatch{ExpectedVersion: prepared.StateVersion, CommandID: request.CommandID, CommandType: "ConfirmWriteoff", CommandFingerprint: fingerprint, Events: []domain.Event{event}}
-		if _, err := domain.ApplyRecordedBatch(prepared.State, asRecordedBatch(command)); err != nil {
+		if _, err := domain.PlanBatch(&o.state, asRecordedBatch(command)); err != nil {
 			return contract.WriteoffResult{}, err
 		}
 		record, found, err = o.appendOwnerCommandLocked(ctx, command)

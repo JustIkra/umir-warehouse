@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"sync"
 	"testing"
@@ -162,7 +163,7 @@ func TestAcceptanceConcurrentDuplicateDeliverySurvivesRecovery(t *testing.T) {
 		t.Fatalf("recovered duplicate command error = %v; want DeliveryAlreadyReceived", err)
 	}
 	versionAfter, err := store.Version(ctx)
-	if err != nil || versionAfter != versionBefore || len(recovered.state.Deliveries) != 1 || len(recovered.state.Batches) != 1 || recovered.state.Batches["owner-event-2"].RemainingQuantity != 1000 {
+	if err != nil || versionAfter != versionBefore || len(recovered.state.DeliveryIDs) != 1 || len(recovered.state.Batches) != 1 || recovered.state.Batches["owner-event-2"].RemainingQuantity != 1000 {
 		t.Fatalf("post-recovery duplicate version/state = %d, %#v, %v; want one unchanged delivery and stock", versionAfter, recovered.state, err)
 	}
 }
@@ -251,8 +252,8 @@ func TestAcceptanceConcurrentDuplicateDeliveryAcrossOwners(t *testing.T) {
 		t.Fatalf("recovered losing command retry = %v; want DeliveryAlreadyReceived", err)
 	}
 	versionAfterRetry, err := base.Version(ctx)
-	if err != nil || versionAfterRetry != versionBeforeRetry || len(recovered.state.Deliveries) != 1 || len(recovered.state.Batches) != 1 {
-		t.Fatalf("journal/projection after recovered loser retry = version %d, deliveries %d, batches %d, err %v; want unchanged single delivery", versionAfterRetry, len(recovered.state.Deliveries), len(recovered.state.Batches), err)
+	if err != nil || versionAfterRetry != versionBeforeRetry || len(recovered.state.DeliveryIDs) != 1 || len(recovered.state.Batches) != 1 {
+		t.Fatalf("journal/projection after recovered loser retry = version %d, deliveries %d, batches %d, err %v; want unchanged single delivery", versionAfterRetry, len(recovered.state.DeliveryIDs), len(recovered.state.Batches), err)
 	}
 	for batchID, batch := range recovered.state.Batches {
 		if batch.RemainingQuantity != 1000 {
@@ -391,7 +392,7 @@ func TestAcceptanceCatalogEventsAdvanceVersionWithoutChangingTasks(t *testing.T)
 	if _, err := owner.ReceiveDelivery(ctx, request); err != nil {
 		t.Fatal(err)
 	}
-	wantTasks := cloneExpirationIndex(owner.expirations)
+	wantTasks := maps.Clone(owner.expirations)
 	if len(wantTasks) != 1 {
 		t.Fatalf("setup expiration tasks = %#v; want one", wantTasks)
 	}
@@ -584,12 +585,15 @@ func TestAcceptanceReplayRestoresEveryResultKindWithoutNewDecisions(t *testing.T
 	if clockCalls != 0 || idCalls != 0 {
 		t.Fatalf("replay called clock/ID %d/%d times; want no new time, ID, or decision inputs", clockCalls, idCalls)
 	}
-	if len(replayed.state.Commands) != len(wantKinds) || replayed.state.StateVersion != batches[len(batches)-1].FinalSequence {
-		t.Fatalf("replayed command count/version = %d/%d; want %d commands through final sequence %d", len(replayed.state.Commands), replayed.state.StateVersion, len(wantKinds), batches[len(batches)-1].FinalSequence)
+	if len(batches) != len(wantKinds) || replayed.state.StateVersion != batches[len(batches)-1].FinalSequence {
+		t.Fatalf("journal command count/replayed version = %d/%d; want %d commands through final sequence %d", len(batches), replayed.state.StateVersion, len(wantKinds), batches[len(batches)-1].FinalSequence)
 	}
 	for _, batch := range batches {
 		kind, expected := wantKinds[batch.CommandID]
-		record, found := replayed.state.Commands[batch.CommandID]
+		record, found, err := replayed.FindRecordedCommand(ctx, batch.CommandID)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !expected || !found || record.CommandType != batch.CommandType || record.CommandFingerprint != batch.CommandFingerprint || record.Result.Kind != kind {
 			t.Fatalf("replayed command %q = %#v; want result kind %q and journal fingerprint %q", batch.CommandID, record, kind, batch.CommandFingerprint)
 		}
