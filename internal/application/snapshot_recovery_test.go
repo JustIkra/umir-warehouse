@@ -228,3 +228,7 @@ func (s *editedBatchesStore) ReadBatches(ctx context.Context, sequence int64) ([
 	}
 	return batches, err
 }
+
+func (s *editedBatchesStore) ScanBatches(ctx context.Context, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	return scanViaRead(ctx, s, afterSequence, fn)
+}

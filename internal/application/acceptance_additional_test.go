@@ -105,11 +105,20 @@ func TestAcceptanceFailedReconciliationBlocksAdmissionAndRepairs(t *testing.T) {
 			t.Fatalf("failed reconciliation changed old expiration index: %#v", owner.expirations)
 		}
 	}
-	wrapped.failNextFullReads(2)
+	wrapped.failNextFullReads(1)
 	if err := owner.Recover(ctx); !errors.Is(err, contract.ErrInventoryUnavailable) {
 		t.Fatalf("Recover() during rebuild failure = %v; want InventoryUnavailable", err)
 	}
 	assertOldProjection()
+	owner.mu.Lock()
+	if !owner.usable {
+		owner.mu.Unlock()
+		t.Fatal("a failed rebuild made a consistent projection unusable")
+	}
+	// An inconsistency found elsewhere marks the projection unusable.
+	owner.usable = false
+	owner.mu.Unlock()
+	wrapped.failNextFullReads(1)
 	clock.Set(dueAt)
 	if _, err := owner.GetInventory(ctx); !errors.Is(err, contract.ErrInventoryUnavailable) {
 		t.Fatalf("GetInventory() while rebuild still fails = %v; want InventoryUnavailable", err)
@@ -372,6 +381,10 @@ func (s *acceptanceFailFullReadStore) ReadBatches(ctx context.Context, afterSequ
 	return s.EventStore.ReadBatches(ctx, afterSequence)
 }
 
+func (s *acceptanceFailFullReadStore) ScanBatches(ctx context.Context, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	return scanViaRead(ctx, s, afterSequence, fn)
+}
+
 type acceptanceGateFullReadStore struct {
 	EventStore
 	mu      sync.Mutex
@@ -400,6 +413,10 @@ func (s *acceptanceGateFullReadStore) ReadBatches(ctx context.Context, afterSequ
 		<-s.release
 	}
 	return batches, err
+}
+
+func (s *acceptanceGateFullReadStore) ScanBatches(ctx context.Context, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	return scanViaRead(ctx, s, afterSequence, fn)
 }
 
 type acceptanceGateAppendStore struct {

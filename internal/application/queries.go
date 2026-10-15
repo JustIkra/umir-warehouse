@@ -54,18 +54,20 @@ func (o *Owner) GetExpiringBatches(ctx context.Context, cutoffAt time.Time) (con
 	return contract.ExpiringBatches{EvaluatedAt: prepared.EvaluatedAt, StateVersion: prepared.StateVersion, Items: items}, nil
 }
 
+// GetHistory returns the whole journal, as the legacy v1 contract requires:
+// it walks the journal from the start.
 func (o *Owner) GetHistory(ctx context.Context) (contract.History, error) {
-	batches, err := o.events.ReadBatches(ctx, 0)
-	if err != nil {
-		return contract.History{}, err
-	}
 	items := make([]contract.Event, 0)
 	var stateVersion int64
-	for _, batch := range batches {
+	err := o.events.ScanBatches(ctx, 0, func(batch domain.RecordedBatch) error {
 		for _, event := range batch.Events {
 			items = append(items, toContractEvent(event))
 			stateVersion = event.Sequence
 		}
+		return nil
+	})
+	if err != nil {
+		return contract.History{}, err
 	}
 	return contract.History{EvaluatedAt: domain.CanonicalBusinessTime(o.now()), StateVersion: stateVersion, Events: items}, nil
 }

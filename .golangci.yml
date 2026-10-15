@@ -126,6 +126,7 @@ linters:
             - "golang.org/x/text/cases$"
             - "golang.org/x/text/unicode/norm$"
             - "context$"
+            - "log$"
             - "sync$"
             - "sync/atomic$"
             - "crypto/sha256$"
