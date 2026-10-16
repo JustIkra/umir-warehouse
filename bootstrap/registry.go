@@ -130,7 +130,10 @@ func (r *Registry) register(ctx context.Context, scope contract.Scope, operation
 
 // settingsNumber is the numeric settings version of a validated scope.
 func settingsNumber(scope contract.Scope) int64 {
-	n, _ := strconv.ParseInt(scope.SettingsVersion, 10, 64)
+	n, err := strconv.ParseInt(scope.SettingsVersion, 10, 64)
+	if err != nil {
+		return 0
+	}
 	return n
 }
 func (r *Registry) readiness(entry registeredRuntime) contract.RuntimeReadiness {
