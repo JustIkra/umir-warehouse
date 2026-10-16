@@ -83,7 +83,7 @@ func (s *EventStore) AppendBatch(ctx context.Context, batch domain.CommandBatch)
 				                    schema_version, recorded_at, proposal_id, order_id, delivery_id, payload)
 				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 				s.scope.RestaurantID, event.Sequence, event.EventID, batch.CommandID,
-				string(event.Type), event.SchemaVersion, event.RecordedAt, nullableIdentity(proposalID), nullableIdentity(orderID), nullableIdentity(deliveryID), payload); err != nil {
+				string(event.Type), event.SchemaVersion, event.RecordedAt.Truncate(time.Microsecond), nullableIdentity(proposalID), nullableIdentity(orderID), nullableIdentity(deliveryID), payload); err != nil {
 				return mapStoreError(err)
 			}
 			message, err := outboxEvent(event, s.scope.OrgID, s.scope.RestaurantID, s.generation)

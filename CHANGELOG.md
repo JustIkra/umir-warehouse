@@ -2,7 +2,7 @@
 
 ## Не выпущено
 
-- Grant the runtime role the DELETE privilege needed by snapshot retention. Validate selected journal rows against their indexed identity, sequence, schema, command and recorded-time columns before returning history or period results. Add real-role snapshot retention and corrupt-row fail-closed tests.
+- Grant the runtime role the DELETE privilege needed by snapshot retention. Add migration `0005` to constrain event sidecar columns to their typed payload values at microsecond storage precision, including validation of existing partition rows. Keep `ReadEvents` and `ReadPeriod` on indexed sidecar filters and reject inconsistent selected rows. Add real-role snapshot retention and corruption regressions.
 
 - Correct the closed-restaurant purge function to compare the text-typed outbox restaurant ID with the UUID argument as text. Add a forward migration and a real runtime-role purge regression.
 

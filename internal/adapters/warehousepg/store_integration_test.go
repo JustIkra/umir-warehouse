@@ -20,6 +20,7 @@ import (
 	"github.com/JustIkra/umir-warehouse/tests/itest"
 	"github.com/JustIkra/umir-warehouse/tests/storecontract"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestPostgresStoresSatisfyStorageContracts(t *testing.T) {
@@ -214,7 +215,7 @@ func TestJournalReceiptAndOutboxCommitTogether(t *testing.T) {
 	}
 }
 
-func TestEventReadMethodsRejectPayloadSidecarMismatch(t *testing.T) {
+func TestEventSidecarConstraintRejectsCorruptionBeforeRead(t *testing.T) {
 	ctx := t.Context()
 	db, err := postgres.Open(ctx, postgres.Config{URL: itest.NewDatabase(t)})
 	if err != nil {
@@ -237,16 +238,32 @@ func TestEventReadMethodsRejectPayloadSidecarMismatch(t *testing.T) {
 	if _, err := stores.Events.AppendBatch(ctx, batch); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Pool().Exec(ctx, `UPDATE events SET payload = jsonb_set(payload, '{sequence}', '2'::jsonb)
-		WHERE restaurant_id = $1 AND sequence = 1`, scope.RestaurantID); err != nil {
-		t.Fatal(err)
+	for _, mutation := range []struct {
+		name string
+		sql  string
+		arg  any
+	}{
+		{"sequence", `UPDATE events SET payload = jsonb_set(payload, '{sequence}', '2'::jsonb) WHERE restaurant_id = $1 AND sequence = 1`, nil},
+		{"time later", `UPDATE events SET payload = jsonb_set(payload, '{recordedAt}', to_jsonb($2::text)) WHERE restaurant_id = $1 AND sequence = 1`, "2026-10-16T10:00:00.123457+03:00"},
+		{"time earlier", `UPDATE events SET payload = jsonb_set(payload, '{recordedAt}', to_jsonb($2::text)) WHERE restaurant_id = $1 AND sequence = 1`, "2026-10-16T10:00:00.123455+03:00"},
+	} {
+		var updateErr error
+		if mutation.arg == nil {
+			_, updateErr = db.Pool().Exec(ctx, mutation.sql, scope.RestaurantID)
+		} else {
+			_, updateErr = db.Pool().Exec(ctx, mutation.sql, scope.RestaurantID, mutation.arg)
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(updateErr, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "events_payload_index_match" {
+			t.Fatalf("corrupt payload %s update error = %v; want sidecar consistency check violation", mutation.name, updateErr)
+		}
 	}
-	if _, err := stores.Events.ReadEvents(ctx, 0, 10); !errors.Is(err, domain.ErrInvalidRecordedBatch) {
-		t.Fatalf("ReadEvents(corrupt payload) error = %v; want ErrInvalidRecordedBatch", err)
+	if events, err := stores.Events.ReadEvents(ctx, 0, 10); err != nil || len(events) != 1 || events[0].Sequence != 1 {
+		t.Fatalf("ReadEvents(after rejected corruption) = %#v, %v", events, err)
 	}
 	query := domain.PeriodQuery{From: recordedAt.Add(-time.Second), To: recordedAt.Add(time.Second), UpToSequence: 1}
-	if _, err := stores.Events.ReadPeriod(ctx, query); !errors.Is(err, domain.ErrInvalidRecordedBatch) {
-		t.Fatalf("ReadPeriod(corrupt payload) error = %v; want ErrInvalidRecordedBatch", err)
+	if events, err := stores.Events.ReadPeriod(ctx, query); err != nil || len(events) != 1 || events[0].Sequence != 1 {
+		t.Fatalf("ReadPeriod(after rejected corruption) = %#v, %v", events, err)
 	}
 }
 
