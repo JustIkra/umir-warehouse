@@ -2,6 +2,16 @@
 
 ## Не выпущено
 
+- Grant the runtime role the DELETE privilege needed by snapshot retention. Add migration `0005` to constrain event sidecar columns to their typed payload values at microsecond storage precision, including validation of existing partition rows. Keep `ReadEvents` and `ReadPeriod` on indexed sidecar filters and reject inconsistent selected rows. Add real-role snapshot retention and corruption regressions.
+
+- Correct the closed-restaurant purge function to compare the text-typed outbox restaurant ID with the UUID argument as text. Add a forward migration and a real runtime-role purge regression.
+
+- Add typed PostgreSQL implementations of Warehouse `EventStore` and `SnapshotStore`. Journal events, command receipts, snapshots and outbox rows share transactional boundaries; event and snapshot codecs store timestamps with nanoseconds and quantities as decimal strings. Add forced-RLS integration coverage using a non-owner runtime role. Add a forward migration to validate event IDs after the first schema migration.
+
+- Add the first Warehouse PostgreSQL migration for storage generation, restaurant lifecycle, streams, partitioned commands and events, snapshots, order attempts, worker leases, outbox support, forced tenant RLS, and the seven-day closed-restaurant purge function. This migration is not yet wired into production startup; the W2 storage work remains in progress.
+
+- Add the W2 integration foundation: unmodified Factory PostgreSQL, RabbitMQ, Redis and relay adapters, isolated test infrastructure helpers, a race-enabled `make integration` gate and CI coverage. The production store remains unchanged; durable journal/schema/bootstrap work is not complete.
+
 - Fix two regressions found in review. A request with a rotated key ID now waits for the key refresh already in flight instead of failing with `InvalidToken`. A state decoded from storage gets the batch index when it is recovered from a snapshot and on its first merge, and the delivery totals check reads only the batches of the products it touches. A settings update that waits for a busy owner no longer holds up the registry; owner settings only move forward.
 
 - **BREAKING:** `WAREHOUSE_API_MODE` has no default any more. An empty or missing value stops the start with an error naming the variable; `legacy` is selected only by setting it. Migration: set `WAREHOUSE_API_MODE=legacy` (the repository `compose.yaml` now does) or `v2` wherever the service is started; a deployment that relied on the old default must be updated before this version is rolled out.

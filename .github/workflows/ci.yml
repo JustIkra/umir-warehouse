@@ -42,9 +42,62 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  durable-integration:
+    name: Durable adapter integration
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Start isolated integration infrastructure
+        run: |
+          set -euo pipefail
+          POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+          RABBITMQ_DEFAULT_PASS="$(openssl rand -hex 24)"
+          UMIR_TEST_CACHE_PASSWORD="$(openssl rand -hex 24)"
+          export POSTGRES_USER=umir_test RABBITMQ_DEFAULT_USER=umir_test
+          export POSTGRES_PASSWORD RABBITMQ_DEFAULT_PASS UMIR_TEST_CACHE_PASSWORD
+          for value in "$POSTGRES_PASSWORD" "$RABBITMQ_DEFAULT_PASS" "$UMIR_TEST_CACHE_PASSWORD"; do
+            echo "::add-mask::$value"
+          done
+          docker run -d --name warehouse-it-pg -p 127.0.0.1:55432:5432 \
+            -e POSTGRES_USER -e POSTGRES_PASSWORD \
+            postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+          docker run -d --name warehouse-it-mq -p 127.0.0.1:55672:5672 -p 127.0.0.1:55673:15672 \
+            -e RABBITMQ_DEFAULT_USER -e RABBITMQ_DEFAULT_PASS \
+            rabbitmq:4-management-alpine@sha256:3ef7f7e89fed709a78f79b8b5f4e30e1312a1d4089da752e23595566d9d61a95
+          docker run -d --name warehouse-it-cache -p 127.0.0.1:56380:6379 -e UMIR_TEST_CACHE_PASSWORD \
+            redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 \
+            sh -ec 'umask 077; printf "requirepass %s\n" "$UMIR_TEST_CACHE_PASSWORD" > /tmp/auth.conf; exec redis-server /tmp/auth.conf --save "" --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lru'
+          {
+            printf 'UMIR_TEST_DATABASE_URL=postgres://umir_test:%s@127.0.0.1:55432/postgres?sslmode=disable\n' "$POSTGRES_PASSWORD"
+            printf 'UMIR_TEST_AMQP_URL=amqp://umir_test:%s@127.0.0.1:55672/%%2F\n' "$RABBITMQ_DEFAULT_PASS"
+            printf 'UMIR_TEST_AMQP_MANAGEMENT_URL=http://umir_test:%s@127.0.0.1:55673\n' "$RABBITMQ_DEFAULT_PASS"
+            printf 'UMIR_TEST_REDIS_CACHE_URL=redis://:%s@127.0.0.1:56380/0\n' "$UMIR_TEST_CACHE_PASSWORD"
+          } >> "$GITHUB_ENV"
+          for _ in $(seq 1 60); do
+            if docker exec warehouse-it-pg pg_isready -q -U umir_test && \
+              docker exec warehouse-it-mq rabbitmq-diagnostics -q ping >/dev/null 2>&1 && \
+              curl -fsS -o /dev/null http://127.0.0.1:55673/ && \
+              [ "$(REDISCLI_AUTH="$UMIR_TEST_CACHE_PASSWORD" docker exec -e REDISCLI_AUTH warehouse-it-cache redis-cli ping 2>/dev/null)" = PONG ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'Integration infrastructure did not become ready' >&2
+          exit 1
+      - name: Run integration tests with race detection
+        run: make integration
+
   publish:
     name: Publish image
-    needs: check
+    needs: [check, durable-integration]
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
