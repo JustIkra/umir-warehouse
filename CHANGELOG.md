@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Add the W2 integration foundation: unmodified Factory PostgreSQL, RabbitMQ, Redis and relay adapters, isolated test infrastructure helpers, a race-enabled `make integration` gate and CI coverage. The production store remains unchanged; durable journal/schema/bootstrap work is not complete.
+
 - Fix two regressions found in review. A request with a rotated key ID now waits for the key refresh already in flight instead of failing with `InvalidToken`. A state decoded from storage gets the batch index when it is recovered from a snapshot and on its first merge, and the delivery totals check reads only the batches of the products it touches. A settings update that waits for a busy owner no longer holds up the registry; owner settings only move forward.
 
 - **BREAKING:** `WAREHOUSE_API_MODE` has no default any more. An empty or missing value stops the start with an error naming the variable; `legacy` is selected only by setting it. Migration: set `WAREHOUSE_API_MODE=legacy` (the repository `compose.yaml` now does) or `v2` wherever the service is started; a deployment that relied on the old default must be updated before this version is rolled out.

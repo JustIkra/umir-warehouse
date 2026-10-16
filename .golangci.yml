@@ -3,6 +3,7 @@ run:
   tests: true
   build-tags:
     - perf
+    - integration
   relative-path-mode: cfg
 linters:
   default: none

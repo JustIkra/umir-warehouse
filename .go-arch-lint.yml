@@ -8,6 +8,9 @@ excludeFiles:
   - "^.*_test\\.go$"
 vendors:
   unicode-text: {in: [golang.org/x/text/cases, golang.org/x/text/unicode/norm]}
+  pgx: {in: ["github.com/jackc/pgx/v5", "github.com/jackc/pgx/v5/**"]}
+  amqp: {in: ["github.com/rabbitmq/amqp091-go"]}
+  redis: {in: ["github.com/redis/go-redis/v9", "github.com/redis/go-redis/v9/**"]}
 components:
   domain: {in: "internal/domain/**"}
   contract: {in: "contract/**"}
@@ -30,6 +33,7 @@ deps:
     mayDependOn: [application, domain, contract]
   adapters:
     mayDependOn: [adapters, application, domain, contract]
+    canUse: [pgx, amqp, redis]
   bootstrap:
     mayDependOn: [bootstrap, application, adapters, contract]
   process:
@@ -38,6 +42,7 @@ deps:
     mayDependOn: [testsupport, application, domain, contract]
   tests:
     mayDependOn: [tests, testsupport, application, adapters, domain, contract, bootstrap]
+    canUse: [pgx, amqp, redis]
   contracttests:
     mayDependOn: [contracttests, application, adapters, domain, contract, testsupport]
   integration:
