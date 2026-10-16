@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"text/tabwriter"
 	"time"
@@ -23,6 +24,8 @@ const (
 	// every checkpoint.
 	commitSamples = 20
 	commitBlocks  = 3
+	// deliveryEvery orders a delivery arrives.
+	deliveryEvery = 150
 	// repeats takes the best of several runs of a read so scheduling noise does
 	// not decide a ratio.
 	repeats = 5
@@ -33,20 +36,48 @@ type row struct {
 	build, commitAvg, commitP50, menu, supply, recInputs time.Duration
 	inventory, history, movements, recoverLive           time.Duration
 	recoverJournal, recoverSnapshot                      time.Duration
-	heapOwnerMiB, heapProcessMiB                         float64
+	// movementsCPU and recoverJournalCPU are the process CPU time of the same
+	// runs: other processes on a busy machine do not change it.
+	movementsCPU, recoverJournalCPU time.Duration
+	heapOwnerMiB, heapProcessMiB    float64
 }
 
+// ingredient is the product and quantity of one ingredient of a dish.
+func ingredient(dish, k int) (int, contract.Quantity) {
+	return (dish*7 + k*3) % products, contract.Quantity(1000 * (k + 1))
+}
+
+// demandPerCycle is what each product is consumed by the orders of one cycle of
+// the corpus: commit orders every dish once with one portion and once with two.
+func demandPerCycle() [products]contract.Quantity {
+	var demand [products]contract.Quantity
+	for dish := range dishes {
+		for k := range 4 {
+			product, quantity := ingredient(dish, k)
+			demand[product] += 3 * quantity
+		}
+	}
+	return demand
+}
+
+// deliver brings each product what the next deliveryEvery orders use plus a
+// margin, so batches run out as they would in a kitchen and the number of
+// batches an order can draw from does not grow with the number of orders.
 func (s *stand) deliver() {
 	s.t.Helper()
 	now := s.clock.Now()
 	lines := make([]contract.DeliveryLine, 0, products)
-	for p := range products {
-		lines = append(lines, contract.DeliveryLine{ProductID: "p" + strconv.Itoa(p), ManufacturedAt: now.Add(-time.Hour), ShelfLife: contract.ShelfLife{Value: 12, Unit: contract.ShelfLifeMonth}, ReceivedAt: now, Quantity: 10_000_000})
+	for p, demand := range demandPerCycle() {
+		if demand == 0 {
+			continue
+		}
+		quantity := demand * deliveryEvery / dishes * 13 / 10
+		lines = append(lines, contract.DeliveryLine{ProductID: "p" + strconv.Itoa(p), ManufacturedAt: now.Add(-time.Hour), ShelfLife: contract.ShelfLife{Value: 12, Unit: contract.ShelfLifeMonth}, ReceivedAt: now, Quantity: quantity})
 	}
 	if _, err := s.owner.ReceiveDelivery(s.ctx, contract.ReceiveDeliveryRequest{Scope: s.scope, CommandID: newUUID(), DeliveryID: newUUID(), Number: "N", CreatedAt: now, Lines: lines}); err != nil {
 		s.t.Fatal(err)
 	}
-	s.deliveries++
+	s.batches += len(lines)
 }
 
 func (s *stand) seedCatalog() {
@@ -59,7 +90,8 @@ func (s *stand) seedCatalog() {
 	for d := range dishes {
 		ingredients := make([]contract.Ingredient, 0, 4)
 		for k := range 4 {
-			ingredients = append(ingredients, contract.Ingredient{ProductID: "p" + strconv.Itoa((d*7+k*3)%products), Quantity: contract.Quantity(1000 * (k + 1))})
+			product, quantity := ingredient(d, k)
+			ingredients = append(ingredients, contract.Ingredient{ProductID: "p" + strconv.Itoa(product), Quantity: quantity})
 		}
 		if _, err := s.owner.DefineDish(s.ctx, contract.DefineDishRequest{CommandID: newUUID(), DishID: "d" + strconv.Itoa(d), Name: "Dish " + strconv.Itoa(d), Ingredients: ingredients}); err != nil {
 			s.t.Fatal(err)
@@ -94,20 +126,40 @@ func (s *stand) timed(name string, f func() error) time.Duration {
 	return time.Since(start)
 }
 
-func (s *stand) best(name string, f func() error) time.Duration {
+// span is the wall-clock and the CPU time of one run.
+type span struct{ wall, cpu time.Duration }
+
+// cpuTime is the user and system CPU time the process has used.
+func cpuTime() time.Duration {
+	var usage syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &usage); err != nil {
+		return 0
+	}
+	return time.Duration(usage.Utime.Nano() + usage.Stime.Nano())
+}
+
+func (s *stand) timedSpan(name string, f func() error) span {
 	s.t.Helper()
-	shortest := s.timed(name, f)
+	cpu := cpuTime()
+	wall := s.timed(name, f)
+	return span{wall: wall, cpu: cpuTime() - cpu}
+}
+
+func (s *stand) best(name string, f func() error) span {
+	s.t.Helper()
+	shortest := s.timedSpan(name, f)
 	for range repeats - 1 {
-		shortest = min(shortest, s.timed(name, f))
+		run := s.timedSpan(name, f)
+		shortest = span{min(shortest.wall, run.wall), min(shortest.cpu, run.cpu)}
 	}
 	return shortest
 }
 
 // recoverFresh times Recover of a new owner over the same journal; the owner
 // is built outside the timer. A nil snapshot store replays the whole journal.
-func (s *stand) recoverFresh(name string, withSnapshots bool) time.Duration {
+func (s *stand) recoverFresh(name string, withSnapshots bool) span {
 	s.t.Helper()
-	var shortest time.Duration
+	var shortest span
 	for attempt := range repeats {
 		var owner *application.Owner
 		if withSnapshots {
@@ -116,10 +168,11 @@ func (s *stand) recoverFresh(name string, withSnapshots bool) time.Duration {
 			owner = s.newOwner(nil)
 		}
 		runtime.GC() // garbage of the previous run must not be collected inside the timer
-		elapsed := s.timed(name, func() error { return owner.Recover(s.ctx) })
-		if attempt == 0 || elapsed < shortest {
-			shortest = elapsed
+		run := s.timedSpan(name, func() error { return owner.Recover(s.ctx) })
+		if attempt == 0 {
+			shortest = run
 		}
+		shortest = span{min(shortest.wall, run.wall), min(shortest.cpu, run.cpu)}
 	}
 	return shortest
 }
@@ -150,13 +203,13 @@ func TestScale(t *testing.T) {
 	start := time.Now()
 	for _, checkpoint := range []int{1000, 4000, 8000} {
 		for ; done < checkpoint-commitSamples*commitBlocks; done++ {
-			if done%150 == 149 {
+			if done%deliveryEvery == deliveryEvery-1 {
 				s.deliver()
 			}
 			s.commit(done)
 			s.flushSnapshots()
 		}
-		r := row{orders: checkpoint, batches: s.deliveries * products}
+		r := row{orders: checkpoint, batches: s.batches}
 		// The median of a block is steady against a few preempted commits, and the
 		// best block against a busy machine.
 		for block := range commitBlocks {
@@ -184,10 +237,12 @@ func TestScale(t *testing.T) {
 		r.recInputs = s.timed("recommendations", func() error { _, err := s.planning.Recommendations(s.ctx, planning); return err })
 		r.inventory = s.timed("inventory", func() error { _, err := s.owner.GetInventory(s.ctx); return err })
 		r.history = s.timed("history", func() error { _, err := s.owner.GetHistory(s.ctx); return err })
-		r.movements = s.best("movements", func() error { _, err := s.analytics.Movements(s.ctx, analytics); return err })
+		movements := s.best("movements", func() error { _, err := s.analytics.Movements(s.ctx, analytics); return err })
+		r.movements, r.movementsCPU = movements.wall, movements.cpu
 		r.recoverLive = s.timed("recover", func() error { return s.owner.Recover(s.ctx) })
-		r.recoverJournal = s.recoverFresh("recover_journal", false)
-		r.recoverSnapshot = s.recoverFresh("recover_snapshot", true)
+		journal := s.recoverFresh("recover_journal", false)
+		r.recoverJournal, r.recoverJournalCPU = journal.wall, journal.cpu
+		r.recoverSnapshot = s.recoverFresh("recover_snapshot", true).wall
 		r.heapOwnerMiB = s.freshOwnerHeap()
 		r.heapProcessMiB = heapMiB() - baseHeap
 		rows = append(rows, r)
@@ -222,8 +277,11 @@ func TestScale(t *testing.T) {
 			t.Errorf("%s grew %.2f times from %d to %d orders; want under %.0f", name, got, first.orders, last.orders, limit)
 		}
 	}
-	ratio("recover_journal", first.recoverJournal, last.recoverJournal, 12)
-	ratio("movements", first.movements, last.movements, 12)
+	// The wall-clock ratios are printed; the limits apply to CPU time, which a
+	// busy machine does not stretch.
+	t.Logf("wall: recover_journal %.2f, movements %.2f", float64(last.recoverJournal)/float64(first.recoverJournal), float64(last.movements)/float64(first.movements))
+	ratio("recover_journal_cpu", first.recoverJournalCPU, last.recoverJournalCPU, 12)
+	ratio("movements_cpu", first.movementsCPU, last.movementsCPU, 12)
 	// The commit ratio is checked on the median of the timed commits: on a busy
 	// machine the mean is decided by a few preempted samples. The best-block
 	// mean ratio is printed too.

@@ -67,8 +67,8 @@ type stand struct {
 	owner     *application.Owner
 	planning  *application.Planning
 	analytics *application.Analytics
-	// deliveries counts received deliveries; each creates one batch per product.
-	deliveries int
+	// batches counts the batches the received deliveries created.
+	batches int
 }
 
 func newStand(t *testing.T) *stand {
