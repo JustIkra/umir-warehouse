@@ -90,6 +90,12 @@ func TestRuntimeRoleCannotReadAcrossRestaurantsOrLeakScope(t *testing.T) {
 	if _, err := admin.Pool().Exec(ctx, "GRANT SELECT ON restaurants, streams, commands, events, snapshots, order_attempts TO "+roleSQL); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := admin.Pool().Exec(ctx, "GRANT SELECT ON storage_meta, schema_migrations TO "+roleSQL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Pool().Exec(ctx, "GRANT INSERT, UPDATE, DELETE ON snapshots TO "+roleSQL); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := admin.Pool().Exec(ctx, "GRANT SELECT, INSERT, UPDATE, DELETE ON outbox, worker_leases TO "+roleSQL); err != nil {
 		t.Fatal(err)
 	}
@@ -132,6 +138,24 @@ func TestRuntimeRoleCannotReadAcrossRestaurantsOrLeakScope(t *testing.T) {
 	}
 	if unscoped != 0 {
 		t.Fatalf("unscoped restaurant count = %d, want 0", unscoped)
+	}
+	stores, err := NewRestaurantStores(ctx, runtimeDB, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for sequence := int64(1); sequence <= 4; sequence++ {
+		snapshot := domain.Snapshot{SchemaVersion: domain.SnapshotSchemaV2, StreamID: domain.InventoryStreamID, LastSequence: sequence,
+			State: domain.InventoryState{Products: map[string]domain.Product{"p1": {ProductID: "p1", Name: "Tomato", BaseUnit: domain.BaseUnitG}}, StateVersion: sequence}}
+		if err := stores.Snapshots.Save(ctx, snapshot); err != nil {
+			t.Fatalf("Save(snapshot %d) with runtime role: %v", sequence, err)
+		}
+	}
+	var retained int
+	if err := admin.Pool().QueryRow(ctx, `SELECT count(*) FROM snapshots WHERE restaurant_id = $1`, first.RestaurantID).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if retained != 3 {
+		t.Fatalf("snapshots retained by runtime role = %d, want 3", retained)
 	}
 }
 
@@ -187,6 +211,42 @@ func TestJournalReceiptAndOutboxCommitTogether(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("outbox count after rejected append = %d; want 1", count)
+	}
+}
+
+func TestEventReadMethodsRejectPayloadSidecarMismatch(t *testing.T) {
+	ctx := t.Context()
+	db, err := postgres.Open(ctx, postgres.Config{URL: itest.NewDatabase(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(db.Close)
+	if err := Migrate(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	scope := newTestScope(t, db)
+	stores, err := NewRestaurantStores(ctx, db, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordedAt := time.Date(2026, time.October, 16, 10, 0, 0, 123456789, time.FixedZone("MSK", 3*60*60))
+	batch := domain.CommandBatch{CommandID: "corruptible", CommandType: "RegisterProduct", CommandFingerprint: "fingerprint", Events: []domain.Event{{
+		EventID: "event-1", RecordedAt: recordedAt, Type: domain.EventProductRegistered,
+		Payload: domain.EventPayload{Product: &domain.Product{ProductID: "product-1", Name: "Tomato", BaseUnit: domain.BaseUnitG}},
+	}}}
+	if _, err := stores.Events.AppendBatch(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Pool().Exec(ctx, `UPDATE events SET payload = jsonb_set(payload, '{sequence}', '2'::jsonb)
+		WHERE restaurant_id = $1 AND sequence = 1`, scope.RestaurantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stores.Events.ReadEvents(ctx, 0, 10); !errors.Is(err, domain.ErrInvalidRecordedBatch) {
+		t.Fatalf("ReadEvents(corrupt payload) error = %v; want ErrInvalidRecordedBatch", err)
+	}
+	query := domain.PeriodQuery{From: recordedAt.Add(-time.Second), To: recordedAt.Add(time.Second), UpToSequence: 1}
+	if _, err := stores.Events.ReadPeriod(ctx, query); !errors.Is(err, domain.ErrInvalidRecordedBatch) {
+		t.Fatalf("ReadPeriod(corrupt payload) error = %v; want ErrInvalidRecordedBatch", err)
 	}
 }
 

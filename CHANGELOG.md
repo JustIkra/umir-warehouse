@@ -2,6 +2,10 @@
 
 ## Не выпущено
 
+- Grant the runtime role the DELETE privilege needed by snapshot retention. Validate selected journal rows against their indexed identity, sequence, schema, command and recorded-time columns before returning history or period results. Add real-role snapshot retention and corrupt-row fail-closed tests.
+
+- Correct the closed-restaurant purge function to compare the text-typed outbox restaurant ID with the UUID argument as text. Add a forward migration and a real runtime-role purge regression.
+
 - Add typed PostgreSQL implementations of Warehouse `EventStore` and `SnapshotStore`. Journal events, command receipts, snapshots and outbox rows share transactional boundaries; event and snapshot codecs store timestamps with nanoseconds and quantities as decimal strings. Add forced-RLS integration coverage using a non-owner runtime role. Add a forward migration to validate event IDs after the first schema migration.
 
 - Add the first Warehouse PostgreSQL migration for storage generation, restaurant lifecycle, streams, partitioned commands and events, snapshots, order attempts, worker leases, outbox support, forced tenant RLS, and the seven-day closed-restaurant purge function. This migration is not yet wired into production startup; the W2 storage work remains in progress.

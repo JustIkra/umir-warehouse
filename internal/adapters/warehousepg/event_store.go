@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -319,7 +320,7 @@ func (s *EventStore) readBatchesTx(ctx context.Context, tx pgx.Tx, after int64, 
 }
 
 func (s *EventStore) readEventsRangeTx(ctx context.Context, tx pgx.Tx, first, last int64) ([]domain.Event, error) {
-	rows, err := tx.Query(ctx, `SELECT sequence, event_id, event_type, schema_version, command_id, payload
+	rows, err := tx.Query(ctx, `SELECT sequence, event_id, event_type, schema_version, command_id, recorded_at, payload
 		FROM events WHERE restaurant_id = $1 AND sequence BETWEEN $2 AND $3 ORDER BY sequence`, s.scope.RestaurantID, first, last)
 	if err != nil {
 		return nil, err
@@ -330,12 +331,13 @@ func (s *EventStore) readEventsRangeTx(ctx context.Context, tx pgx.Tx, first, la
 		var sequence int64
 		var id, eventType, commandID string
 		var schema int16
+		var recordedAt time.Time
 		var payload []byte
-		if err := rows.Scan(&sequence, &id, &eventType, &schema, &commandID, &payload); err != nil {
+		if err := rows.Scan(&sequence, &id, &eventType, &schema, &commandID, &recordedAt, &payload); err != nil {
 			return nil, err
 		}
 		event, err := decodeEvent(payload)
-		if err != nil || event.Sequence != sequence || event.EventID != id || string(event.Type) != eventType || event.SchemaVersion != int64(schema) || event.CommandID != commandID {
+		if err != nil || !storedEventMatches(event, sequence, id, eventType, schema, commandID, recordedAt) {
 			return nil, domain.ErrInvalidRecordedBatch
 		}
 		events = append(events, event)
@@ -352,18 +354,23 @@ func (s *EventStore) ReadEvents(ctx context.Context, after int64, limit int) ([]
 	}
 	var events []domain.Event
 	err := s.db.InScopedTx(ctx, s.scope, pgx.TxOptions{AccessMode: pgx.ReadOnly}, func(ctx context.Context, tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT payload FROM events WHERE restaurant_id = $1 AND sequence > $2 ORDER BY sequence LIMIT $3`, s.scope.RestaurantID, after, limit)
+		rows, err := tx.Query(ctx, `SELECT sequence, event_id, event_type, schema_version, command_id, recorded_at, payload
+			FROM events WHERE restaurant_id = $1 AND sequence > $2 ORDER BY sequence LIMIT $3`, s.scope.RestaurantID, after, limit)
 		if err != nil {
 			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
+			var sequence int64
+			var eventID, eventType, commandID string
+			var schema int16
+			var recordedAt time.Time
 			var payload []byte
-			if err := rows.Scan(&payload); err != nil {
+			if err := rows.Scan(&sequence, &eventID, &eventType, &schema, &commandID, &recordedAt, &payload); err != nil {
 				return err
 			}
 			event, err := decodeEvent(payload)
-			if err != nil {
+			if err != nil || !storedEventMatches(event, sequence, eventID, eventType, schema, commandID, recordedAt) {
 				return domain.ErrInvalidRecordedBatch
 			}
 			events = append(events, event)
@@ -386,7 +393,7 @@ func (s *EventStore) ReadPeriod(ctx context.Context, query application.PeriodQue
 	}
 	var events []domain.Event
 	err := s.db.InScopedTx(ctx, s.scope, pgx.TxOptions{AccessMode: pgx.ReadOnly}, func(ctx context.Context, tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT payload FROM events
+		rows, err := tx.Query(ctx, `SELECT sequence, event_id, event_type, schema_version, command_id, recorded_at, payload FROM events
 			WHERE restaurant_id = $1 AND sequence <= $2
 			  AND recorded_at >= $3::timestamptz - interval '1 millisecond'
 			  AND recorded_at < $4::timestamptz + interval '1 millisecond'
@@ -397,12 +404,16 @@ func (s *EventStore) ReadPeriod(ctx context.Context, query application.PeriodQue
 		}
 		defer rows.Close()
 		for rows.Next() {
+			var sequence int64
+			var eventID, eventType, commandID string
+			var schema int16
+			var recordedAt time.Time
 			var payload []byte
-			if err := rows.Scan(&payload); err != nil {
+			if err := rows.Scan(&sequence, &eventID, &eventType, &schema, &commandID, &recordedAt, &payload); err != nil {
 				return err
 			}
 			event, err := decodeEvent(payload)
-			if err != nil {
+			if err != nil || !storedEventMatches(event, sequence, eventID, eventType, schema, commandID, recordedAt) {
 				return domain.ErrInvalidRecordedBatch
 			}
 			if event.RecordedAt.Before(query.From) || !event.RecordedAt.Before(query.To) || len(query.Types) > 0 && !slices.Contains(query.Types, event.Type) {
@@ -413,6 +424,12 @@ func (s *EventStore) ReadPeriod(ctx context.Context, query application.PeriodQue
 		return rows.Err()
 	})
 	return events, mapStoreError(err)
+}
+
+func storedEventMatches(event domain.Event, sequence int64, eventID, eventType string, schema int16, commandID string, recordedAt time.Time) bool {
+	return event.Sequence == sequence && event.EventID == eventID && string(event.Type) == eventType &&
+		event.SchemaVersion == int64(schema) && event.CommandID == commandID &&
+		event.RecordedAt.Round(0).Truncate(time.Microsecond).Equal(recordedAt.Round(0).Truncate(time.Microsecond))
 }
 
 func (s *EventStore) FindOrderPlacement(ctx context.Context, orderID string) (application.OrderPlacement, bool, error) {
