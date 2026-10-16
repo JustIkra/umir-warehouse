@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Fix two regressions found in review. A request with a rotated key ID now waits for the key refresh already in flight instead of failing with `InvalidToken`. A state decoded from storage gets the batch index when it is recovered from a snapshot and on its first merge, and the delivery totals check reads only the batches of the products it touches. A settings update that waits for a busy owner no longer holds up the registry; owner settings only move forward.
+
 - **BREAKING:** `WAREHOUSE_API_MODE` has no default any more. An empty or missing value stops the start with an error naming the variable; `legacy` is selected only by setting it. Migration: set `WAREHOUSE_API_MODE=legacy` (the repository `compose.yaml` now does) or `v2` wherever the service is started; a deployment that relied on the old default must be updated before this version is rolled out.
 
 - Read the four service keys (`AUTH_SERVICE_KEY`, `AUTH_RUNTIME_SERVICE_KEY`, `GATEWAY_SERVICE_KEY`, `SERVING_SERVICE_KEY`) from files named by `<NAME>_FILE`. A trailing newline is dropped; setting both the variable and the file, or an empty or unreadable file, is a start-up error; the key never appears in errors or logs.

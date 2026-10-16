@@ -229,7 +229,7 @@ func TestTotalsCheckThroughIndexEqualsFullPass(t *testing.T) {
 		"replaces a big batch":     {Batches: map[string]Batch{"batch-0": {BatchID: "batch-0", ProductID: "product-0", ReceivedQuantity: 1, RemainingQuantity: 1}}},
 	} {
 		want := ValidateInventoryTotalsWith(&plain, delta)
-		if got := ValidateInventoryTotalsWith(&state, delta); !errors.Is(got, want) && got != want {
+		if got := ValidateInventoryTotalsWith(&state, delta); !errors.Is(got, want) {
 			t.Errorf("%s: indexed %v, full pass %v", name, got, want)
 		}
 	}

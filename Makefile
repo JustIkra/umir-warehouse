@@ -10,4 +10,4 @@ fmt-check build lint arch test check:
 quality-test:
 	bash tests/quality/check.sh
 perf:
-	go test -tags perf -run TestScale -count=1 -v -timeout 40m ./tests/perf
+	go test -tags perf -run 'TestScale|TestHTTPCommitOverhead' -count=1 -v -timeout 40m ./tests/perf
