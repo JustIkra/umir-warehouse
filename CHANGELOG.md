@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Add typed PostgreSQL implementations of Warehouse `EventStore` and `SnapshotStore`. Journal events, command receipts, snapshots and outbox rows share transactional boundaries; event and snapshot codecs store timestamps with nanoseconds and quantities as decimal strings. Add forced-RLS integration coverage using a non-owner runtime role. Add a forward migration to validate event IDs after the first schema migration.
+
 - Add the first Warehouse PostgreSQL migration for storage generation, restaurant lifecycle, streams, partitioned commands and events, snapshots, order attempts, worker leases, outbox support, forced tenant RLS, and the seven-day closed-restaurant purge function. This migration is not yet wired into production startup; the W2 storage work remains in progress.
 
 - Add the W2 integration foundation: unmodified Factory PostgreSQL, RabbitMQ, Redis and relay adapters, isolated test infrastructure helpers, a race-enabled `make integration` gate and CI coverage. The production store remains unchanged; durable journal/schema/bootstrap work is not complete.
