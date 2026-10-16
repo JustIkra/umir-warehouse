@@ -35,6 +35,16 @@ type Client struct {
 	retryAt          time.Time
 	unknownRefreshed bool
 	lastError        error
+	// flight is the refresh on the network, shared by everyone who needs it.
+	flight *refreshFlight
+}
+
+// refreshTimeout bounds a refresh that belongs to no single caller.
+const refreshTimeout = 10 * time.Second
+
+type refreshFlight struct {
+	done chan struct{}
+	err  error
 }
 
 func NewClient(options Options) (*Client, error) {
@@ -73,7 +83,11 @@ func (c *Client) Key(ctx context.Context, kid string) (ed25519.PublicKey, error)
 		}
 		c.retryAt = retryNow
 		c.unknownRefreshed = false
-		c.lastError = c.refresh(ctx)
+		left, err := c.refreshLocked(ctx)
+		if left {
+			return nil, contract.ErrAuthUnavailable
+		}
+		c.lastError = err
 		if c.lastError == nil {
 			c.fetchedAt = now
 		}
@@ -87,7 +101,11 @@ func (c *Client) Key(ctx context.Context, kid string) (ed25519.PublicKey, error)
 	if !c.unknownRefreshed {
 		c.unknownRefreshed = true
 		c.retryAt = c.options.RetryNow()
-		c.lastError = c.refresh(ctx)
+		left, err := c.refreshLocked(ctx)
+		if left {
+			return nil, contract.ErrAuthUnavailable
+		}
+		c.lastError = err
 		if c.lastError != nil {
 			return nil, contract.ErrAuthUnavailable
 		}
@@ -108,51 +126,85 @@ type jwk struct {
 	Use       string `json:"use"`
 }
 
-func (c *Client) refresh(ctx context.Context) (err error) {
+// refreshLocked joins the refresh on the network or starts it. It is called
+// with c.mu held, gives the lock up while it waits and returns with it held.
+// The refresh runs on its own context, so the caller that started it can leave
+// without cutting it short; left reports that this caller's context ended
+// first, in which case nothing about the keys has changed.
+func (c *Client) refreshLocked(ctx context.Context) (left bool, err error) {
+	flight := c.flight
+	if flight == nil {
+		flight = &refreshFlight{done: make(chan struct{})}
+		c.flight = flight
+		detached, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
+		go func() {
+			defer cancel()
+			keys, fetchErr := c.fetch(detached)
+			c.mu.Lock()
+			if fetchErr == nil {
+				c.keys = keys
+			}
+			flight.err = fetchErr
+			c.flight = nil
+			c.mu.Unlock()
+			close(flight.done)
+		}()
+	}
+	c.mu.Unlock()
+	defer c.mu.Lock()
+	select {
+	case <-flight.done:
+		return false, flight.err
+	case <-ctx.Done():
+		return true, nil
+	}
+}
+
+// fetch reads the key document; it touches no state of the client.
+func (c *Client) fetch(ctx context.Context) (keys map[string]ed25519.PublicKey, err error) {
 	request, err := http.NewRequestWithContext(ctx, "GET", c.options.URL, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	request.Header.Set("X-Umir-Service-Key", c.options.ServiceKey)
 	response, err := c.options.HTTP.Do(request)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if response == nil || response.Body == nil {
-		return contract.ErrAuthUnavailable
+		return nil, contract.ErrAuthUnavailable
 	}
 	defer func() { err = errors.Join(err, response.Body.Close()) }()
 	if response.StatusCode != 200 {
-		return contract.ErrAuthUnavailable
+		return nil, contract.ErrAuthUnavailable
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, (64<<10)+1))
 	if err != nil || len(data) > 64<<10 {
-		return contract.ErrAuthUnavailable
+		return nil, contract.ErrAuthUnavailable
 	}
 	var document struct {
 		Keys []jwk `json:"keys"`
 	}
 	if !validKeyDocument(data) {
-		return contract.ErrAuthUnavailable
+		return nil, contract.ErrAuthUnavailable
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&document) != nil || len(document.Keys) < 1 || len(document.Keys) > 3 {
-		return contract.ErrAuthUnavailable
+		return nil, contract.ErrAuthUnavailable
 	}
 	next := make(map[string]ed25519.PublicKey, len(document.Keys))
 	for _, entry := range document.Keys {
 		decoded, err := base64.RawURLEncoding.Strict().DecodeString(entry.X)
 		if err != nil || len(decoded) != 32 || entry.Type != "OKP" || entry.Curve != "Ed25519" || entry.ID == "" || entry.Algorithm != "EdDSA" || entry.Use != "sig" {
-			return contract.ErrAuthUnavailable
+			return nil, contract.ErrAuthUnavailable
 		}
 		if _, exists := next[entry.ID]; exists {
-			return contract.ErrAuthUnavailable
+			return nil, contract.ErrAuthUnavailable
 		}
 		next[entry.ID] = ed25519.PublicKey(decoded)
 	}
-	c.keys = next
-	return nil
+	return next, nil
 }
 func validKeyDocument(data []byte) bool {
 	if !utf8.Valid(data) {

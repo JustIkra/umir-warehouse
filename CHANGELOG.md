@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Refresh Auth signing keys once for all callers. The refresh runs on its own context with a timeout, outside the cache lock, and every waiter waits for its result under its own context. A caller that started the refresh and gave up no longer records a failure that blocks the others, and a failed refresh still does not serve stale keys.
+
 - Accept a repeated restaurant registration with different settings. For the same lifecycle version, a higher `settingsVersion` replaces the stored time zone and settings while the inventory stays, a lower one is a successful repeat that changes nothing, and the same version with another time zone is still a `CommandIdentityConflict`. A repeat of a lost registration answer after the organization's settings changed now succeeds.
 
 - Keep the projection when a request ends early. The owner lock is a context-aware mutex: a request whose context ends while it waits leaves without touching anything, and `usable` is no longer cleared by a canceled or timed-out request, only by a journal that contradicts the projection. The server's `WriteTimeout` is now the request timeout plus five seconds so a result recorded just before the deadline can still be written.
