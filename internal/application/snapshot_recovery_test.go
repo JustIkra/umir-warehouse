@@ -88,11 +88,13 @@ func TestSnapshotContradictingJournalTailFallsBackToFullReplay(t *testing.T) {
 	if err := seedOwner.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// The snapshot sits on a batch boundary but lacks the product the journal
-	// tail (the delivery) refers to: structurally valid, contradicted by the tail.
+	// The snapshot sits on a batch boundary but holds another product than the
+	// one the journal tail (the delivery) refers to: structurally valid,
+	// contradicted by the tail.
 	candidate := snapshotFor(seedOwner.state)
 	candidate.LastSequence, candidate.State.StateVersion = 2, 2
-	candidate.State.Products, candidate.State.Dishes = map[string]domain.Product{}, map[string]domain.Dish{}
+	candidate.State.Products = map[string]domain.Product{"other": {ProductID: "other", Name: "Other", BaseUnit: domain.BaseUnitG}}
+	candidate.State.Dishes = map[string]domain.Dish{}
 	candidate.State.DeliveryIDs, candidate.State.Batches = map[string]struct{}{}, map[string]domain.Batch{}
 	if err := domain.ValidateSnapshot(candidate); err != nil {
 		t.Fatalf("altered candidate should still be structurally valid: %v", err)

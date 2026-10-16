@@ -88,6 +88,21 @@ func TestValidateInventoryStateRejectsBrokenStructure(t *testing.T) {
 		"dish repeating an ingredient": func(s *InventoryState) {
 			s.Dishes["dish-1"] = Dish{DishID: "dish-1", Name: "Soup", Ingredients: []Ingredient{{ProductID: "product-1", Quantity: 1}, {ProductID: "product-1", Quantity: 2}}}
 		},
+		"version below the record count": func(s *InventoryState) { s.StateVersion = 2 },
+		"version without any records": func(s *InventoryState) {
+			*s = InventoryState{Products: map[string]Product{}, Dishes: map[string]Dish{}, DeliveryIDs: map[string]struct{}{}, Batches: map[string]Batch{}, StateVersion: 3}
+		},
+		"two batches on one delivery line": func(s *InventoryState) {
+			batch := s.Batches["batch-1"]
+			batch.BatchID = "batch-2"
+			s.Batches["batch-2"] = batch
+			s.StateVersion = 4
+		},
+		"delivery lines with a gap": func(s *InventoryState) {
+			batch := s.Batches["batch-1"]
+			batch.LineNo = 2
+			s.Batches["batch-1"] = batch
+		},
 		"empty delivery ID":              func(s *InventoryState) { s.DeliveryIDs[""] = struct{}{} },
 		"delivery without batches":       func(s *InventoryState) { s.DeliveryIDs["delivery-2"] = struct{}{} },
 		"batch from an unknown delivery": editBatch(func(b *Batch) { b.DeliveryID = "missing" }),

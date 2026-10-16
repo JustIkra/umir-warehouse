@@ -60,7 +60,10 @@ func equalBatch(a, b Batch) bool {
 // ValidateInventoryState checks the structure of a state on its own: records
 // are keyed by their IDs, references resolve and batch balances add up.
 func ValidateInventoryState(state InventoryState) error {
-	if state.StateVersion < 0 || state.StateVersion == 0 && (len(state.Products) > 0 || len(state.Dishes) > 0 || len(state.DeliveryIDs) > 0 || len(state.Batches) > 0) {
+	records := int64(len(state.Products)) + int64(len(state.Dishes)) + int64(len(state.DeliveryIDs))
+	// Every product, dish and delivery comes from at least one event, so the
+	// version cannot be below their count, and a state at a version is never empty.
+	if state.StateVersion < 0 || state.StateVersion == 0 && (records > 0 || len(state.Batches) > 0) || state.StateVersion > 0 && (records == 0 || records > state.StateVersion) {
 		return ErrInvalidSnapshot
 	}
 	for id, product := range state.Products {
@@ -95,7 +98,8 @@ func validateDeliveryIDsAndBatches(state InventoryState) error {
 			return ErrInvalidSnapshot
 		}
 	}
-	delivered := make(map[string]struct{}, len(state.DeliveryIDs))
+	lines := make(map[string]int, len(state.DeliveryIDs))
+	lineSeen := make(map[string]map[int64]struct{}, len(state.DeliveryIDs))
 	for id, batch := range state.Batches {
 		if id == "" || id != batch.BatchID || batch.DeliveryID == "" || batch.ProductID == "" || batch.LineNo <= 0 || batch.ReceivedQuantity <= 0 || batch.ShelfLife.Value <= 0 || batch.ShelfLife.Unit != ShelfLifeDay && batch.ShelfLife.Unit != ShelfLifeMonth || !isBusinessTime(batch.ManufacturedAt) || !isBusinessTime(batch.ReceivedAt) || !isBusinessTime(batch.ExpiresAt) || !batch.ExpiresAt.After(batch.ManufacturedAt) || batch.PendingWriteoff && (batch.RemainingQuantity <= 0 || batch.WrittenOffForExpiry > 0) || batch.WrittenOffForExpiry > 0 && batch.RemainingQuantity > 0 || !validBatchBalance(batch) {
 			return ErrInvalidSnapshot
@@ -106,12 +110,26 @@ func validateDeliveryIDsAndBatches(state InventoryState) error {
 		if _, exists := state.DeliveryIDs[batch.DeliveryID]; !exists {
 			return fmt.Errorf("%w: batch %q references missing delivery %q", ErrInvalidSnapshot, id, batch.DeliveryID)
 		}
-		delivered[batch.DeliveryID] = struct{}{}
+		if lineSeen[batch.DeliveryID] == nil {
+			lineSeen[batch.DeliveryID] = map[int64]struct{}{}
+		}
+		if _, exists := lineSeen[batch.DeliveryID][batch.LineNo]; exists {
+			return fmt.Errorf("%w: delivery %q has two batches on line %d", ErrInvalidSnapshot, batch.DeliveryID, batch.LineNo)
+		}
+		lineSeen[batch.DeliveryID][batch.LineNo] = struct{}{}
+		lines[batch.DeliveryID]++
 	}
-	// A delivery always creates at least one batch and batches are never removed.
+	// A delivery always creates at least one batch, one for each of its lines
+	// numbered from 1, and batches are never removed.
 	for id := range state.DeliveryIDs {
-		if _, exists := delivered[id]; !exists {
+		count := lines[id]
+		if count == 0 {
 			return fmt.Errorf("%w: delivery %q has no batches", ErrInvalidSnapshot, id)
+		}
+		for line := int64(1); line <= int64(count); line++ {
+			if _, exists := lineSeen[id][line]; !exists {
+				return fmt.Errorf("%w: delivery %q has no batch on line %d", ErrInvalidSnapshot, id, line)
+			}
 		}
 	}
 	return nil

@@ -157,11 +157,13 @@ func snapshotsDelayedExpiration(t *testing.T, f Fixture) {
 func snapshotsAcceptBatches(t *testing.T, f Fixture) {
 	store := f.open(t).Snapshots
 	for sequence, snapshot := range []domain.Snapshot{snapshotWithExpiry(1000, 0), snapshotWithExpiry(0, 1000)} {
-		snapshot.LastSequence, snapshot.State.StateVersion = int64(sequence+1), int64(sequence+1)
+		// A product and a delivery take at least two events.
+		version := int64(sequence + 3)
+		snapshot.LastSequence, snapshot.State.StateVersion = version, version
 		if err := store.Save(context.Background(), snapshot); err != nil {
 			t.Fatalf("Save(valid snapshot %d) error = %v", sequence, err)
 		}
-		assertLatestSequence(t, store, int64(sequence+1))
+		assertLatestSequence(t, store, version)
 	}
 }
 
