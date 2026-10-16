@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -234,4 +235,60 @@ func TestSnapshotWorkerSurvivesRejectedCandidate(t *testing.T) {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+}
+
+// bulkSnapshot is a snapshot of a state with n batches of one product.
+func bulkSnapshot(n int) domain.Snapshot {
+	at := moscowTime(2026, time.April, 1, 10)
+	state := domain.InventoryState{
+		Products:     map[string]domain.Product{"p": {ProductID: "p", Name: "P", BaseUnit: domain.BaseUnitG}},
+		Dishes:       map[string]domain.Dish{},
+		DeliveryIDs:  map[string]struct{}{},
+		Batches:      map[string]domain.Batch{},
+		StateVersion: int64(n) + 2,
+	}
+	for i := range n {
+		id := fmt.Sprintf("b%d", i)
+		state.DeliveryIDs["d"+id] = struct{}{}
+		state.Batches[id] = domain.Batch{BatchID: id, DeliveryID: "d" + id, LineNo: 1, ProductID: "p", ManufacturedAt: at, ShelfLife: domain.ShelfLife{Value: 5, Unit: domain.ShelfLifeDay}, ReceivedAt: at, ExpiresAt: at.AddDate(0, 0, 5), ReceivedQuantity: 10, RemainingQuantity: 10}
+	}
+	return domain.Snapshot{SchemaVersion: domain.SnapshotSchemaV2, StreamID: domain.InventoryStreamID, LastSequence: state.StateVersion, State: state}
+}
+
+// An offer nobody needs costs nothing, and one that is kept is copied once:
+// running it does not copy the state again.
+func TestSnapshotOfferCopiesOnlyWhatIsKept(t *testing.T) {
+	big, small := bulkSnapshot(2000), bulkSnapshot(20)
+	t.Run("stale offer", func(t *testing.T) {
+		worker := NewSnapshotWorker(memory.NewSnapshotStore())
+		worker.observeSaved(big.LastSequence)
+		if allocs := testing.AllocsPerRun(20, func() { worker.Offer(big) }); allocs > 1 {
+			t.Fatalf("an offer behind the saved snapshot allocates %.0f times; want at most 1", allocs)
+		}
+	})
+	t.Run("run", func(t *testing.T) {
+		allocsOfRun := func(snapshot domain.Snapshot) float64 {
+			var total float64
+			const runs = 20
+			for i := range runs {
+				worker := NewSnapshotWorker(memory.NewSnapshotStore())
+				worker.verify = func(context.Context, domain.Snapshot) error { return nil }
+				snapshot.State.StateVersion += int64(i)
+				snapshot.LastSequence = snapshot.State.StateVersion
+				worker.Offer(snapshot)
+				total += testing.AllocsPerRun(1, func() {
+					if _, err := worker.RunOnce(context.Background()); err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+			return total / runs
+		}
+		// Save itself copies the snapshot once, so compare the owner's own share:
+		// running must cost about what Save costs, not twice it.
+		base := allocsOfRun(small)
+		if large := allocsOfRun(big); large > base*1.2+50 && large > 2*float64(len(big.State.Batches))+50 {
+			t.Fatalf("running a snapshot of 2000 batches allocates %.0f times against %.0f for 20; want no extra copy of the state", large, base)
+		}
+	})
 }

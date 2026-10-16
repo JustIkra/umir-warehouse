@@ -71,7 +71,11 @@ func NewInMemory(options Options) (*Runtime, error) {
 			return nil, err
 		}
 	}
-	if err := owner.ConfigureSnapshots(memory.NewSnapshotStore(), options.EventsPerSnapshot); err != nil {
+	var snapshots application.SnapshotStore = memory.NewSnapshotStore()
+	if options.WrapSnapshotStore != nil {
+		snapshots = options.WrapSnapshotStore(options.Scope, snapshots)
+	}
+	if err := owner.ConfigureSnapshots(snapshots, options.EventsPerSnapshot); err != nil {
 		return nil, err
 	}
 	coverage := options.CoverageFrom

@@ -133,3 +133,25 @@ func TestCommitDoesNotReadJournalOverHTTP(t *testing.T) {
 		t.Fatalf("commit and passive reads read the journal from the start %d times; want 0", got)
 	}
 }
+
+// A token is not accepted before the second it was issued: there is no clock
+// skew allowance (R12).
+func TestIssuedAtHasNoTolerance(t *testing.T) {
+	f, _ := w6Stock(t)
+	for _, test := range []struct {
+		name   string
+		offset int64
+		want   int
+	}{{"issued now", 0, 200}, {"issued one second ahead", 1, 401}} {
+		t.Run(test.name, func(t *testing.T) {
+			claims := claims(tenantA, "inventory", "stock.read")
+			claims["iat"] = now.Unix() + test.offset
+			claims["nbf"] = now.Unix() + test.offset
+			claims["exp"] = now.Unix() + test.offset + 60
+			w := f.call("GET", tenantA, "inventory", "", f.token(t, claims, nil), "gateway-key")
+			if w.Code != test.want {
+				t.Fatalf("status = %d %s; want %d", w.Code, w.Body, test.want)
+			}
+		})
+	}
+}

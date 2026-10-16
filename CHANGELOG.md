@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Cache loaded time zones by name in `zonedata.Load`, so a repeated load no longer parses the archive. `Check` still reads the archive afresh. Offering a snapshot to the worker now copies it once and only when it is needed, running it copies nothing more, and a snapshot save failure of one restaurant no longer stops the snapshot workers of the others: each restaurant's worker is retried on its own after a pause. A test fixes that a token issued a second ahead of the clock is rejected (no `iat` tolerance).
+
 - Refresh Auth signing keys once for all callers. The refresh runs on its own context with a timeout, outside the cache lock, and every waiter waits for its result under its own context. A caller that started the refresh and gave up no longer records a failure that blocks the others, and a failed refresh still does not serve stale keys.
 
 - Accept a repeated restaurant registration with different settings. For the same lifecycle version, a higher `settingsVersion` replaces the stored time zone and settings while the inventory stays, a lower one is a successful repeat that changes nothing, and the same version with another time zone is still a `CommandIdentityConflict`. A repeat of a lost registration answer after the organization's settings changed now succeeds.

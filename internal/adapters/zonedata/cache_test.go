@@ -1,6 +1,7 @@
 package zonedata
 
 import (
+	"errors"
 	"sync"
 	"testing"
 
@@ -42,7 +43,7 @@ func TestLoadIsSafeForConcurrentUse(t *testing.T) {
 
 func TestLoadDoesNotCacheFailures(t *testing.T) {
 	for range 3 {
-		if _, err := Load("Not/AZone"); err != contract.ErrUnknownTimeZone {
+		if _, err := Load("Not/AZone"); !errors.Is(err, contract.ErrUnknownTimeZone) {
 			t.Fatalf("Load(unknown) = %v; want ErrUnknownTimeZone", err)
 		}
 	}

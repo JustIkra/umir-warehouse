@@ -68,5 +68,6 @@ func loadFromArchive(name string) (*time.Location, error) {
 	}
 	return nil, contract.ErrUnknownTimeZone
 }
+
 // Check reads the archive afresh, not through the cache, so it reports the state of the archive itself.
 func Check() error { _, err := loadFromArchive("Europe/Moscow"); return err }

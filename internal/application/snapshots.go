@@ -47,12 +47,14 @@ func NewSnapshotWorker(store SnapshotStore) *SnapshotWorker {
 }
 
 func (w *SnapshotWorker) Offer(snapshot domain.Snapshot) {
-	candidate := domain.CloneSnapshot(snapshot)
 	w.mu.Lock()
-	if candidate.LastSequence <= w.savedSequence || candidate.LastSequence <= w.rejectedSequence || w.active && candidate.LastSequence <= w.activeSequence || w.pending != nil && candidate.LastSequence <= w.pending.LastSequence {
+	if snapshot.LastSequence <= w.savedSequence || snapshot.LastSequence <= w.rejectedSequence || w.active && snapshot.LastSequence <= w.activeSequence || w.pending != nil && snapshot.LastSequence <= w.pending.LastSequence {
 		w.mu.Unlock()
 		return
 	}
+	// The one copy: the worker owns the pending snapshot from here on, and the
+	// caller's state may change as soon as Offer returns.
+	candidate := domain.CloneSnapshot(snapshot)
 	w.pending = &candidate
 	w.mu.Unlock()
 	select {
@@ -70,7 +72,8 @@ func (w *SnapshotWorker) RunOnce(ctx context.Context) (bool, error) {
 		w.mu.Unlock()
 		return false, nil
 	}
-	candidate := domain.CloneSnapshot(*w.pending)
+	// Nothing else holds or changes the pending snapshot, so it is used as is.
+	candidate := *w.pending
 	verify := w.verify
 	w.pending = nil
 	w.active = true
