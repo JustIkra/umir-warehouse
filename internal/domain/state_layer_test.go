@@ -280,3 +280,32 @@ func TestApplyBatchAllocsIndependentOfHistory(t *testing.T) {
 		t.Fatalf("allocations depend on history: %.0f after 1000 orders vs %.0f after 10000 orders (limit 10%%)", smallAllocs, largeAllocs)
 	}
 }
+
+// A state holds copies of what an event carries, so a caller reusing or
+// changing the event afterwards does not change the state.
+func TestApplyBatchDoesNotAliasEventPayload(t *testing.T) {
+	product := layerProductEvent("p")
+	dish := layerDishEvent("d", "p")
+	delivery := layerDeliveryEvent("del", "p", "b1", "b2")
+	var state InventoryState
+	for _, step := range []struct {
+		command string
+		event   Event
+	}{{"RegisterProduct", product}, {"DefineDish", dish}, {"ReceiveDelivery", delivery}} {
+		if err := state.ApplyBatch(layerBatch("c-"+step.command, step.command, state.StateVersion+1, step.event)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := CloneInventoryState(state)
+
+	product.Payload.Product.Name = "changed"
+	dish.Payload.Dish.Name = "changed"
+	dish.Payload.Dish.Ingredients[0].Quantity = 999
+	delivery.Payload.Delivery.Lines[0].Quantity = 1
+	delivery.Payload.Batches[0].RemainingQuantity = 1
+	delivery.Payload.Batches[1].ProductID = "changed"
+
+	if !EqualInventoryState(state, want) {
+		t.Fatalf("state follows the event payload: %#v", state)
+	}
+}
