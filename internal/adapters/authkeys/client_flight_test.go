@@ -102,7 +102,8 @@ func TestConcurrentKeyCallsOneRefresh(t *testing.T) {
 	}
 	started.Wait()
 	<-doer.entered
-	time.Sleep(20 * time.Millisecond) // let the others reach the wait
+	// Release only once every other caller is waiting on the shared refresh.
+	waitUntil(t, "callers to join the refresh", func() bool { return client.waiting() == callers })
 	close(doer.release)
 	finished.Wait()
 	close(failures)
@@ -142,5 +143,77 @@ func TestRefreshDoesNotHoldCacheLock(t *testing.T) {
 	close(doer.release)
 	if err := <-first; err != nil {
 		t.Fatalf("the refreshing caller = %v", err)
+	}
+}
+
+func waitUntil(t *testing.T, what string, done func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !done() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// rotatingDoer serves the old key at once and, from the second request on,
+// the rotated key once released.
+type rotatingDoer struct {
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (d *rotatingDoer) Do(r *http.Request) (*http.Response, error) {
+	n := d.calls.Add(1)
+	kid, first := "one", byte(7)
+	if n > 1 {
+		close(d.entered)
+		select {
+		case <-d.release:
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+		kid, first = "two", 8
+	}
+	key := make([]byte, 32)
+	key[0] = first
+	payload := `{"keys":[{"kty":"OKP","crv":"Ed25519","kid":"` + kid + `","x":"` + base64.RawURLEncoding.EncodeToString(key) + `","alg":"EdDSA","use":"sig"}]}`
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(payload))}, nil
+}
+
+// Auth rotates its key: two requests with the new kid arrive while the
+// refresh that brings it is on the network. Both must find the key.
+func TestRotationWithConcurrentNewKidCalls(t *testing.T) {
+	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.FixedZone("MSK", 10800))
+	doer := &rotatingDoer{entered: make(chan struct{}), release: make(chan struct{})}
+	client, err := NewClient(Options{URL: "http://auth/internal/auth/v1/jwks", ServiceKey: "key", Now: func() time.Time { return now }, HTTP: doer, AllowPlainHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Key(context.Background(), "one"); err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, 2)
+	call := func() {
+		got, err := client.Key(context.Background(), "two")
+		if err == nil && got[0] != 8 {
+			err = errors.New("wrong key")
+		}
+		results <- err
+	}
+	go call()
+	<-doer.entered
+	go call()
+	waitUntil(t, "the second caller to join", func() bool { return client.waiting() == 2 })
+	close(doer.release)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("Key(two) during rotation = %v; want the rotated key", err)
+		}
+	}
+	if calls := doer.calls.Load(); calls != 2 {
+		t.Fatalf("key requests = %d; want the first fetch and one refresh", calls)
 	}
 }

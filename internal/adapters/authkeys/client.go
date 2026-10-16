@@ -37,6 +37,8 @@ type Client struct {
 	lastError        error
 	// flight is the refresh on the network, shared by everyone who needs it.
 	flight *refreshFlight
+	// waiters counts callers waiting on the refresh in flight.
+	waiters int
 }
 
 // refreshTimeout bounds a refresh that belongs to no single caller.
@@ -98,6 +100,21 @@ func (c *Client) Key(ctx context.Context, kid string) (ed25519.PublicKey, error)
 	if key, ok := c.keys[kid]; ok {
 		return append(ed25519.PublicKey(nil), key...), nil
 	}
+	if c.flight != nil {
+		// A refresh is already on the network and will bring the key if Auth has
+		// it: wait for it instead of judging the kid by the old keys.
+		left, err := c.refreshLocked(ctx)
+		if left {
+			return nil, contract.ErrAuthUnavailable
+		}
+		if err != nil {
+			return nil, contract.ErrAuthUnavailable
+		}
+		if key, ok := c.keys[kid]; ok {
+			return append(ed25519.PublicKey(nil), key...), nil
+		}
+		return nil, contract.ErrInvalidToken
+	}
 	if !c.unknownRefreshed {
 		c.unknownRefreshed = true
 		c.retryAt = c.options.RetryNow()
@@ -150,8 +167,12 @@ func (c *Client) refreshLocked(ctx context.Context) (left bool, err error) {
 			close(flight.done)
 		}()
 	}
+	c.waiters++
 	c.mu.Unlock()
-	defer c.mu.Lock()
+	defer func() {
+		c.mu.Lock()
+		c.waiters--
+	}()
 	select {
 	case <-flight.done:
 		return false, flight.err
