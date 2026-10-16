@@ -51,18 +51,13 @@ func (h *scopedHandlers) scopedOrder(w http.ResponseWriter, r *http.Request, run
 			writeScopedResult(w, scope, value.Evaluation.EvaluatedAt, value.Evaluation.StateVersion, wireCommit(value))
 			return
 		}
-		history, err := runtime.GetHistory(ctx)
-		if err != nil {
+		// The answer carries where the order was placed, whichever command placed it.
+		placement, found, err := runtime.FindOrderPlacement(ctx, value.Order.OrderID)
+		if err != nil || !found {
 			writeScopedError(w, contract.ErrUnknownWriteOutcome, true)
 			return
 		}
-		for _, event := range history.Events {
-			if event.CommandID == command && event.Payload.Order != nil && event.Payload.Order.OrderID == value.Order.OrderID {
-				writeScopedResult(w, scope, event.RecordedAt, event.Sequence, wireCommit(value))
-				return
-			}
-		}
-		writeScopedError(w, contract.ErrUnknownWriteOutcome, true)
+		writeScopedResult(w, scope, placement.RecordedAt, placement.Sequence, wireCommit(value))
 		return
 	}
 	query := "orderID"
@@ -102,27 +97,29 @@ func (h *scopedHandlers) scopedOrder(w http.ResponseWriter, r *http.Request, run
 		if value.Error != nil {
 			result.Error = &errorWire{Code: value.Error.Code, Message: value.Error.Message, Outcome: string(value.Error.Outcome)}
 		}
-		history, err := runtime.GetHistory(ctx)
+		head, err := runtime.Head(ctx)
 		if err != nil {
 			writeScopedError(w, err, false)
 			return
 		}
-		writeScopedResult(w, scope, history.EvaluatedAt, history.StateVersion, result)
+		writeScopedResult(w, scope, head.EvaluatedAt, head.StateVersion, result)
 		return
 	}
-	history, err := runtime.GetHistory(ctx)
+	head, err := runtime.Head(ctx)
+	if err != nil {
+		writeScopedError(w, err, false)
+		return
+	}
+	order, found, err := runtime.FindOrder(ctx, id)
 	if err != nil {
 		writeScopedError(w, err, false)
 		return
 	}
 	result := foundOrderWire{}
-	for _, event := range history.Events {
-		if event.Payload.Order != nil && event.Payload.Order.OrderID == id {
-			order := wireOrder(*event.Payload.Order)
-			result.Found = true
-			result.Order = &order
-			break
-		}
+	if found {
+		wire := wireOrder(order)
+		result.Found = true
+		result.Order = &wire
 	}
-	writeScopedResult(w, scope, history.EvaluatedAt, history.StateVersion, result)
+	writeScopedResult(w, scope, head.EvaluatedAt, head.StateVersion, result)
 }

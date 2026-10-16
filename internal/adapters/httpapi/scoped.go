@@ -431,12 +431,12 @@ func (h *scopedHandlers) dispatch(w http.ResponseWriter, r *http.Request, runtim
 			record := wireCommandRecord(value)
 			response.Record = &record
 		}
-		history, err := runtime.GetHistory(ctx)
+		head, err := runtime.Head(ctx)
 		if err != nil {
 			writeScopedError(w, err, false)
 			return
 		}
-		writeScopedResult(w, scope, history.EvaluatedAt, history.StateVersion, response)
+		writeScopedResult(w, scope, head.EvaluatedAt, head.StateVersion, response)
 	default:
 		writeScopedFailure(w, 503, "ServiceUnavailable", "This operation is not installed.", definiteOutcome(mutation))
 	}
