@@ -3,6 +3,7 @@ package domain
 import (
 	"math/rand"
 	"reflect"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -155,5 +156,34 @@ func TestEvaluateFallsBackWhenIndexIsStale(t *testing.T) {
 	}
 	if allocations[0].BatchID != "batch-extra" {
 		t.Fatalf("first allocation = %q; want the earliest-expiring batch-extra", allocations[0].BatchID)
+	}
+}
+
+// The index lists the batches that can still supply a product, so depleted
+// and pending batches cost an order nothing however many pile up.
+func TestIndexListsOnlyBatchesThatCanSupply(t *testing.T) {
+	state := indexedEvaluationState(6, 2, 2)
+	member := func(productID string) []string {
+		ids := slices.Clone(state.byProduct[productID])
+		slices.Sort(ids)
+		return ids
+	}
+	if got := member("product-0"); !slices.Equal(got, []string{"batch-0", "batch-2", "batch-4"}) {
+		t.Fatalf("index of product-0 = %v", got)
+	}
+	depleted, pending := state.Batches["batch-2"], state.Batches["batch-4"]
+	depleted.RemainingQuantity, depleted.ConsumedByOrders = 0, depleted.ReceivedQuantity
+	pending.PendingWriteoff = true
+	state.Merge(StateDelta{Batches: map[string]Batch{"batch-2": depleted, "batch-4": pending}, StateVersion: 2})
+	if got := member("product-0"); !slices.Equal(got, []string{"batch-0"}) {
+		t.Fatalf("index of product-0 after depleting and pending = %v; want only batch-0", got)
+	}
+	if state.indexed != len(state.Batches) {
+		t.Fatalf("index counts %d batches; state has %d", state.indexed, len(state.Batches))
+	}
+	fresh := Batch{BatchID: "batch-new", ProductID: "product-0", ReceivedQuantity: 5, RemainingQuantity: 5, ExpiresAt: depleted.ExpiresAt}
+	state.Merge(StateDelta{Batches: map[string]Batch{"batch-new": fresh}, StateVersion: 3})
+	if got := member("product-0"); !slices.Equal(got, []string{"batch-0", "batch-new"}) {
+		t.Fatalf("index of product-0 after a new batch = %v", got)
 	}
 }
