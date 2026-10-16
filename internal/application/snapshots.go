@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/JustIkra/umir-warehouse/contract"
@@ -20,6 +21,10 @@ type SnapshotWorker struct {
 	notify         chan struct{}
 	onSaved        func(int64)
 	verify         func(context.Context, domain.Snapshot) error
+	// rejectedSequence is the highest position a candidate was dropped at
+	// because it contradicted the journal; candidates up to it are not judged again.
+	rejectedSequence int64
+	logf             func(string, ...any)
 }
 
 // SnapshotSaveError identifies a failed SnapshotStore save and preserves its cause.
@@ -38,13 +43,13 @@ func (e *SnapshotSaveError) Unwrap() error {
 func (e *SnapshotSaveError) RetryableSnapshotSave() {}
 
 func NewSnapshotWorker(store SnapshotStore) *SnapshotWorker {
-	return &SnapshotWorker{store: store, notify: make(chan struct{}, 1)}
+	return &SnapshotWorker{store: store, notify: make(chan struct{}, 1), logf: log.Printf}
 }
 
 func (w *SnapshotWorker) Offer(snapshot domain.Snapshot) {
 	candidate := domain.CloneSnapshot(snapshot)
 	w.mu.Lock()
-	if candidate.LastSequence <= w.savedSequence || w.active && candidate.LastSequence <= w.activeSequence || w.pending != nil && candidate.LastSequence <= w.pending.LastSequence {
+	if candidate.LastSequence <= w.savedSequence || candidate.LastSequence <= w.rejectedSequence || w.active && candidate.LastSequence <= w.activeSequence || w.pending != nil && candidate.LastSequence <= w.pending.LastSequence {
 		w.mu.Unlock()
 		return
 	}
@@ -80,13 +85,21 @@ func (w *SnapshotWorker) RunOnce(ctx context.Context) (bool, error) {
 	if err == nil {
 		err = w.store.Save(ctx, candidate)
 	}
-	// A candidate that contradicts the journal is dropped, not retried: the
-	// owner offers a newer one with its next write.
+	// A candidate that contradicts the journal is dropped, not retried, and its
+	// position is not judged again: the owner offers a newer one with its next
+	// write. The worker goes on, so one wrong candidate does not stop snapshots.
 	rejected := errors.Is(verifyErr, domain.ErrInvalidSnapshot)
 	w.mu.Lock()
 	w.active = false
 	w.activeSequence = 0
 	acknowledge := w.onSaved
+	logf := w.logf
+	if rejected {
+		w.rejectedSequence = max(w.rejectedSequence, candidate.LastSequence)
+		if w.pending != nil && w.pending.LastSequence <= w.rejectedSequence {
+			w.pending = nil
+		}
+	}
 	if err != nil && !rejected {
 		if w.pending == nil || w.pending.LastSequence < candidate.LastSequence {
 			w.pending = &candidate
@@ -98,6 +111,10 @@ func (w *SnapshotWorker) RunOnce(ctx context.Context) (bool, error) {
 	w.mu.Unlock()
 	if err == nil && acknowledge != nil {
 		acknowledge(candidate.LastSequence)
+	}
+	if rejected {
+		logf("warehouse: snapshot not saved: %v", verifyErr)
+		err = nil
 	}
 	if more {
 		select {
@@ -138,6 +155,12 @@ func (w *SnapshotWorker) Run(ctx context.Context) error {
 	}
 }
 
+func (w *SnapshotWorker) setLogger(logf func(string, ...any)) {
+	w.mu.Lock()
+	w.logf = logf
+	w.mu.Unlock()
+}
+
 func (w *SnapshotWorker) setOnSaved(callback func(int64)) {
 	w.mu.Lock()
 	w.onSaved = callback
@@ -170,6 +193,7 @@ func (o *Owner) ConfigureSnapshots(store SnapshotStore, eventsPerSnapshot int64)
 	o.snapshotStore = store
 	o.snapshotEvery = eventsPerSnapshot
 	o.snapshotWorker = NewSnapshotWorker(store)
+	o.snapshotWorker.setLogger(o.logf)
 	o.snapshotWorker.setOnSaved(o.confirmSnapshotSaved)
 	events := o.events
 	o.snapshotWorker.setVerifier(func(ctx context.Context, candidate domain.Snapshot) error {

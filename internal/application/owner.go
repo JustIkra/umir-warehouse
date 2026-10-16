@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"time"
 
@@ -29,6 +30,7 @@ type Owner struct {
 	snapshotWorker    *SnapshotWorker
 	snapshotEvery     int64
 	lastSavedSequence int64
+	logf              func(string, ...any)
 }
 
 // ReadState is the inventory a caller evaluates. Owner.Prepare returns an
@@ -44,7 +46,22 @@ func NewOwner(events EventStore, now func() time.Time, newID func() string) (*Ow
 	if events == nil || now == nil || newID == nil {
 		return nil, contract.ErrInvalidArgument
 	}
-	return &Owner{events: events, now: now, newID: newID, loadZone: domain.LoadZone}, nil
+	return &Owner{events: events, now: now, newID: newID, loadZone: domain.LoadZone, logf: log.Printf}, nil
+}
+
+// ConfigureLogger replaces the function the Owner and its snapshot worker log
+// through; it must be called before the Owner starts.
+func (o *Owner) ConfigureLogger(logf func(string, ...any)) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.started || logf == nil {
+		return contract.ErrInvalidArgument
+	}
+	o.logf = logf
+	if o.snapshotWorker != nil {
+		o.snapshotWorker.setLogger(logf)
+	}
+	return nil
 }
 
 func (o *Owner) Recover(ctx context.Context) error {

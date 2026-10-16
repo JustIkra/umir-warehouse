@@ -115,8 +115,18 @@ func TestAcceptanceFailedReconciliationBlocksAdmissionAndRepairs(t *testing.T) {
 		owner.mu.Unlock()
 		t.Fatal("a failed rebuild made a consistent projection unusable")
 	}
-	// An inconsistency found elsewhere marks the projection unusable.
-	owner.usable = false
+	owner.mu.Unlock()
+	// A journal that contradicts itself makes the projection unusable.
+	wrapped.failNextFullReadsWith(1, domain.ErrInvalidRecordedBatch)
+	if err := owner.Recover(ctx); !errors.Is(err, contract.ErrInventoryUnavailable) {
+		t.Fatalf("Recover() with a contradicting journal = %v; want InventoryUnavailable", err)
+	}
+	assertOldProjection()
+	owner.mu.Lock()
+	if owner.usable {
+		owner.mu.Unlock()
+		t.Fatal("a contradicting journal left the projection usable")
+	}
 	owner.mu.Unlock()
 	wrapped.failNextFullReads(1)
 	clock.Set(dueAt)
@@ -356,11 +366,17 @@ type acceptanceFailFullReadStore struct {
 	EventStore
 	mu       sync.Mutex
 	failures int
+	// fault is what the failing reads return; nil means an I/O error.
+	fault error
 }
 
 func (s *acceptanceFailFullReadStore) failNextFullReads(count int) {
+	s.failNextFullReadsWith(count, nil)
+}
+
+func (s *acceptanceFailFullReadStore) failNextFullReadsWith(count int, fault error) {
 	s.mu.Lock()
-	s.failures = count
+	s.failures, s.fault = count, fault
 	s.mu.Unlock()
 }
 
@@ -373,7 +389,11 @@ func (s *acceptanceFailFullReadStore) ReadBatches(ctx context.Context, afterSequ
 		s.mu.Lock()
 		if s.failures > 0 {
 			s.failures--
+			fault := s.fault
 			s.mu.Unlock()
+			if fault != nil {
+				return nil, fault
+			}
 			return nil, errors.New("acceptance injected reconciliation failure")
 		}
 		s.mu.Unlock()

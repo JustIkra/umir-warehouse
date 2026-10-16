@@ -1,11 +1,9 @@
 package application
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math/rand/v2"
 	"reflect"
 	"strings"
@@ -205,13 +203,12 @@ func TestSnapshotTailFailureFallsBackToJournal(t *testing.T) {
 	if err := domain.ValidateSnapshot(candidate); err != nil {
 		t.Fatalf("altered snapshot should be structurally valid: %v", err)
 	}
-	var logged bytes.Buffer
-	previous := log.Writer()
-	log.SetOutput(&logged)
-	t.Cleanup(func() { log.SetOutput(previous) })
-
+	sink := newLogSink()
 	owner, err := NewOwner(store, func() time.Time { return at }, nextTestID())
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.ConfigureLogger(sink.logf); err != nil {
 		t.Fatal(err)
 	}
 	if err := owner.ConfigureSnapshots(&fixedSnapshotStore{snapshot: candidate, found: true}, 2); err != nil {
@@ -226,8 +223,8 @@ func TestSnapshotTailFailureFallsBackToJournal(t *testing.T) {
 	if owner.lastSavedSequence != 0 {
 		t.Fatalf("rejected snapshot counted as saved at %d", owner.lastSavedSequence)
 	}
-	if !strings.Contains(logged.String(), "snapshot") {
-		t.Fatalf("fallback was not logged: %q", logged.String())
+	if !strings.Contains(sink.text(), "snapshot") {
+		t.Fatalf("fallback was not logged: %q", sink.text())
 	}
 }
 

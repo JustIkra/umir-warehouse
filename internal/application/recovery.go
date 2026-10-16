@@ -3,7 +3,6 @@ package application
 import (
 	"context"
 	"errors"
-	"log"
 	"math"
 	"time"
 
@@ -85,25 +84,33 @@ type projection struct {
 }
 
 // recoverLocked rebuilds the projection and publishes it only if the whole
-// rebuild succeeds; on any error the previous projection and usable stay.
+// rebuild succeeds; on any error the previous projection stays. It stays
+// usable when the rebuild fails for a reason outside the journal (a canceled
+// context, an unavailable store) and stops being usable when the journal
+// itself is inconsistent.
 func (o *Owner) recoverLocked(ctx context.Context) error {
 	o.started = true
-	candidate, err := o.buildProjection(ctx)
+	// The pending command is looked up first: a failing lookup or a conflicting
+	// record is known before the journal is read.
+	committed, err := o.pendingCommittedLocked(ctx)
 	if err != nil {
 		return err
 	}
-	if o.pending != nil {
-		record, found, err := o.events.FindCommand(ctx, o.pending.CommandID)
-		if err != nil {
+	candidate, err := o.buildProjection(ctx)
+	if err != nil {
+		if isJournalFault(err) {
+			o.usable = false
+		}
+		return err
+	}
+	if o.pending != nil && !committed {
+		// Another writer may have recorded the command while the journal was read.
+		if committed, err = o.pendingCommittedLocked(ctx); err != nil {
 			return err
 		}
-		if found {
-			if record.CommandType != o.pending.CommandType || record.CommandFingerprint != o.pending.CommandFingerprint {
-				o.usable = false
-				return domain.ErrCommandIdentityConflict
-			}
-			o.pending = nil
-		}
+	}
+	if committed {
+		o.pending = nil
 	}
 	o.state, o.expirations = candidate.state, candidate.expirations
 	if candidate.snapshotSequence > 0 {
@@ -114,23 +121,61 @@ func (o *Owner) recoverLocked(ctx context.Context) error {
 	return nil
 }
 
+// pendingCommittedLocked reports whether the store already holds the pending
+// command. A record with another identity is a conflict.
+func (o *Owner) pendingCommittedLocked(ctx context.Context) (bool, error) {
+	if o.pending == nil {
+		return false, nil
+	}
+	record, found, err := o.events.FindCommand(ctx, o.pending.CommandID)
+	if err != nil || !found {
+		return false, err
+	}
+	if record.CommandType != o.pending.CommandType || record.CommandFingerprint != o.pending.CommandFingerprint {
+		o.usable = false
+		return false, domain.ErrCommandIdentityConflict
+	}
+	return true, nil
+}
+
 // buildProjection prefers the latest snapshot plus the journal tail and falls
 // back to the whole journal when the snapshot is invalid or contradicts it.
+// Only a fault in the snapshot or the journal causes the fallback; any other
+// error, such as a store failure, is returned.
 func (o *Owner) buildProjection(ctx context.Context) (projection, error) {
 	if o.snapshotStore != nil {
 		snapshot, found, err := o.snapshotStore.LoadLatest(ctx)
-		if err != nil {
+		if err != nil && !isJournalFault(err) {
 			return projection{}, err
 		}
-		if found {
+		if err != nil {
+			o.logf("warehouse: the latest snapshot is unusable, replaying the journal from the start: %v", err)
+		} else if found {
 			candidate, err := o.projectFromSnapshot(ctx, snapshot)
-			if err == nil || isContextErr(err) || errors.Is(err, domain.ErrConcurrentModification) {
+			if err == nil || !isJournalFault(err) {
 				return candidate, err
 			}
-			log.Printf("warehouse: snapshot at sequence %d is unusable, replaying the journal from the start: %v", snapshot.LastSequence, err)
+			o.logf("warehouse: snapshot at sequence %d is unusable, replaying the journal from the start: %v", snapshot.LastSequence, err)
 		}
 	}
 	return o.projectFromJournal(ctx)
+}
+
+// isJournalFault reports whether err says that a snapshot or the journal is
+// itself wrong, as opposed to the store being unavailable, the context ending
+// or another writer being ahead.
+func isJournalFault(err error) bool {
+	for _, fault := range []error{
+		domain.ErrInvalidSnapshot, domain.ErrUnsupportedSchema, domain.ErrInvalidEventBatch, domain.ErrInvalidEvent,
+		domain.ErrInvalidRecordedBatch, domain.ErrProductNotFound, domain.ErrDishNotFound, domain.ErrBatchNotFound,
+		domain.ErrInsufficientQuantity, domain.ErrQuantityOverflow, domain.ErrInvalidQuantity,
+		domain.ErrInvalidShelfLife, domain.ErrInvalidBusinessTime, domain.ErrShelfLifeOverflow,
+	} {
+		if errors.Is(err, fault) {
+			return true
+		}
+	}
+	return false
 }
 
 // projectFromSnapshot takes ownership of the snapshot state: stores return copies.
