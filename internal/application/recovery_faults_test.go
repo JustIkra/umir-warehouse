@@ -169,7 +169,7 @@ func TestJournalFaultMarksProjectionUnusable(t *testing.T) {
 		t.Fatal(err)
 	}
 	counting.setScanErr(func(int64) error { return domain.ErrInvalidRecordedBatch })
-	owner.mu.Lock()
+	owner.mu.lockUncancellable()
 	err = owner.recoverLocked(ctx)
 	usable := owner.usable
 	owner.mu.Unlock()
@@ -213,7 +213,7 @@ func TestRecoveryLooksUpPendingCommandBeforeReadingJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner.pending = &domain.CommandBatch{CommandID: "pending", CommandType: "ConfirmOrder", CommandFingerprint: "fp"}
-	owner.mu.Lock()
+	owner.mu.lockUncancellable()
 	err = owner.recoverLocked(ctx)
 	owner.mu.Unlock()
 	if !errors.Is(err, store.err) {

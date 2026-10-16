@@ -31,7 +31,9 @@ func (o *Owner) ProcessDueExpirations(ctx context.Context) ([]contract.ExpiryRes
 }
 
 func (o *Owner) RunExpirations(ctx context.Context) (contract.ExpirationRun, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.ExpirationRun{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	state, results, err := o.prepareLocked(ctx)
 	if err != nil {
@@ -41,7 +43,9 @@ func (o *Owner) RunExpirations(ctx context.Context) (contract.ExpirationRun, err
 }
 
 func (o *Owner) ExpireBatch(ctx context.Context, request contract.ExpireBatchRequest) (contract.ExpiryResult, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.ExpiryResult{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if o.scope.RestaurantID != "" || request.CommandID == "" || request.BatchID == "" {
 		return contract.ExpiryResult{}, contract.ErrInvalidArgument
@@ -105,7 +109,7 @@ func (o *Owner) writeExpiryLocked(ctx context.Context, commandID, fingerprint st
 			}
 			if resolveErr != nil {
 				o.pending = nil
-				o.usable = false
+				o.markUnusable(resolveErr)
 			}
 			return resolved, nil
 		}

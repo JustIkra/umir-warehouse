@@ -185,7 +185,7 @@ func (w *SnapshotWorker) observeSaved(sequence int64) {
 }
 
 func (o *Owner) ConfigureSnapshots(store SnapshotStore, eventsPerSnapshot int64) error {
-	o.mu.Lock()
+	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
 	if store == nil || eventsPerSnapshot <= 0 || o.started {
 		return contract.ErrInvalidArgument
@@ -247,7 +247,9 @@ func replayToCandidate(ctx context.Context, events EventStore, state domain.Inve
 }
 
 func (o *Owner) RunSnapshotOnce(ctx context.Context) (bool, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return false, err
+	}
 	worker := o.snapshotWorker
 	o.mu.Unlock()
 	if worker == nil {
@@ -257,7 +259,9 @@ func (o *Owner) RunSnapshotOnce(ctx context.Context) (bool, error) {
 }
 
 func (o *Owner) RunSnapshots(ctx context.Context) error {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return err
+	}
 	worker := o.snapshotWorker
 	o.mu.Unlock()
 	if worker == nil {
@@ -267,7 +271,7 @@ func (o *Owner) RunSnapshots(ctx context.Context) error {
 }
 
 func (o *Owner) confirmSnapshotSaved(sequence int64) {
-	o.mu.Lock()
+	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
 	if sequence > o.lastSavedSequence {
 		o.lastSavedSequence = sequence

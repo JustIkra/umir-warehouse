@@ -26,7 +26,9 @@ func (o *Owner) writePendingLocked(ctx context.Context, batch domain.Batch, now 
 	return domain.ExpiryResult{BatchID: p.BatchID, ProductID: p.ProductID, ExpiresAt: p.ExpiresAt, ProcessedAt: now}, nil
 }
 func (o *Owner) ConfirmWriteoff(ctx context.Context, request contract.ConfirmWriteoffRequest) (result contract.WriteoffResult, err error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.WriteoffResult{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	var committedPreparation int64
 	defer func() {
@@ -100,7 +102,9 @@ func (o *Owner) ConfirmWriteoff(ctx context.Context, request contract.ConfirmWri
 	}
 }
 func (o *Owner) ResolveWriteoff(ctx context.Context, commandID, batchID string) (contract.WriteoffObservation, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.WriteoffObservation{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if commandID == "" || isReservedCommandID(commandID) || batchID == "" || o.scope.RestaurantID == "" {
 		return contract.WriteoffObservation{}, contract.ErrInvalidArgument

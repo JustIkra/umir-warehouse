@@ -75,7 +75,9 @@ func evaluateMenu(ctx context.Context, prepared ReadState) (contract.MenuEvaluat
 }
 
 func (o *Owner) CommitAcceptedOrder(ctx context.Context, request contract.CommitOrderRequest) (contract.CommitResult, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.CommitResult{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if request.CommandID == "" || request.ProposalID == "" || isReservedCommandID(request.CommandID) {
 		return contract.CommitResult{}, contract.ErrInvalidArgument

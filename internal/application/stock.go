@@ -10,7 +10,9 @@ import (
 )
 
 func (o *Owner) PrepareStock(ctx context.Context) (contract.StockPreparation, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.StockPreparation{Products: []contract.Product{}, Batches: []contract.Batch{}}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	prepared, transitions, err := o.prepareLocked(ctx)
 	result := contract.StockPreparation{EvaluatedAt: prepared.EvaluatedAt, StateVersion: o.state.StateVersion, InvalidationRequired: len(transitions) > 0, Products: make([]contract.Product, 0), Batches: make([]contract.Batch, 0)}

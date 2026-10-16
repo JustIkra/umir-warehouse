@@ -43,7 +43,7 @@ func TestSnapshotFullCommandBoundary(t *testing.T) {
 	if snapshot.LastSequence != 4 || snapshot.LastSequence != snapshot.State.StateVersion {
 		t.Fatalf("snapshot sequence/state version = %d/%d; want final sequence 4 of compound command", snapshot.LastSequence, snapshot.State.StateVersion)
 	}
-	owner.mu.Lock()
+	owner.mu.lockUncancellable()
 	lastSaved := owner.lastSavedSequence
 	owner.mu.Unlock()
 	if lastSaved != 4 {

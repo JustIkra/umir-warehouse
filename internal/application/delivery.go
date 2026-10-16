@@ -11,7 +11,9 @@ import (
 )
 
 func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDeliveryRequest) (contract.DeliveryReceipt, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.DeliveryReceipt{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if request.CommandID == "" || isReservedCommandID(request.CommandID) {
 		return contract.DeliveryReceipt{}, contract.ErrInvalidArgument

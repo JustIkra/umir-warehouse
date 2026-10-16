@@ -100,7 +100,9 @@ func planningPeriod(ctx context.Context, events []domain.Event, from, to time.Ti
 // and takes the version, the clock and a shallow copy of the inventory; the
 // facts of the period up to that version are then read and summed without it.
 func (p *Planning) capture(ctx context.Context, request contract.PlanningRequest) (planningCapture, error) {
-	p.owner.mu.Lock()
+	if err := p.owner.mu.Lock(ctx); err != nil {
+		return planningCapture{}, inventoryUnavailable(err)
+	}
 	capture, err := p.captureLocked(ctx, request)
 	p.owner.mu.Unlock()
 	if err != nil {

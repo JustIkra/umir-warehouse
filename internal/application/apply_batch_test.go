@@ -22,7 +22,7 @@ func TestApplyBatchLockedKeepsExpirationIndexInStepWithState(t *testing.T) {
 	if err := owner.Recover(ctx); err != nil {
 		t.Fatal(err)
 	}
-	owner.mu.Lock()
+	owner.mu.lockUncancellable()
 	defer owner.mu.Unlock()
 	apply := func(commandID, commandType string, events ...domain.Event) error {
 		return owner.applyBatchLocked(asRecordedBatch(domain.CommandBatch{ExpectedVersion: owner.state.StateVersion, CommandID: commandID, CommandType: commandType, CommandFingerprint: "fp-" + commandID, Events: events}))

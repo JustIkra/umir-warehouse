@@ -71,7 +71,9 @@ func NewAnalytics(stock AnalyticsStockReader, journal AnalyticsJournalReader, co
 // CaptureJournal brings the projection up to date and returns its version, the
 // clock and a copy of the products.
 func (o *Owner) CaptureJournal(ctx context.Context) (JournalCapture, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return JournalCapture{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if err := o.syncProjectionLocked(ctx); err != nil {
 		return JournalCapture{}, inventoryUnavailable(err)

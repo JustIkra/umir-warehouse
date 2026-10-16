@@ -2,6 +2,14 @@
 
 ## Не выпущено
 
+- Keep the projection when a request ends early. The owner lock is a context-aware mutex: a request whose context ends while it waits leaves without touching anything, and `usable` is no longer cleared by a canceled or timed-out request, only by a journal that contradicts the projection. The server's `WriteTimeout` is now the request timeout plus five seconds so a result recorded just before the deadline can still be written.
+
+- Answer commits and passive reads from bounded store reads. `order-commits` takes the position of the order from `FindOrderPlacement`, so a second command for a proposal that is already an order answers 200 with the same order instead of an unknown outcome; `orders`, `order-attempts`, `commands` and history pages use `Head`, `FindOrder` and `HistoryPage` instead of copying the journal. Planning holds the owner only to capture the version and a shallow view and reads the period facts without it; `Movements` reads the events of its period and takes names from the captured products. `Analytics` reads the journal through `CaptureJournal` and `ReadPeriod`, which replace `ReadAnalyticsJournal`. `bootstrap.Options.WrapEventStore` lets tests wrap each restaurant's store.
+
+- Keep snapshot and journal faults apart from store failures. A snapshot that the journal contradicts is logged and dropped, the worker goes on and the position is not verified again. Recovery falls back to the whole journal only for faults in the snapshot or the journal, never for a store error, and marks the projection unusable when the journal is inconsistent. Snapshot validation also requires a version that covers its records and delivery lines numbered 1..n. `Owner.ConfigureLogger` injects the logger.
+
+- Index batches by product so evaluating an order reads only the batches of its ingredients that can still supply them.
+
 - Add `make perf`, a scale harness under `tests/perf` (build tag `perf`, linted through `run.build-tags`). It builds a restaurant with 1000, 4000 and 8000 orders over the memory stores and prints latencies of commits, menu, supply, recommendations, inventory, history, movements and recovery (live, from the journal, from a snapshot), plus the heap of a freshly restored owner. It checks only growth ratios between the first and last checkpoint.
 
 - Stop copying the projection on every read. `Owner.Prepare` returns an independent copy of products, dishes (with their ingredients) and batches only, without the delivery IDs, and the owner's own commands work on a borrowed view of its state under the lock. Offering a snapshot clones the state once. Writes to the maps returned by `Prepare` can no longer reach the owner or a snapshot.

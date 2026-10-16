@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log"
-	"sync"
 	"time"
 
 	"github.com/JustIkra/umir-warehouse/contract"
@@ -17,7 +16,7 @@ type Owner struct {
 	loadZone          func(string) (*time.Location, error)
 	tzdataVersion     string
 	scope             contract.Scope
-	mu                sync.Mutex
+	mu                ctxMutex
 	events            EventStore
 	now               func() time.Time
 	newID             func() string
@@ -46,13 +45,13 @@ func NewOwner(events EventStore, now func() time.Time, newID func() string) (*Ow
 	if events == nil || now == nil || newID == nil {
 		return nil, contract.ErrInvalidArgument
 	}
-	return &Owner{events: events, now: now, newID: newID, loadZone: domain.LoadZone, logf: log.Printf}, nil
+	return &Owner{mu: newCtxMutex(), events: events, now: now, newID: newID, loadZone: domain.LoadZone, logf: log.Printf}, nil
 }
 
 // ConfigureLogger replaces the function the Owner and its snapshot worker log
 // through; it must be called before the Owner starts.
 func (o *Owner) ConfigureLogger(logf func(string, ...any)) error {
-	o.mu.Lock()
+	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
 	if o.started || logf == nil {
 		return contract.ErrInvalidArgument
@@ -65,7 +64,9 @@ func (o *Owner) ConfigureLogger(logf func(string, ...any)) error {
 }
 
 func (o *Owner) Recover(ctx context.Context) error {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	o.started = true
 	if err := o.recoverLocked(ctx); err != nil {
@@ -87,7 +88,9 @@ func (o *Owner) Recover(ctx context.Context) error {
 }
 
 func (o *Owner) Prepare(ctx context.Context) (ReadState, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return ReadState{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	o.started = true
 	state, _, err := o.prepareLocked(ctx)
@@ -128,7 +131,7 @@ func (o *Owner) prepareLocked(ctx context.Context) (ReadState, []contract.Expiry
 		if !ok {
 			version, err := o.events.Version(ctx)
 			if err != nil {
-				o.usable = false
+				o.markUnusable(err)
 				return ReadState{}, results, err
 			}
 			if version != o.state.StateVersion {
@@ -163,7 +166,7 @@ func (o *Owner) prepareLocked(ctx context.Context) (ReadState, []contract.Expiry
 }
 
 func (o *Owner) ConfigureScope(scope contract.Scope) error {
-	o.mu.Lock()
+	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
 	if o.started || o.scope.RestaurantID != "" {
 		return contract.ErrInvalidArgument
@@ -176,7 +179,7 @@ func (o *Owner) ConfigureScope(scope contract.Scope) error {
 }
 
 func (o *Owner) ConfigureTZData(version string) error {
-	o.mu.Lock()
+	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
 	if o.started {
 		return contract.ErrInvalidArgument
@@ -186,7 +189,7 @@ func (o *Owner) ConfigureTZData(version string) error {
 }
 
 func (o *Owner) ConfigureZoneLoader(loader func(string) (*time.Location, error)) error {
-	o.mu.Lock()
+	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
 	if o.started || loader == nil {
 		return contract.ErrInvalidArgument
@@ -196,7 +199,7 @@ func (o *Owner) ConfigureZoneLoader(loader func(string) (*time.Location, error))
 }
 
 func (o *Owner) ValidateAnalyticsScope(scope contract.Scope) error {
-	o.mu.Lock()
+	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
 	if scope.Validate() != nil || scope.OrganizationID != o.scope.OrganizationID || scope.RestaurantID != o.scope.RestaurantID || scope.LifecycleVersion != o.scope.LifecycleVersion {
 		return contract.ErrForbidden

@@ -131,7 +131,7 @@ func TestCancelledCatchUpKeepsConsistentPrefix(t *testing.T) {
 	defer cancel()
 	counting.afterBatch = cancel
 
-	owner.mu.Lock()
+	owner.mu.lockUncancellable()
 	defer owner.mu.Unlock()
 	if err := owner.syncProjectionLocked(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("syncProjectionLocked() = %v; want context.Canceled", err)
@@ -164,7 +164,7 @@ func TestFailedRecoveryKeepsPreviousProjection(t *testing.T) {
 	boom := errors.New("journal unavailable")
 	counting.setScanErr(func(int64) error { return boom })
 
-	owner.mu.Lock()
+	owner.mu.lockUncancellable()
 	err = owner.recoverLocked(ctx)
 	usable := owner.usable
 	owner.mu.Unlock()

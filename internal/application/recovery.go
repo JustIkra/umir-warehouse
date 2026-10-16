@@ -25,9 +25,7 @@ func (o *Owner) syncProjectionLocked(ctx context.Context) error {
 	}
 	version, err := o.events.Version(ctx)
 	if err != nil {
-		if !isContextErr(err) {
-			o.usable = false
-		}
+		o.markUnusable(err)
 		return err
 	}
 	if version < o.state.StateVersion {
@@ -222,6 +220,14 @@ func (o *Owner) completeProjection(ctx context.Context, candidate projection) (p
 	return candidate, nil
 }
 
+// markUnusable stops the projection from being served after err, unless err is
+// the end of a request's context, which says nothing about the journal.
+func (o *Owner) markUnusable(err error) {
+	if !isContextErr(err) {
+		o.usable = false
+	}
+}
+
 func isContextErr(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
@@ -335,7 +341,7 @@ func (o *Owner) resolvePendingLocked(ctx context.Context) (domain.CommandRecord,
 	pending := cloneCommandBatch(*o.pending)
 	record, found, err := o.events.FindCommand(ctx, pending.CommandID)
 	if err != nil {
-		o.usable = false
+		o.markUnusable(err)
 		return domain.CommandRecord{}, false, err
 	}
 	if found {
@@ -346,7 +352,7 @@ func (o *Owner) resolvePendingLocked(ctx context.Context) (domain.CommandRecord,
 		}
 		batches, err := o.events.ReadBatches(ctx, pending.ExpectedVersion)
 		if err != nil {
-			o.usable = false
+			o.markUnusable(err)
 			o.pending = nil
 			return record, true, err
 		}
@@ -367,7 +373,7 @@ func (o *Owner) resolvePendingLocked(ctx context.Context) (domain.CommandRecord,
 	}
 	result, err := o.events.AppendBatch(ctx, *pending)
 	if err != nil {
-		o.usable = false
+		o.markUnusable(err)
 		if errors.Is(err, domain.ErrConcurrentModification) {
 			o.pending = nil
 		}

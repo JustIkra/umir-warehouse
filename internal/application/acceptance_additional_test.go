@@ -96,7 +96,7 @@ func TestAcceptanceFailedReconciliationBlocksAdmissionAndRepairs(t *testing.T) {
 	}
 	assertOldProjection := func() {
 		t.Helper()
-		owner.mu.Lock()
+		owner.mu.lockUncancellable()
 		defer owner.mu.Unlock()
 		if owner.state.StateVersion != 3 || owner.state.Batches["batch"].RemainingQuantity != 10000 {
 			t.Fatalf("failed reconciliation changed old inventory: %#v", owner.state)
@@ -110,7 +110,7 @@ func TestAcceptanceFailedReconciliationBlocksAdmissionAndRepairs(t *testing.T) {
 		t.Fatalf("Recover() during rebuild failure = %v; want InventoryUnavailable", err)
 	}
 	assertOldProjection()
-	owner.mu.Lock()
+	owner.mu.lockUncancellable()
 	if !owner.usable {
 		owner.mu.Unlock()
 		t.Fatal("a failed rebuild made a consistent projection unusable")
@@ -122,7 +122,7 @@ func TestAcceptanceFailedReconciliationBlocksAdmissionAndRepairs(t *testing.T) {
 		t.Fatalf("Recover() with a contradicting journal = %v; want InventoryUnavailable", err)
 	}
 	assertOldProjection()
-	owner.mu.Lock()
+	owner.mu.lockUncancellable()
 	if owner.usable {
 		owner.mu.Unlock()
 		t.Fatal("a contradicting journal left the projection usable")
@@ -254,7 +254,7 @@ func TestAcceptanceReaderSeesWholeDeliveryAndExpiryProjection(t *testing.T) {
 	if read.view.StateVersion != 3 || len(read.view.Products) != 1 || read.view.Products[0].Quantity != 0 || len(read.view.Products[0].Batches) != 0 {
 		t.Fatalf("reader inventory after atomic delivery+expiry = %#v; want final zero-stock state at version 3", read.view)
 	}
-	owner.mu.Lock()
+	owner.mu.lockUncancellable()
 	version, tasks := owner.state.StateVersion, len(owner.expirations)
 	owner.mu.Unlock()
 	if version != 3 || tasks != 0 {

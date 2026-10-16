@@ -429,3 +429,13 @@ func TestRunServiceJoinsServeAndSnapshotFailures(t *testing.T) {
 		t.Fatalf("runService() error = %v; want serve and snapshot failures", err)
 	}
 }
+
+func TestServerWriteTimeoutExceedsRequestTimeout(t *testing.T) {
+	server := newHTTPServer("0", http.NotFoundHandler(), 8*time.Second)
+	if server.WriteTimeout != 13*time.Second {
+		t.Fatalf("WriteTimeout = %v; want the request timeout plus 5s so a recorded result can be written", server.WriteTimeout)
+	}
+	if server.ReadTimeout != 8*time.Second {
+		t.Fatalf("ReadTimeout = %v; want the request timeout", server.ReadTimeout)
+	}
+}
