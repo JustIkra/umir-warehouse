@@ -69,12 +69,9 @@ func evaluatePositions(state InventoryState, positions []Position) (OrderEvaluat
 		AcceptedPositions:  make([]AcceptedPosition, 0, len(positions)),
 		Changes:            make([]Change, 0),
 	}
-	working := make(map[string]Quantity, len(state.Batches))
-	for id, batch := range state.Batches {
-		if !batch.PendingWriteoff {
-			working[id] = batch.RemainingQuantity
-		}
-	}
+	// working holds the remaining quantity of the batches this order has
+	// already drawn from; every other batch still has its recorded quantity.
+	working := make(map[string]Quantity)
 	allocations := make([]Allocation, 0)
 	seenLines := make(map[int64]struct{}, len(positions))
 	for _, position := range positions {
@@ -125,8 +122,7 @@ func evaluatePositions(state InventoryState, positions []Position) (OrderEvaluat
 					return OrderEvaluation{}, nil, err
 				}
 				for _, allocation := range allocated {
-					remaining := working[allocation.BatchID] - allocation.Quantity
-					working[allocation.BatchID] = remaining
+					working[allocation.BatchID] = workingQuantity(working, allocation.BatchID, state.Batches[allocation.BatchID]) - allocation.Quantity
 				}
 				allocations = append(allocations, allocated...)
 			}
@@ -149,14 +145,25 @@ func evaluatePositions(state InventoryState, positions []Position) (OrderEvaluat
 	return evaluation, allocations, nil
 }
 
+func workingQuantity(working map[string]Quantity, id string, batch Batch) Quantity {
+	if batch.PendingWriteoff {
+		return 0
+	}
+	if quantity, drawn := working[id]; drawn {
+		return quantity
+	}
+	return batch.RemainingQuantity
+}
+
 func availableQuantity(state InventoryState, working map[string]Quantity, productID string) (Quantity, error) {
 	var available Quantity
-	for batchID, batch := range state.Batches {
-		if batch.ProductID != productID || working[batchID] <= 0 {
+	for _, batchID := range state.productBatchIDs(productID) {
+		quantity := workingQuantity(working, batchID, state.Batches[batchID])
+		if quantity <= 0 {
 			continue
 		}
 		var err error
-		available, err = AddQuantity(available, working[batchID])
+		available, err = AddQuantity(available, quantity)
 		if err != nil {
 			return 0, err
 		}
@@ -165,12 +172,15 @@ func availableQuantity(state InventoryState, working map[string]Quantity, produc
 }
 
 func productBatches(state InventoryState, working map[string]Quantity, productID string) []Batch {
-	batches := make([]Batch, 0)
-	for batchID, batch := range state.Batches {
-		if batch.ProductID != productID || working[batchID] <= 0 {
+	ids := state.productBatchIDs(productID)
+	batches := make([]Batch, 0, len(ids))
+	for _, batchID := range ids {
+		batch := state.Batches[batchID]
+		quantity := workingQuantity(working, batchID, batch)
+		if quantity <= 0 {
 			continue
 		}
-		batch.RemainingQuantity = working[batchID]
+		batch.RemainingQuantity = quantity
 		batches = append(batches, batch)
 	}
 	return batches

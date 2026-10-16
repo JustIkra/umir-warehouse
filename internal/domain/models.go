@@ -135,4 +135,11 @@ type InventoryState struct {
 	DeliveryIDs  map[string]struct{}
 	Batches      map[string]Batch
 	StateVersion int64
+
+	// byProduct lists the IDs of the batches of each product and indexed counts
+	// the batches listed. It is derived from Batches, built where a state is
+	// built or cloned and never serialized. A state whose count differs from
+	// len(Batches), such as a literal, is searched in full instead.
+	byProduct map[string][]string
+	indexed   int
 }

@@ -107,19 +107,23 @@ func CloneInventoryState(value InventoryState) InventoryState {
 	value.Products = maps.Clone(value.Products)
 	value.Dishes = cloneDishes(value.Dishes)
 	value.DeliveryIDs = maps.Clone(value.DeliveryIDs)
+	source := value
 	value.Batches = maps.Clone(value.Batches)
+	value.cloneIndex(source)
 	return value
 }
 
 // CloneReadView copies what a reader of the current inventory needs:
 // products, dishes and batches. DeliveryIDs is left out and nil.
 func CloneReadView(value InventoryState) InventoryState {
-	return InventoryState{
+	view := InventoryState{
 		Products:     maps.Clone(value.Products),
 		Dishes:       cloneDishes(value.Dishes),
 		Batches:      maps.Clone(value.Batches),
 		StateVersion: value.StateVersion,
 	}
+	view.cloneIndex(value)
+	return view
 }
 
 func cloneDishes(dishes map[string]Dish) map[string]Dish {

@@ -19,8 +19,10 @@ import (
 const (
 	products = 30
 	dishes   = 40
-	// commitSamples orders are timed at each checkpoint, after the corpus size.
+	// commitSamples orders are timed in each of commitBlocks blocks that end at
+	// every checkpoint.
 	commitSamples = 20
+	commitBlocks  = 3
 	// repeats takes the best of several runs of a read so scheduling noise does
 	// not decide a ratio.
 	repeats = 5
@@ -147,25 +149,36 @@ func TestScale(t *testing.T) {
 	done := 0
 	start := time.Now()
 	for _, checkpoint := range []int{1000, 4000, 8000} {
-		for ; done < checkpoint; done++ {
+		for ; done < checkpoint-commitSamples*commitBlocks; done++ {
 			if done%150 == 149 {
 				s.deliver()
 			}
 			s.commit(done)
 			s.flushSnapshots()
 		}
-		r := row{orders: done + commitSamples, batches: s.deliveries * products, build: time.Since(start)}
-		var commitTotal time.Duration
-		samples := make([]time.Duration, 0, commitSamples)
-		for range commitSamples {
-			sample := s.timed("commit", func() error { s.commit(done); return nil })
-			samples = append(samples, sample)
-			commitTotal += sample
-			s.flushSnapshots()
-			done++
+		r := row{orders: checkpoint, batches: s.deliveries * products}
+		// The median of a block is steady against a few preempted commits, and the
+		// best block against a busy machine.
+		for block := range commitBlocks {
+			var blockTotal time.Duration
+			samples := make([]time.Duration, 0, commitSamples)
+			for range commitSamples {
+				sample := s.timed("commit", func() error { s.commit(done); return nil })
+				samples = append(samples, sample)
+				blockTotal += sample
+				s.flushSnapshots()
+				done++
+			}
+			slices.Sort(samples)
+			avg, p50 := blockTotal/commitSamples, samples[commitSamples/2]
+			if block == 0 || avg < r.commitAvg {
+				r.commitAvg = avg
+			}
+			if block == 0 || p50 < r.commitP50 {
+				r.commitP50 = p50
+			}
 		}
-		slices.Sort(samples)
-		r.commitAvg, r.commitP50 = commitTotal/commitSamples, samples[commitSamples/2]
+		r.build = time.Since(start)
 		r.menu = s.timed("menu", func() error { _, err := s.owner.EvaluateMenu(s.ctx); return err })
 		r.supply = s.timed("supply", func() error { _, err := s.planning.Supply(s.ctx, planning); return err })
 		r.recInputs = s.timed("recommendations", func() error { _, err := s.planning.Recommendations(s.ctx, planning); return err })
@@ -212,8 +225,8 @@ func TestScale(t *testing.T) {
 	ratio("recover_journal", first.recoverJournal, last.recoverJournal, 12)
 	ratio("movements", first.movements, last.movements, 12)
 	// The commit ratio is checked on the median of the timed commits: on a busy
-	// machine the mean is decided by a few preempted samples. The mean ratio is
-	// printed too.
+	// machine the mean is decided by a few preempted samples. The best-block
+	// mean ratio is printed too.
 	t.Logf("commit_avg(%d)/commit_avg(%d) = %.2f", last.orders, first.orders, float64(last.commitAvg)/float64(first.commitAvg))
 	ratio("commit_p50", first.commitP50, last.commitP50, 3)
 }

@@ -64,6 +64,7 @@ func (s *InventoryState) Merge(delta StateDelta) {
 	maps.Copy(s.Products, delta.Products)
 	maps.Copy(s.Dishes, delta.Dishes)
 	maps.Copy(s.DeliveryIDs, delta.DeliveryIDs)
+	s.indexNewBatches(delta.Batches)
 	maps.Copy(s.Batches, delta.Batches)
 	s.StateVersion = delta.StateVersion
 }
