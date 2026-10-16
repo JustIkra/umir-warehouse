@@ -95,10 +95,23 @@ func (r *Registry) register(ctx context.Context, scope contract.Scope, operation
 			if operationID != "" && old.registerOperation != "" && old.registerOperation != operationID {
 				return contract.RuntimeReadiness{}, contract.ErrCommandIdentityConflict
 			}
-			if err := old.runtime.owner.UpdateSettings(ctx, scope); err != nil {
+			// The owner may be busy; waiting for it must not hold the registry,
+			// so the lock is given up for the update. The owner never takes the
+			// registry lock, so nothing here can wait on the registry in turn.
+			owner := old.runtime.owner
+			r.mu.Unlock()
+			err := owner.UpdateSettings(ctx, scope)
+			r.mu.Lock()
+			if err != nil {
 				return contract.RuntimeReadiness{}, err
 			}
-			old.scope = scope
+			old = r.tenants[scope.RestaurantID]
+			if old.closed {
+				return contract.RuntimeReadiness{}, contract.ErrScopeDeleted
+			}
+			if settingsNumber(old.scope) < newVersion {
+				old.scope = scope
+			}
 		}
 		if operationID != "" {
 			if old.registerOperation != "" && old.registerOperation != operationID {

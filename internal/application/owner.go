@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/JustIkra/umir-warehouse/contract"
@@ -187,6 +188,12 @@ func (o *Owner) UpdateSettings(ctx context.Context, scope contract.Scope) error 
 	defer o.mu.Unlock()
 	if scope.Validate() != nil || scope.OrganizationID != o.scope.OrganizationID || scope.RestaurantID != o.scope.RestaurantID || scope.RuntimeEpoch != o.scope.RuntimeEpoch || scope.LifecycleVersion != o.scope.LifecycleVersion {
 		return contract.ErrInvalidArgument
+	}
+	// Concurrent updates may arrive in either order; settings only move forward.
+	current, currentErr := strconv.ParseInt(o.scope.SettingsVersion, 10, 64)
+	next, nextErr := strconv.ParseInt(scope.SettingsVersion, 10, 64)
+	if currentErr == nil && nextErr == nil && next <= current {
+		return nil
 	}
 	o.scope.TimeZone, o.scope.SettingsVersion = scope.TimeZone, scope.SettingsVersion
 	return nil

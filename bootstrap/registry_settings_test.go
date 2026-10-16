@@ -3,10 +3,13 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/JustIkra/umir-warehouse/contract"
+	"github.com/JustIkra/umir-warehouse/internal/application"
+	"github.com/JustIkra/umir-warehouse/internal/domain"
 )
 
 const (
@@ -107,5 +110,79 @@ func TestLostRegistrationAnswerRepeatedWithNewSettings(t *testing.T) {
 	}
 	if _, err := registry.RegisterRuntime(ctx, settingsScope("Europe/Samara", "3"), "66666666-6666-4666-8666-666666666666"); !errors.Is(err, contract.ErrCommandIdentityConflict) {
 		t.Fatalf("another operation = %v; want ErrCommandIdentityConflict", err)
+	}
+}
+
+// gateStore holds appends until released, which keeps the owner busy.
+type gateStore struct {
+	application.EventStore
+	armed   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *gateStore) AppendBatch(ctx context.Context, batch domain.CommandBatch) (domain.AppendResult, error) {
+	if s.armed.Load() {
+		close(s.entered)
+		<-s.release
+	}
+	return s.EventStore.AppendBatch(ctx, batch)
+}
+
+// A settings update waits for the restaurant's owner; that wait must not hold
+// up the registry, so another restaurant can be registered meanwhile.
+func TestSettingsUpdateWaitDoesNotBlockRegistry(t *testing.T) {
+	ctx := context.Background()
+	var gates []*gateStore
+	now := time.Date(2026, 10, 10, 12, 0, 0, 0, time.FixedZone("MSK", 3*60*60))
+	registry, err := NewRegistry(Options{Now: func() time.Time { return now }, NewID: func() string { return "id" }, EventsPerSnapshot: 10,
+		WrapEventStore: func(inner application.EventStore) application.EventStore {
+			gate := &gateStore{EventStore: inner, entered: make(chan struct{}), release: make(chan struct{})}
+			gates = append(gates, gate)
+			return gate
+		}}, settingsEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(ctx, settingsScope("Europe/Moscow", "1")); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := registry.Resolve(ctx, settingsScope("Europe/Moscow", "1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := gates[0]
+	gate.armed.Store(true)
+	busy := make(chan error, 1)
+	go func() {
+		_, err := runtime.RegisterProduct(ctx, contract.RegisterProductRequest{CommandID: "p", ProductID: "p", Name: "Milk", BaseUnit: contract.BaseUnitML})
+		busy <- err
+	}()
+	<-gate.entered
+	updated := make(chan error, 1)
+	go func() { updated <- registry.Register(ctx, settingsScope("Europe/Samara", "2")) }()
+	time.Sleep(50 * time.Millisecond) // the update is now waiting for the owner, or about to
+	other := settingsScope("Europe/Moscow", "1")
+	other.RestaurantID = "33333333-3333-4333-8333-333333333334"
+	registered := make(chan error, 1)
+	go func() { registered <- registry.Register(ctx, other) }()
+	select {
+	case err := <-registered:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		close(gate.release)
+		t.Fatal("a busy owner held up the registration of another restaurant")
+	}
+	close(gate.release)
+	if err := <-busy; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-updated; err != nil {
+		t.Fatalf("the update after the owner was free = %v", err)
+	}
+	if got := currentSettings(t, registry); got.TimeZone != "Europe/Samara" || got.SettingsVersion != "2" {
+		t.Fatalf("settings = %s/%s; want Europe/Samara/2", got.TimeZone, got.SettingsVersion)
 	}
 }
