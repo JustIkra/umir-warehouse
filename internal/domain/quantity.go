@@ -20,7 +20,8 @@ func AddQuantity(a, b Quantity) (Quantity, error) {
 
 // ValidateInventoryTotalsWith checks the per-product stock totals of state with
 // the batches of delta substituted for the ones they replace, without copying
-// the state.
+// the state. Only the products the delta touches can change, and an indexed
+// state lists the batches that hold their stock, so the check reads those.
 func ValidateInventoryTotalsWith(state *InventoryState, delta StateDelta) error {
 	totals := make(map[string]Quantity)
 	add := func(batch Batch) error {
@@ -31,12 +32,29 @@ func ValidateInventoryTotalsWith(state *InventoryState, delta StateDelta) error 
 		totals[batch.ProductID] = total
 		return err
 	}
-	for id, batch := range state.Batches {
-		if _, replaced := delta.Batches[id]; replaced {
-			continue
+	if state.Indexed() {
+		touched := make(map[string]struct{})
+		for _, batch := range delta.Batches {
+			touched[batch.ProductID] = struct{}{}
 		}
-		if err := add(batch); err != nil {
-			return err
+		for productID := range touched {
+			for _, id := range state.productBatchIDs(productID) {
+				if _, replaced := delta.Batches[id]; replaced {
+					continue
+				}
+				if err := add(state.Batches[id]); err != nil {
+					return err
+				}
+			}
+		}
+	} else {
+		for id, batch := range state.Batches {
+			if _, replaced := delta.Batches[id]; replaced {
+				continue
+			}
+			if err := add(batch); err != nil {
+				return err
+			}
 		}
 	}
 	for _, batch := range delta.Batches {

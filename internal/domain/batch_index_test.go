@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"errors"
+	"math"
 	"math/rand"
 	"reflect"
 	"slices"
@@ -185,5 +187,50 @@ func TestIndexListsOnlyBatchesThatCanSupply(t *testing.T) {
 	state.Merge(StateDelta{Batches: map[string]Batch{"batch-new": fresh}, StateVersion: 3})
 	if got := member("product-0"); !slices.Equal(got, []string{"batch-0", "batch-new"}) {
 		t.Fatalf("index of product-0 after a new batch = %v", got)
+	}
+}
+
+// A state that arrives without an index, as one decoded from storage does,
+// gets it once and keeps it: the first merge builds it, later ones extend it.
+func TestStateWithoutIndexIsIndexedByMerge(t *testing.T) {
+	built := indexedEvaluationState(30, 3, 2)
+	state := InventoryState{Products: built.Products, Dishes: built.Dishes, DeliveryIDs: built.DeliveryIDs, Batches: built.Batches, StateVersion: built.StateVersion}
+	if state.Indexed() {
+		t.Fatal("a literal state reports an index")
+	}
+	fresh := Batch{BatchID: "batch-new", ProductID: "product-0", ReceivedQuantity: 5, RemainingQuantity: 5, ExpiresAt: built.Batches["batch-0"].ExpiresAt}
+	state.Merge(StateDelta{Batches: map[string]Batch{"batch-new": fresh}, StateVersion: state.StateVersion + 1})
+	if !state.Indexed() {
+		t.Fatal("the state is still without an index after a merge")
+	}
+	ids := slices.Clone(state.byProduct["product-0"])
+	if !slices.Contains(ids, "batch-new") || !slices.Contains(ids, "batch-0") {
+		t.Fatalf("index of product-0 = %v; want the old and the new batch", ids)
+	}
+	if again := indexedEvaluationState(1, 1, 1); !again.Indexed() {
+		t.Fatal("a cloned state reports no index")
+	}
+}
+
+// The totals check reads the batches of the touched products only; for a state
+// that was valid before the delta it gives the answer of the full pass.
+func TestTotalsCheckThroughIndexEqualsFullPass(t *testing.T) {
+	state := indexedEvaluationState(6, 2, 2)
+	for _, id := range []string{"batch-0", "batch-2"} {
+		batch := state.Batches[id]
+		batch.ReceivedQuantity, batch.RemainingQuantity = math.MaxInt64/2+1, math.MaxInt64/2+1
+		state.Batches[id] = batch
+	}
+	state.Merge(StateDelta{Batches: map[string]Batch{}, StateVersion: state.StateVersion})
+	state.reindex()
+	plain := InventoryState{Products: state.Products, Batches: state.Batches}
+	for name, delta := range map[string]StateDelta{
+		"touches the full product": {Batches: map[string]Batch{"batch-new": {BatchID: "batch-new", ProductID: "product-0", ReceivedQuantity: 1, RemainingQuantity: 1}}},
+		"replaces a big batch":     {Batches: map[string]Batch{"batch-0": {BatchID: "batch-0", ProductID: "product-0", ReceivedQuantity: 1, RemainingQuantity: 1}}},
+	} {
+		want := ValidateInventoryTotalsWith(&plain, delta)
+		if got := ValidateInventoryTotalsWith(&state, delta); !errors.Is(got, want) && got != want {
+			t.Errorf("%s: indexed %v, full pass %v", name, got, want)
+		}
 	}
 }

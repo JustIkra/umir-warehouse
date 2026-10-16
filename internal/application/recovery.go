@@ -181,6 +181,8 @@ func (o *Owner) projectFromSnapshot(ctx context.Context, snapshot domain.Snapsho
 	if err := domain.ValidateSnapshot(snapshot); err != nil {
 		return projection{}, err
 	}
+	// The state may come from storage without the owner's derived batch index.
+	snapshot.State.Reindex()
 	index, err := expirationIndex(snapshot.State)
 	if err != nil {
 		return projection{}, err

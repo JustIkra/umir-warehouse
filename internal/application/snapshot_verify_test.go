@@ -292,3 +292,50 @@ func TestSnapshotOfferCopiesOnlyWhatIsKept(t *testing.T) {
 		}
 	})
 }
+
+// Storage hands back a snapshot state without the owner's derived index; the
+// owner indexes it once on recovery so commits do not search every batch.
+func TestRecoveryFromSnapshotIndexesBatches(t *testing.T) {
+	ctx := context.Background()
+	at := moscowTime(2026, time.April, 1, 10)
+	store := seedStore(t, at.Add(72*time.Hour), 20000, 0)
+	seed, err := NewOwner(store, func() time.Time { return at }, nextTestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A state rebuilt from plain data, as a decoder would produce it.
+	plain := domain.InventoryState{Products: seed.state.Products, Dishes: seed.state.Dishes, DeliveryIDs: seed.state.DeliveryIDs, Batches: seed.state.Batches, StateVersion: seed.state.StateVersion}
+	if plain.Indexed() {
+		t.Fatal("a plain state reports an index")
+	}
+	snapshots := &plainSnapshotStore{snapshot: domain.Snapshot{SchemaVersion: domain.SnapshotSchemaV2, StreamID: domain.InventoryStreamID, LastSequence: plain.StateVersion, State: plain}}
+	owner, err := NewOwner(store, func() time.Time { return at }, nextTestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.ConfigureSnapshots(snapshots, 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if owner.lastSavedSequence != plain.StateVersion {
+		t.Fatalf("recovered from sequence %d; want the snapshot at %d", owner.lastSavedSequence, plain.StateVersion)
+	}
+	if !owner.state.Indexed() {
+		t.Fatal("the state recovered from a snapshot has no batch index")
+	}
+}
+
+// plainSnapshotStore returns its snapshot as it is, without the copy that
+// would give the state an index.
+type plainSnapshotStore struct{ snapshot domain.Snapshot }
+
+func (s *plainSnapshotStore) LoadLatest(context.Context) (domain.Snapshot, bool, error) {
+	return s.snapshot, true, nil
+}
+
+func (s *plainSnapshotStore) Save(context.Context, domain.Snapshot) error { return nil }

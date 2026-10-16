@@ -23,6 +23,13 @@ func canSupply(batch Batch) bool {
 	return batch.RemainingQuantity > 0 && !batch.PendingWriteoff
 }
 
+// Indexed reports whether the state carries a current batch index.
+func (s InventoryState) Indexed() bool { return s.indexed == len(s.Batches) }
+
+// Reindex builds the batch index of a state that arrived without one, such as
+// a state decoded from storage. The owner calls it once; Merge keeps it current.
+func (s *InventoryState) Reindex() { s.reindex() }
+
 // reindex rebuilds the index of a state from its batches.
 func (s *InventoryState) reindex() {
 	s.byProduct = nil
@@ -55,8 +62,8 @@ func (s *InventoryState) cloneIndex(source InventoryState) {
 // they are new or replace a recorded batch. It must run before the delta is
 // copied into the state, and only extends an index that is current.
 func (s *InventoryState) indexBatches(delta map[string]Batch) {
-	if s.indexed != len(s.Batches) {
-		return
+	if !s.Indexed() {
+		s.reindex()
 	}
 	for id, batch := range delta {
 		recorded, exists := s.Batches[id]
