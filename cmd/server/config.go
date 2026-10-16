@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -21,9 +22,14 @@ type serverConfig struct {
 	snapshotRetryInterval time.Duration
 }
 
-func loadConfig(lookup func(string) (string, bool)) (serverConfig, error) {
+// loadConfig reads the configuration from the environment; readFile reads the
+// files named by the <NAME>_FILE variables of the service keys.
+func loadConfig(lookup func(string) (string, bool), readFile func(string) ([]byte, error)) (serverConfig, error) {
+	if value, ok := lookup("WAREHOUSE_API_MODE"); !ok || value == "" {
+		return serverConfig{}, fmt.Errorf("WAREHOUSE_API_MODE is required: set it to legacy or v2")
+	}
 	cfg := serverConfig{
-		apiMode:               envValue(lookup, "WAREHOUSE_API_MODE", "legacy"),
+		apiMode:               envValue(lookup, "WAREHOUSE_API_MODE", ""),
 		port:                  envValue(lookup, "PORT", "8080"),
 		internalPort:          envValue(lookup, "INTERNAL_PORT", "8082"),
 		requestTimeout:        8 * time.Second,
@@ -81,12 +87,20 @@ func loadConfig(lookup func(string) (string, bool)) (serverConfig, error) {
 	}
 	if cfg.apiMode == "v2" {
 		cfg.authJWKSURL = envValue(lookup, "AUTH_JWKS_URL", "")
-		cfg.authServiceKey = envValue(lookup, "AUTH_SERVICE_KEY", "")
+		keys := make(map[string]string, 4)
+		for _, name := range []string{"AUTH_SERVICE_KEY", "AUTH_RUNTIME_SERVICE_KEY", "GATEWAY_SERVICE_KEY", "SERVING_SERVICE_KEY"} {
+			key, err := serviceKey(lookup, readFile, name)
+			if err != nil {
+				return serverConfig{}, err
+			}
+			keys[name] = key
+		}
+		cfg.authServiceKey = keys["AUTH_SERVICE_KEY"]
 		cfg.allowPlainHTTP = envValue(lookup, "AUTH_ALLOW_PLAIN_HTTP", "false") == "true"
 		if cfg.maxRequestBytes > 1<<20 {
 			return serverConfig{}, fmt.Errorf("v2 MAX_REQUEST_BYTES must be at most 1048576")
 		}
-		cfg.callerKeys = map[string]string{"umir-auth": envValue(lookup, "AUTH_RUNTIME_SERVICE_KEY", ""), "umir-gateway": envValue(lookup, "GATEWAY_SERVICE_KEY", ""), "umir-serving": envValue(lookup, "SERVING_SERVICE_KEY", "")}
+		cfg.callerKeys = map[string]string{"umir-auth": keys["AUTH_RUNTIME_SERVICE_KEY"], "umir-gateway": keys["GATEWAY_SERVICE_KEY"], "umir-serving": keys["SERVING_SERVICE_KEY"]}
 		seen := make(map[string]bool)
 		for _, key := range cfg.callerKeys {
 			if key == "" || seen[key] {
@@ -115,4 +129,27 @@ func envValue(lookup func(string) (string, bool), key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// serviceKey returns a service key from NAME or from the file named by
+// NAME_FILE, without its trailing newline. Setting both is an error. Errors
+// name the variable and never carry the key.
+func serviceKey(lookup func(string) (string, bool), readFile func(string) ([]byte, error), name string) (string, error) {
+	value := envValue(lookup, name, "")
+	path := envValue(lookup, name+"_FILE", "")
+	switch {
+	case value != "" && path != "":
+		return "", fmt.Errorf("%s and %s_FILE are both set; use one", name, name)
+	case path == "":
+		return value, nil
+	}
+	content, err := readFile(path)
+	if err != nil {
+		return "", fmt.Errorf("%s_FILE: the file cannot be read", name)
+	}
+	key := strings.TrimSuffix(strings.TrimSuffix(string(content), "\n"), "\r")
+	if key == "" {
+		return "", fmt.Errorf("%s_FILE: the file is empty", name)
+	}
+	return key, nil
 }

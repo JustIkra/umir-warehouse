@@ -53,7 +53,7 @@ func runMain() error {
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
 		return healthcheck()
 	}
-	cfg, err := loadConfig(os.LookupEnv)
+	cfg, err := loadConfig(os.LookupEnv, os.ReadFile)
 	if err != nil {
 		return err
 	}

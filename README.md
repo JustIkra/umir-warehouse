@@ -18,9 +18,13 @@ The unpublished W1–W6 candidate implements the C2-frozen scoped backend contra
 
 Основной документ бизнес-контрактов находится в [docs фабрики](https://github.com/JustIkra/umir-factory/blob/main/docs/business-core.md). При расхождении описаний контрактов приоритет имеет docs.
 
+## Scale checks
+
+`make perf` (build tag `perf`) builds a restaurant with 1000, 4000 and 8000 orders over the memory stores, prints the latency of commits, reads and recovery and the heap of a freshly restored owner, and fails only when recovery, `Movements` (CPU time) or the median commit grow faster than the corpus. The numbers are not absolute limits and depend on the machine.
+
 ## Restaurant boundary (W1 candidate)
 
-The W1 candidate adds a separate v2 composition. It consumes the frozen backend contract 2.0.0-draft.2. Set `WAREHOUSE_API_MODE=v2` to select it. The default `legacy` mode preserves the selected v1 topology. Do not expose a legacy business listener as the v2 backend.
+The W1 candidate adds a separate v2 composition. It consumes the frozen backend contract 2.0.0-draft.2. `WAREHOUSE_API_MODE` has no default and the process refuses to start without it: set `v2` to select this composition or `legacy` explicitly for the v1 topology. Do not expose a legacy business listener as the v2 backend.
 
 In v2 mode, the public listener serves only `GET /healthz`. All business requests use the private listener and `/internal/warehouse/v2/r/{restaurantID}/...`. Unscoped requests return InvalidArgument. Health reports process availability, not restaurant readiness.
 
@@ -31,6 +35,7 @@ In v2 mode, the public listener serves only `GET /healthz`. All business request
 | `AUTH_RUNTIME_SERVICE_KEY` | Auth credential for the Warehouse lifecycle boundary. |
 | `GATEWAY_SERVICE_KEY` | Gateway credential for the Warehouse private listener. |
 | `SERVING_SERVICE_KEY` | Serving credential for the Warehouse private listener. |
+| `<NAME>_FILE` | For each of the four service keys above, the path of a file that holds the key instead of the variable itself (a Docker or Kubernetes secret). One trailing newline is dropped. Setting both `<NAME>` and `<NAME>_FILE`, or pointing at an empty or unreadable file, stops the start; errors name the variable and never contain the key. |
 | `AUTH_ALLOW_PLAIN_HTTP=true` | Allow HTTP discovery only on an isolated test network. HTTPS is required otherwise. |
 
 V2 requires distinct, nonempty caller keys and a request limit of at most 1 MiB. It does not log token or key values. The Auth client rejects redirects, bounds discovery responses to 64 KiB, and validates one to three Ed25519 public keys. It refreshes every 30 seconds when used, with at most one extra refresh for an unknown kid in that window. Failed discovery blocks verification. Caller authentication uses constant-time comparisons. JWT validation checks exact EdDSA headers, claims, issuer, audiences, 60-second lifetime, subject, operation, capability, and route restaurant. Browser identity/cookie headers cannot supply trust.

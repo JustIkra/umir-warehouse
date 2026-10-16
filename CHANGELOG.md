@@ -2,6 +2,10 @@
 
 ## Не выпущено
 
+- **BREAKING:** `WAREHOUSE_API_MODE` has no default any more. An empty or missing value stops the start with an error naming the variable; `legacy` is selected only by setting it. Migration: set `WAREHOUSE_API_MODE=legacy` (the repository `compose.yaml` now does) or `v2` wherever the service is started; a deployment that relied on the old default must be updated before this version is rolled out.
+
+- Read the four service keys (`AUTH_SERVICE_KEY`, `AUTH_RUNTIME_SERVICE_KEY`, `GATEWAY_SERVICE_KEY`, `SERVING_SERVICE_KEY`) from files named by `<NAME>_FILE`. A trailing newline is dropped; setting both the variable and the file, or an empty or unreadable file, is a start-up error; the key never appears in errors or logs.
+
 - Cache loaded time zones by name in `zonedata.Load`, so a repeated load no longer parses the archive. `Check` still reads the archive afresh. Offering a snapshot to the worker now copies it once and only when it is needed, running it copies nothing more, and a snapshot save failure of one restaurant no longer stops the snapshot workers of the others: each restaurant's worker is retried on its own after a pause. A test fixes that a token issued a second ahead of the clock is rejected (no `iat` tolerance).
 
 - Refresh Auth signing keys once for all callers. The refresh runs on its own context with a timeout, outside the cache lock, and every waiter waits for its result under its own context. A caller that started the refresh and gave up no longer records a failure that blocks the others, and a failed refresh still does not serve stale keys.

@@ -105,27 +105,27 @@ func healthcheckClient(statusCode int, closeErr error) *http.Client {
 }
 
 func TestLoadConfigDefaultsAndPort(t *testing.T) {
-	cfg, err := loadConfig(func(string) (string, bool) { return "", false })
+	cfg, err := loadConfigEnv(func(string) (string, bool) { return "", false })
 	if err != nil {
-		t.Fatalf("loadConfig() error = %v", err)
+		t.Fatalf("loadConfigEnv() error = %v", err)
 	}
 	if cfg.port != "8080" || cfg.internalPort != "8082" || cfg.requestTimeout != 8*time.Second || cfg.maxRequestBytes != 1<<20 || cfg.eventsPerSnapshot != 100 || cfg.snapshotRetryInterval != time.Second {
-		t.Fatalf("loadConfig() = %#v; want defaults", cfg)
+		t.Fatalf("loadConfigEnv() = %#v; want defaults", cfg)
 	}
 
-	cfg, err = loadConfig(func(key string) (string, bool) {
+	cfg, err = loadConfigEnv(func(key string) (string, bool) {
 		if key == "PORT" {
 			return "18080", true
 		}
 		return "", false
 	})
 	if err != nil || cfg.port != "18080" {
-		t.Fatalf("loadConfig(PORT) = %#v, %v; want port 18080", cfg, err)
+		t.Fatalf("loadConfigEnv(PORT) = %#v, %v; want port 18080", cfg, err)
 	}
 }
 
 func TestLoadConfigUsesSnapshotRetryIntervalAndIgnoresExpirationInterval(t *testing.T) {
-	cfg, err := loadConfig(func(key string) (string, bool) {
+	cfg, err := loadConfigEnv(func(key string) (string, bool) {
 		switch key {
 		case "SNAPSHOT_RETRY_INTERVAL":
 			return "250ms", true
@@ -136,16 +136,16 @@ func TestLoadConfigUsesSnapshotRetryIntervalAndIgnoresExpirationInterval(t *test
 		}
 	})
 	if err != nil || cfg.snapshotRetryInterval != 250*time.Millisecond {
-		t.Fatalf("loadConfig() = %#v, %v; want snapshot retry 250ms", cfg, err)
+		t.Fatalf("loadConfigEnv() = %#v, %v; want snapshot retry 250ms", cfg, err)
 	}
-	cfg, err = loadConfig(func(key string) (string, bool) {
+	cfg, err = loadConfigEnv(func(key string) (string, bool) {
 		if key == "EXPIRATION_CHECK_INTERVAL" {
 			return "9s", true
 		}
 		return "", false
 	})
 	if err != nil || cfg.snapshotRetryInterval != time.Second {
-		t.Fatalf("loadConfig(obsolete expiration setting) = %#v, %v; want 1s snapshot default", cfg, err)
+		t.Fatalf("loadConfigEnv(obsolete expiration setting) = %#v, %v; want 1s snapshot default", cfg, err)
 	}
 }
 
@@ -172,14 +172,14 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := loadConfig(func(key string) (string, bool) {
+			_, err := loadConfigEnv(func(key string) (string, bool) {
 				if key == tt.key {
 					return tt.value, true
 				}
 				return "", false
 			})
 			if err == nil || !strings.Contains(err.Error(), tt.key) {
-				t.Fatalf("loadConfig() error = %v; want error naming %s", err, tt.key)
+				t.Fatalf("loadConfigEnv() error = %v; want error naming %s", err, tt.key)
 			}
 		})
 	}
