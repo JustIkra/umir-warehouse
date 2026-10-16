@@ -14,7 +14,6 @@ import (
 type planningSpyStore struct {
 	EventStore
 	reads, writes int
-	corrupt       bool
 }
 
 func TestFINSupplyCapacityRefusesPartialResult(t *testing.T) {
@@ -43,13 +42,9 @@ func TestFINSupplyCapacityRefusesPartialResult(t *testing.T) {
 	}
 }
 
-func (s *planningSpyStore) ReadBatches(ctx context.Context, after int64) ([]domain.RecordedBatch, error) {
+func (s *planningSpyStore) ReadPeriod(ctx context.Context, query PeriodQuery) ([]domain.Event, error) {
 	s.reads++
-	batches, err := s.EventStore.ReadBatches(ctx, after)
-	if s.corrupt && len(batches) > 0 {
-		batches[0].Events[0].Sequence++
-	}
-	return batches, err
+	return s.EventStore.ReadPeriod(ctx, query)
 }
 
 func (s *planningSpyStore) AppendBatch(ctx context.Context, batch domain.CommandBatch) (domain.AppendResult, error) {
@@ -90,11 +85,6 @@ func TestFINPlanningRiskHorizonAndWholeRecipeCapture(t *testing.T) {
 	if err != nil || again.Menu.Dishes[0].Allocations[0].Quantity != 1000 {
 		t.Fatalf("menu capture alias: %+v %v", again, err)
 	}
-	spy.corrupt = true
-	if _, err := planning.Supply(context.Background(), request); !errors.Is(err, contract.ErrInventoryUnavailable) {
-		t.Fatalf("corrupt prefix accepted: %v", err)
-	}
-	spy.corrupt = false
 	owner.pending = &domain.CommandBatch{CommandID: "unresolved"}
 	spy.reads, spy.writes = 0, 0
 	if _, err := planning.Supply(context.Background(), request); !errors.Is(err, contract.ErrInventoryUnavailable) || spy.reads != 0 || spy.writes != 0 {

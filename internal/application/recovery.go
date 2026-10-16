@@ -250,8 +250,6 @@ func newJournalWalk(after int64) *journalWalk {
 	return walk
 }
 
-func (w *journalWalk) version() int64 { return w.next - 1 }
-
 func (w *journalWalk) check(batch domain.RecordedBatch) error {
 	if len(batch.Events) == 0 || batch.CommandID == "" || batch.CommandType == "" || batch.CommandFingerprint == "" || batch.FinalSequence != batch.Events[len(batch.Events)-1].Sequence {
 		return domain.ErrInvalidRecordedBatch
@@ -282,27 +280,6 @@ func (w *journalWalk) check(batch domain.RecordedBatch) error {
 	}
 	_, err := domain.ResultForBatch(batch)
 	return err
-}
-
-// validateJournalContext checks a journal that is already in memory.
-// TODO(T4): remove with the last in-memory journal readers (planning, analytics).
-func validateJournalContext(ctx context.Context, batches []domain.RecordedBatch, version int64) error {
-	if version < 0 {
-		return domain.ErrInvalidRecordedBatch
-	}
-	walk := newJournalWalk(0)
-	for _, batch := range batches {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := walk.check(batch); err != nil {
-			return err
-		}
-	}
-	if walk.version() != version {
-		return domain.ErrInvalidRecordedBatch
-	}
-	return nil
 }
 
 func expirationIndex(state domain.InventoryState) (map[string]time.Time, error) {

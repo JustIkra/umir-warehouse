@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -22,8 +23,20 @@ type AnalyticsStockReader interface {
 	PrepareStock(context.Context) (contract.StockPreparation, error)
 	CalculateStock(context.Context, contract.StockPreparation) (contract.InventoryView, error)
 }
+
+// JournalCapture is what a report fixes about the journal: how far it had
+// gone, when, and the names of the products.
+type JournalCapture struct {
+	Version  int64
+	At       time.Time
+	Products map[string]domain.Product
+}
+
+// AnalyticsJournalReader captures the journal under the owner's lock and then
+// reads the events of a period without it.
 type AnalyticsJournalReader interface {
-	ReadAnalyticsJournal(context.Context) ([]domain.RecordedBatch, time.Time, error)
+	CaptureJournal(context.Context) (JournalCapture, error)
+	ReadPeriod(context.Context, PeriodQuery) ([]domain.Event, error)
 }
 type capturedReport struct {
 	request  contract.AnalyticsRequest
@@ -54,24 +67,21 @@ func NewAnalytics(stock AnalyticsStockReader, journal AnalyticsJournalReader, co
 	}
 	return &Analytics{loadZone: loadZone, stock: stock, journal: journal, coverage: coverage, now: now, newCursor: newCursor, reports: map[*capturedReport]bool{}, cursors: map[string]reportCursor{}}, nil
 }
-func (o *Owner) ReadAnalyticsJournal(ctx context.Context) ([]domain.RecordedBatch, time.Time, error) {
+
+// CaptureJournal brings the projection up to date and returns its version, the
+// clock and a copy of the products.
+func (o *Owner) CaptureJournal(ctx context.Context) (JournalCapture, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	batches, err := o.events.ReadBatches(ctx, 0)
-	if err != nil {
-		return nil, time.Time{}, inventoryUnavailable(err)
+	if err := o.syncProjectionLocked(ctx); err != nil {
+		return JournalCapture{}, inventoryUnavailable(err)
 	}
-	version := int64(0)
-	if len(batches) > 0 {
-		version = batches[len(batches)-1].FinalSequence
-	}
-	if err := validateJournalContext(ctx, batches, version); err != nil {
-		if errors.Is(err, domain.ErrUnsupportedSchema) {
-			return nil, time.Time{}, contract.ErrUnknownEventSchema
-		}
-		return nil, time.Time{}, inventoryUnavailable(err)
-	}
-	return batches, domain.CanonicalBusinessTime(o.now()), nil
+	return JournalCapture{Version: o.state.StateVersion, At: domain.CanonicalBusinessTime(o.now()), Products: maps.Clone(o.state.Products)}, nil
+}
+
+// ReadPeriod reads the events of a period from the journal.
+func (o *Owner) ReadPeriod(ctx context.Context, query PeriodQuery) ([]domain.Event, error) {
+	return readPeriod(ctx, o.events, query)
 }
 func normalizeAnalytics(r contract.AnalyticsRequest, stock bool) (contract.AnalyticsRequest, error) {
 	if r.Scope.Validate() != nil || r.Actor == "" || !contract.ValidVersion(r.ExpectedSettingsVersion) || !utf8.ValidString(r.Search) || utf8.RuneCountInString(r.Search) > 100 || !utf8.ValidString(r.ProductID) {
@@ -218,89 +228,86 @@ func (a *Analytics) Movements(ctx context.Context, request contract.AnalyticsReq
 	if err := a.fresh(r); err != nil {
 		return contract.MovementReport{}, err
 	}
-	batches, at, err := a.journal.ReadAnalyticsJournal(ctx)
+	captured, err := a.journal.CaptureJournal(ctx)
 	if err != nil {
 		return contract.MovementReport{}, err
 	}
+	at := captured.At
 	from, to, err := a.movementPeriod(r, at)
 	if err != nil {
 		return contract.MovementReport{}, err
 	}
-	state := domain.InventoryState{}
-	for _, b := range batches {
+	events, err := a.journal.ReadPeriod(ctx, PeriodQuery{
+		From: from, To: to, UpToSequence: captured.Version,
+		Types: []domain.EventType{domain.EventDeliveryReceived, domain.EventOrderPlaced, domain.EventBatchExpired, domain.EventBatchWriteoffConfirmed},
+	})
+	if err != nil {
+		return contract.MovementReport{}, inventoryUnavailable(err)
+	}
+	if err := checkEventSchemas(events); err != nil {
+		return contract.MovementReport{}, contract.ErrUnknownEventSchema
+	}
+	result := contract.MovementReport{Identity: contract.ReportIdentity{Scope: r.Scope, EvaluatedAt: at, StateVersion: captured.Version, PrefixSequence: captured.Version, FilterFingerprint: analyticsFingerprint(r)}, From: from, To: to, Coverage: contract.Coverage{Epoch: r.Scope.RuntimeEpoch, CoverageFrom: a.coverage, Complete: !from.Before(a.coverage), RequestedFrom: from, AvailableFrom: maxTime(from, a.coverage)}, Items: make([]contract.MovementRow, 0)}
+	rows := map[string]contract.MovementRow{}
+	for _, e := range events {
 		if err := ctx.Err(); err != nil {
 			return contract.MovementReport{}, err
 		}
-		if err := state.ApplyBatch(b); err != nil {
-			return contract.MovementReport{}, inventoryUnavailable(err)
+		add := func(id string, q domain.Quantity, kind int) error {
+			p, ok := captured.Products[id]
+			if !ok {
+				return domain.ErrProductNotFound
+			}
+			row := rows[id]
+			row.ProductID = id
+			row.Name = p.Name
+			row.BaseUnit = contract.BaseUnit(p.BaseUnit)
+			var current contract.Quantity
+			switch kind {
+			case 0:
+				current = row.ReceivedQuantity
+			case 1:
+				current = row.OrderedQuantity
+			case 2:
+				current = row.WrittenOffQuantity
+			}
+			total, err := domain.AddQuantity(domain.Quantity(current), q)
+			if err != nil {
+				return err
+			}
+			switch kind {
+			case 0:
+				row.ReceivedQuantity = contract.Quantity(total)
+			case 1:
+				row.OrderedQuantity = contract.Quantity(total)
+			case 2:
+				row.WrittenOffQuantity = contract.Quantity(total)
+			}
+			rows[id] = row
+			return nil
 		}
-	}
-	result := contract.MovementReport{Identity: contract.ReportIdentity{Scope: r.Scope, EvaluatedAt: at, StateVersion: state.StateVersion, PrefixSequence: state.StateVersion, FilterFingerprint: analyticsFingerprint(r)}, From: from, To: to, Coverage: contract.Coverage{Epoch: r.Scope.RuntimeEpoch, CoverageFrom: a.coverage, Complete: !from.Before(a.coverage), RequestedFrom: from, AvailableFrom: maxTime(from, a.coverage)}, Items: make([]contract.MovementRow, 0)}
-	rows := map[string]contract.MovementRow{}
-	for _, b := range batches {
-		for _, e := range b.Events {
-			if err := ctx.Err(); err != nil {
-				return contract.MovementReport{}, err
-			}
-			if e.RecordedAt.Before(from) || !e.RecordedAt.Before(to) {
-				continue
-			}
-			add := func(id string, q domain.Quantity, kind int) error {
-				p, ok := state.Products[id]
-				if !ok {
-					return domain.ErrProductNotFound
-				}
-				row := rows[id]
-				row.ProductID = id
-				row.Name = p.Name
-				row.BaseUnit = contract.BaseUnit(p.BaseUnit)
-				var current contract.Quantity
-				switch kind {
-				case 0:
-					current = row.ReceivedQuantity
-				case 1:
-					current = row.OrderedQuantity
-				case 2:
-					current = row.WrittenOffQuantity
-				}
-				total, err := domain.AddQuantity(domain.Quantity(current), q)
-				if err != nil {
-					return err
-				}
-				switch kind {
-				case 0:
-					row.ReceivedQuantity = contract.Quantity(total)
-				case 1:
-					row.OrderedQuantity = contract.Quantity(total)
-				case 2:
-					row.WrittenOffQuantity = contract.Quantity(total)
-				}
-				rows[id] = row
-				return nil
-			}
-			switch e.Type {
-			case domain.EventDeliveryReceived:
-				for _, v := range e.Payload.Batches {
-					if err = add(v.ProductID, v.ReceivedQuantity, 0); err != nil {
-						return contract.MovementReport{}, inventoryUnavailable(err)
-					}
-				}
-			case domain.EventOrderPlaced:
-				for _, v := range e.Payload.Order.Allocations {
-					if err = add(v.ProductID, v.Quantity, 1); err != nil {
-						return contract.MovementReport{}, inventoryUnavailable(err)
-					}
-				}
-			case domain.EventBatchExpired:
-				v := e.Payload.Expiry
-				if err = add(v.ProductID, v.WrittenOffQuantity, 2); err != nil {
+		switch e.Type {
+		case domain.EventDeliveryReceived:
+			for _, v := range e.Payload.Batches {
+				if err = add(v.ProductID, v.ReceivedQuantity, 0); err != nil {
 					return contract.MovementReport{}, inventoryUnavailable(err)
 				}
-			case domain.EventBatchWriteoffConfirmed:
-				v := e.Payload.Writeoff
-				if err = add(v.ProductID, v.WrittenOffQuantity, 2); err != nil {
+			}
+		case domain.EventOrderPlaced:
+			for _, v := range e.Payload.Order.Allocations {
+				if err = add(v.ProductID, v.Quantity, 1); err != nil {
 					return contract.MovementReport{}, inventoryUnavailable(err)
 				}
+			}
+		case domain.EventBatchExpired:
+			v := e.Payload.Expiry
+			if err = add(v.ProductID, v.WrittenOffQuantity, 2); err != nil {
+				return contract.MovementReport{}, inventoryUnavailable(err)
+			}
+		case domain.EventBatchWriteoffConfirmed:
+			v := e.Payload.Writeoff
+			if err = add(v.ProductID, v.WrittenOffQuantity, 2); err != nil {
+				return contract.MovementReport{}, inventoryUnavailable(err)
 			}
 		}
 	}

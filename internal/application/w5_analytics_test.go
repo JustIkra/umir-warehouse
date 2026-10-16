@@ -183,22 +183,23 @@ func TestW5JournalSurvivesStockFailureAndRejectsUnknownSchema(t *testing.T) {
 	if err != nil || report.Items[0].ReceivedQuantity != 10000 || report.Items[0].WrittenOffQuantity != 0 {
 		t.Fatalf("independent journal=%+v %v", report, err)
 	}
-	wrapped := &eventStoreWrapper{EventStore: base, read: func(_ int64, b []domain.RecordedBatch, e error) ([]domain.RecordedBatch, error) {
-		b[0].Events[0].SchemaVersion = 99
-		return b, e
-	}}
-	bad := w3Owner(t, wrapped, clock)
+	badSchema := &periodSchemaStore{EventStore: base}
+	bad := w3Owner(t, badSchema, clock)
 	badAnalytics := w5Analytics(t, bad, clock, at)
 	if _, err := badAnalytics.Movements(ctx, w5Request()); !errors.Is(err, contract.ErrUnknownEventSchema) {
 		t.Fatalf("unknown schema=%v", err)
 	}
-	wrapped.read = func(_ int64, b []domain.RecordedBatch, e error) ([]domain.RecordedBatch, error) {
-		b[1].Events[0].EventID = b[0].Events[0].EventID
-		return b, e
+}
+
+// periodSchemaStore returns the events of a period with an unknown schema.
+type periodSchemaStore struct{ EventStore }
+
+func (s *periodSchemaStore) ReadPeriod(ctx context.Context, query PeriodQuery) ([]domain.Event, error) {
+	events, err := s.EventStore.ReadPeriod(ctx, query)
+	for i := range events {
+		events[i].SchemaVersion = 99
 	}
-	if _, err := badAnalytics.Movements(ctx, w5Request()); !errors.Is(err, contract.ErrInventoryUnavailable) {
-		t.Fatalf("duplicate fact=%v", err)
-	}
+	return events, err
 }
 func TestW5ConcurrentReportsCaptureOnePrefix(t *testing.T) {
 	at := moscowTime(2026, time.April, 2, 10)

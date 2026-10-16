@@ -17,23 +17,23 @@ func TestFINPeriodUsesRecordedAtAndOnlyActualConsumption(t *testing.T) {
 	order := func(recorded time.Time, quantity domain.Quantity) domain.Event {
 		return domain.Event{RecordedAt: recorded, Type: domain.EventOrderPlaced, Payload: domain.EventPayload{Order: &domain.Order{PlacedAt: at.Add(-900 * time.Hour), AcceptedPositions: []domain.AcceptedPosition{{DishID: "d", Portions: 2}}, Allocations: []domain.Allocation{{ProductID: "p", Quantity: quantity}}}}}
 	}
-	batches := []domain.RecordedBatch{{Events: []domain.Event{
+	events := []domain.Event{
 		order(from.Add(-time.Nanosecond), 100), order(from, 200), order(at.Add(-time.Nanosecond), 300), order(at, 400),
 		{RecordedAt: from, Type: domain.EventBatchExpiryPending, Payload: domain.EventPayload{Pending: &domain.PendingResult{ProductID: "p", RemainingQuantity: 700}}},
 		{RecordedAt: from, Type: domain.EventBatchExpired, Payload: domain.EventPayload{Expiry: &domain.ExpiryResult{ProductID: "p", WrittenOffQuantity: 700}}},
 		{RecordedAt: from, Type: domain.EventBatchWriteoffConfirmed, Payload: domain.EventPayload{Writeoff: &domain.WriteoffResult{ProductID: "p", WrittenOffQuantity: 600}}},
-	}}}
-	facts, err := planningPeriod(context.Background(), batches, from, at)
+	}
+	facts, err := planningPeriod(context.Background(), events, from, at)
 	if err != nil || facts.consumed["p"] != 1100 || facts.demand["d"] != 4 {
 		t.Fatalf("RecordedAt/count: %+v %v", facts, err)
 	}
-	batches[0].Events = []domain.Event{order(from, math.MaxInt64), order(from, 1)}
-	if _, err := planningPeriod(context.Background(), batches, from, at); !errors.Is(err, contract.ErrCalculationUnavailable) {
+	events = []domain.Event{order(from, math.MaxInt64), order(from, 1)}
+	if _, err := planningPeriod(context.Background(), events, from, at); !errors.Is(err, contract.ErrCalculationUnavailable) {
 		t.Fatalf("period sum overflow: %v", err)
 	}
-	batches[0].Events = []domain.Event{order(from, 1), order(from, 1)}
-	batches[0].Events[0].Payload.Order.AcceptedPositions[0].Portions = math.MaxInt64
-	if _, err := planningPeriod(context.Background(), batches, from, at); !errors.Is(err, contract.ErrCalculationUnavailable) {
+	events = []domain.Event{order(from, 1), order(from, 1)}
+	events[0].Payload.Order.AcceptedPositions[0].Portions = math.MaxInt64
+	if _, err := planningPeriod(context.Background(), events, from, at); !errors.Is(err, contract.ErrCalculationUnavailable) {
 		t.Fatalf("portion sum overflow: %v", err)
 	}
 }

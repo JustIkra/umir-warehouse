@@ -56,8 +56,11 @@ func TestReorderedJournalFailsFullReplay(t *testing.T) {
 		batches[i].Events[0].Sequence = int64(i + 1)
 		batches[i].FinalSequence = int64(i + 1)
 	}
-	if err := validateJournalContext(context.Background(), batches, 5); err != nil {
-		t.Fatalf("structural journal validation = %v; want sequence-valid reordered prefix", err)
+	walk := newJournalWalk(0)
+	for _, batch := range batches {
+		if err := walk.check(batch); err != nil {
+			t.Fatalf("structural journal validation = %v; want sequence-valid reordered prefix", err)
+		}
 	}
 	var fullReplay domain.InventoryState
 	for _, batch := range batches {
