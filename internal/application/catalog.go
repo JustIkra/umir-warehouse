@@ -16,7 +16,9 @@ func (o *Owner) SuggestID(ctx context.Context, kind contract.CatalogKind) (contr
 	if kind != contract.CatalogProduct && kind != contract.CatalogDish {
 		return contract.IDSuggestion{}, contract.ErrInvalidArgument
 	}
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.IDSuggestion{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if o.pending != nil {
 		return contract.IDSuggestion{}, inventoryUnavailable(domain.ErrUnknownWriteOutcome)
@@ -54,7 +56,9 @@ func nextDecimalID(id string) string {
 }
 
 func (o *Owner) RegisterProduct(ctx context.Context, request contract.RegisterProductRequest) (contract.Product, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.Product{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if request.CommandID == "" || isReservedCommandID(request.CommandID) {
 		return contract.Product{}, contract.ErrInvalidArgument
@@ -101,7 +105,9 @@ func (o *Owner) RegisterProduct(ctx context.Context, request contract.RegisterPr
 }
 
 func (o *Owner) DefineDish(ctx context.Context, request contract.DefineDishRequest) (contract.Dish, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.Dish{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if request.CommandID == "" || isReservedCommandID(request.CommandID) {
 		return contract.Dish{}, contract.ErrInvalidArgument
@@ -173,7 +179,9 @@ func (o *Owner) DefineDish(ctx context.Context, request contract.DefineDishReque
 }
 
 func (o *Owner) GetProducts(ctx context.Context) (contract.Products, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.Products{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if err := o.syncProjectionLocked(ctx); err != nil {
 		return contract.Products{}, inventoryUnavailable(err)
@@ -191,7 +199,9 @@ func (o *Owner) GetProducts(ctx context.Context) (contract.Products, error) {
 }
 
 func (o *Owner) GetDishCatalog(ctx context.Context) (contract.DishCatalog, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.DishCatalog{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if err := o.syncProjectionLocked(ctx); err != nil {
 		return contract.DishCatalog{}, inventoryUnavailable(err)
@@ -212,7 +222,9 @@ func (o *Owner) GetDish(ctx context.Context, dishID string) (contract.DishDetail
 	if dishID == "" {
 		return contract.DishDetails{}, contract.ErrInvalidArgument
 	}
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.DishDetails{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if err := o.syncProjectionLocked(ctx); err != nil {
 		return contract.DishDetails{}, inventoryUnavailable(err)

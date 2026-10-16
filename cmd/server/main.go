@@ -53,7 +53,7 @@ func runMain() error {
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
 		return healthcheck()
 	}
-	cfg, err := loadConfig(os.LookupEnv)
+	cfg, err := loadConfig(os.LookupEnv, os.ReadFile)
 	if err != nil {
 		return err
 	}
@@ -93,8 +93,9 @@ func newHTTPServer(port string, handler http.Handler, requestTimeout time.Durati
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       requestTimeout,
-		WriteTimeout:      requestTimeout,
-		IdleTimeout:       60 * time.Second,
+		// A result recorded just before the request deadline still has time to be written.
+		WriteTimeout: requestTimeout + 5*time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 }
 

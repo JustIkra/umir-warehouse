@@ -188,7 +188,9 @@ func (p *ProductBatches) Close() {
 }
 
 func (o *Owner) CaptureProductBatches(ctx context.Context, r contract.ProductBatchesRequest) (contract.ProductBatchesPage, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.ProductBatchesPage{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if r.Scope.OrganizationID != o.scope.OrganizationID || r.Scope.RestaurantID != o.scope.RestaurantID || r.Scope.LifecycleVersion != o.scope.LifecycleVersion {
 		return contract.ProductBatchesPage{}, contract.ErrForbidden

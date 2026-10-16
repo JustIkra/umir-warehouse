@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/JustIkra/umir-warehouse/contract"
+	"github.com/JustIkra/umir-warehouse/internal/domain"
 )
 
 type Runtime interface {
@@ -31,7 +32,22 @@ type Runtime interface {
 	FindRecordedCommand(context.Context, string) (contract.CommandRecord, bool, error)
 	FindOrderByProposal(context.Context, string) (contract.Order, bool, error)
 	FindOrderAttempt(context.Context, string, string) (contract.OrderAttempt, error)
+	// Head, FindOrderPlacement, FindOrder and HistoryPage answer the passive
+	// reads and commits from bounded store reads, never from the whole journal.
+	Head(context.Context) (Head, error)
+	FindOrderPlacement(context.Context, string) (OrderPlacement, bool, error)
+	FindOrder(context.Context, string) (contract.Order, bool, error)
+	HistoryPage(ctx context.Context, fromSequence int64, limit int) (contract.History, error)
 }
+
+// Head is the journal version and the time it was read.
+type Head struct {
+	StateVersion int64
+	EvaluatedAt  time.Time
+}
+
+// OrderPlacement is where the journal recorded an order.
+type OrderPlacement = domain.OrderPlacement
 
 type Options struct {
 	RequestTimeout  time.Duration

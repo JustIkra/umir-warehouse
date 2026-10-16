@@ -25,10 +25,14 @@ type periodFacts struct {
 	demand   map[string]int64
 }
 
+// planningCapture is what a planning request fixes under the owner's lock:
+// the report identity, a private shallow view of the inventory and the period
+// whose facts are read afterwards.
 type planningCapture struct {
 	identity contract.ReportIdentity
 	window   contract.PlanningWindow
 	coverage contract.Coverage
+	view     domain.InventoryState
 	facts    periodFacts
 }
 
@@ -39,7 +43,10 @@ func NewPlanning(owner *Owner, coverage time.Time) (*Planning, error) {
 	return &Planning{owner: owner, coverage: domain.CanonicalBusinessTime(coverage)}, nil
 }
 
-func planningPeriod(ctx context.Context, batches []domain.RecordedBatch, from, to time.Time) (periodFacts, error) {
+// planningPeriod sums what the events of [from, to) consumed and what was
+// asked for. The store already selects the period; the check keeps the sums
+// right for any source.
+func planningPeriod(ctx context.Context, events []domain.Event, from, to time.Time) (periodFacts, error) {
 	facts := periodFacts{consumed: map[string]domain.Quantity{}, demand: map[string]int64{}}
 	add := func(id string, quantity domain.Quantity) error {
 		if id == "" || quantity <= 0 {
@@ -52,43 +59,71 @@ func planningPeriod(ctx context.Context, batches []domain.RecordedBatch, from, t
 		facts.consumed[id] = total
 		return nil
 	}
-	for _, batch := range batches {
-		for _, event := range batch.Events {
-			if err := ctx.Err(); err != nil {
-				return periodFacts{}, err
+	for _, event := range events {
+		if err := ctx.Err(); err != nil {
+			return periodFacts{}, err
+		}
+		if event.RecordedAt.Before(from) || !event.RecordedAt.Before(to) {
+			continue
+		}
+		switch event.Type {
+		case domain.EventOrderPlaced:
+			order := event.Payload.Order
+			if order == nil {
+				return periodFacts{}, contract.ErrCalculationUnavailable
 			}
-			if event.RecordedAt.Before(from) || !event.RecordedAt.Before(to) {
-				continue
-			}
-			switch event.Type {
-			case domain.EventOrderPlaced:
-				order := event.Payload.Order
-				if order == nil {
-					return periodFacts{}, contract.ErrCalculationUnavailable
-				}
-				for _, allocation := range order.Allocations {
-					if err := add(allocation.ProductID, allocation.Quantity); err != nil {
-						return periodFacts{}, err
-					}
-				}
-				for _, position := range order.AcceptedPositions {
-					if position.DishID == "" || position.Portions <= 0 || facts.demand[position.DishID] > math.MaxInt64-position.Portions {
-						return periodFacts{}, contract.ErrCalculationUnavailable
-					}
-					facts.demand[position.DishID] += position.Portions
-				}
-			case domain.EventBatchWriteoffConfirmed:
-				if event.Payload.Writeoff == nil {
-					return periodFacts{}, contract.ErrCalculationUnavailable
-				}
-				value := event.Payload.Writeoff
-				if err := add(value.ProductID, value.WrittenOffQuantity); err != nil {
+			for _, allocation := range order.Allocations {
+				if err := add(allocation.ProductID, allocation.Quantity); err != nil {
 					return periodFacts{}, err
 				}
+			}
+			for _, position := range order.AcceptedPositions {
+				if position.DishID == "" || position.Portions <= 0 || facts.demand[position.DishID] > math.MaxInt64-position.Portions {
+					return periodFacts{}, contract.ErrCalculationUnavailable
+				}
+				facts.demand[position.DishID] += position.Portions
+			}
+		case domain.EventBatchWriteoffConfirmed:
+			if event.Payload.Writeoff == nil {
+				return periodFacts{}, contract.ErrCalculationUnavailable
+			}
+			value := event.Payload.Writeoff
+			if err := add(value.ProductID, value.WrittenOffQuantity); err != nil {
+				return periodFacts{}, err
 			}
 		}
 	}
 	return facts, nil
+}
+
+// capture fixes a planning request: under the owner's lock it checks the scope
+// and takes the version, the clock and a shallow copy of the inventory; the
+// facts of the period up to that version are then read and summed without it.
+func (p *Planning) capture(ctx context.Context, request contract.PlanningRequest) (planningCapture, error) {
+	if err := p.owner.mu.Lock(ctx); err != nil {
+		return planningCapture{}, inventoryUnavailable(err)
+	}
+	capture, err := p.captureLocked(ctx, request)
+	p.owner.mu.Unlock()
+	if err != nil {
+		return planningCapture{}, err
+	}
+	events, err := readPeriod(ctx, p.owner.events, PeriodQuery{
+		From: capture.window.From, To: capture.window.To,
+		Types:        []domain.EventType{domain.EventOrderPlaced, domain.EventBatchWriteoffConfirmed},
+		UpToSequence: capture.identity.StateVersion,
+	})
+	if err != nil {
+		return planningCapture{}, inventoryUnavailable(err)
+	}
+	if err := checkEventSchemas(events); err != nil {
+		return planningCapture{}, inventoryUnavailable(err)
+	}
+	capture.facts, err = planningPeriod(ctx, events, capture.window.From, capture.window.To)
+	if err != nil {
+		return planningCapture{}, err
+	}
+	return capture, nil
 }
 
 func (p *Planning) captureLocked(ctx context.Context, request contract.PlanningRequest) (planningCapture, error) {
@@ -116,38 +151,25 @@ func (p *Planning) captureLocked(ctx context.Context, request contract.PlanningR
 	if err != nil || version != o.state.StateVersion {
 		return planningCapture{}, errors.Join(contract.ErrInventoryUnavailable, err)
 	}
-	batches, err := o.events.ReadBatches(ctx, 0)
-	if err != nil {
-		return planningCapture{}, inventoryUnavailable(err)
-	}
-	if err := validateJournalContext(ctx, batches, version); err != nil {
-		return planningCapture{}, inventoryUnavailable(err)
-	}
 	at := domain.CanonicalBusinessTime(o.now())
 	if p.coverage.After(at) {
 		return planningCapture{}, contract.ErrCalculationUnavailable
 	}
 	from := at.Add(-planningHours * time.Hour)
-	facts, err := planningPeriod(ctx, batches, from, at)
-	if err != nil {
-		return planningCapture{}, err
-	}
 	return planningCapture{
 		identity: contract.ReportIdentity{Scope: scope, EvaluatedAt: at, StateVersion: version, PrefixSequence: version},
 		window:   contract.PlanningWindow{From: from, To: at, Days: domain.SupplyWindowDays},
 		coverage: contract.Coverage{Epoch: scope.RuntimeEpoch, CoverageFrom: p.coverage, Complete: !from.Before(p.coverage), RequestedFrom: from, AvailableFrom: maxTime(from, p.coverage)},
-		facts:    facts,
+		view:     domain.CloneReadView(o.state),
 	}, nil
 }
 
 func (p *Planning) Supply(ctx context.Context, request contract.PlanningRequest) (contract.SupplySuggestions, error) {
-	p.owner.mu.Lock()
-	defer p.owner.mu.Unlock()
-	capture, err := p.captureLocked(ctx, request)
+	capture, err := p.capture(ctx, request)
 	if err != nil {
 		return contract.SupplySuggestions{}, err
 	}
-	rows, err := domain.CalculateSupply(p.owner.state, capture.facts.consumed, capture.identity.EvaluatedAt)
+	rows, err := domain.CalculateSupply(capture.view, capture.facts.consumed, capture.identity.EvaluatedAt)
 	if err != nil {
 		return contract.SupplySuggestions{}, errors.Join(contract.ErrCalculationUnavailable, err)
 	}
@@ -181,13 +203,11 @@ func (p *Planning) Supply(ctx context.Context, request contract.PlanningRequest)
 }
 
 func (p *Planning) Recommendations(ctx context.Context, request contract.PlanningRequest) (contract.RecommendationInputs, error) {
-	p.owner.mu.Lock()
-	defer p.owner.mu.Unlock()
-	capture, err := p.captureLocked(ctx, request)
+	capture, err := p.capture(ctx, request)
 	if err != nil {
 		return contract.RecommendationInputs{}, err
 	}
-	state := p.owner.state
+	state := capture.view
 	view := domain.InventoryState{Products: state.Products, Dishes: state.Dishes, Batches: make(map[string]domain.Batch), StateVersion: state.StateVersion}
 	result := contract.RecommendationInputs{Identity: capture.identity, HorizonHours: recommendationHorizonHours, Window: capture.window, Coverage: capture.coverage, RiskBatches: []contract.RiskBatch{}, Demand: []contract.DishDemand{}}
 	cutoff := capture.identity.EvaluatedAt.Add(recommendationHorizonHours * time.Hour)

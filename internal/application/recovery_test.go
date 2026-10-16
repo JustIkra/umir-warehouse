@@ -255,6 +255,10 @@ func (s *unknownCommitReadFailureStore) ReadBatches(ctx context.Context, afterSe
 	return s.EventStore.ReadBatches(ctx, afterSequence)
 }
 
+func (s *unknownCommitReadFailureStore) ScanBatches(ctx context.Context, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	return scanViaRead(ctx, s, afterSequence, fn)
+}
+
 type findCommandFailureStore struct {
 	EventStore
 	err error

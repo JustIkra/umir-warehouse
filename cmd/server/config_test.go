@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 )
 
@@ -12,19 +13,19 @@ func TestW1V2ConfigFailsClosed(t *testing.T) {
 		{"WAREHOUSE_API_MODE": "v2"},
 		{"WAREHOUSE_API_MODE": "v2", "AUTH_JWKS_URL": "http://auth/internal/auth/v1/jwks", "AUTH_SERVICE_KEY": "own", "GATEWAY_SERVICE_KEY": "gateway", "SERVING_SERVICE_KEY": "serving", "AUTH_RUNTIME_SERVICE_KEY": "runtime"},
 	} {
-		if _, err := loadConfig(func(key string) (string, bool) { v, ok := values[key]; return v, ok }); err == nil {
+		if _, err := loadConfigEnv(func(key string) (string, bool) { v, ok := values[key]; return v, ok }); err == nil {
 			t.Fatalf("unsafe config accepted: mode=%s", values["WAREHOUSE_API_MODE"])
 		}
 	}
 	values := map[string]string{"WAREHOUSE_API_MODE": "v2", "AUTH_JWKS_URL": "http://auth/internal/auth/v1/jwks", "AUTH_SERVICE_KEY": "own", "GATEWAY_SERVICE_KEY": "gateway", "SERVING_SERVICE_KEY": "serving", "AUTH_RUNTIME_SERVICE_KEY": "runtime", "AUTH_ALLOW_PLAIN_HTTP": "true"}
-	if _, err := loadConfig(func(key string) (string, bool) { v, ok := values[key]; return v, ok }); err != nil {
+	if _, err := loadConfigEnv(func(key string) (string, bool) { v, ok := values[key]; return v, ok }); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestW1V2ListenersKeepBusinessPrivate(t *testing.T) {
 	values := map[string]string{"WAREHOUSE_API_MODE": "v2", "AUTH_JWKS_URL": "http://auth/internal/auth/v1/jwks", "AUTH_SERVICE_KEY": "own", "GATEWAY_SERVICE_KEY": "gateway", "SERVING_SERVICE_KEY": "serving", "AUTH_RUNTIME_SERVICE_KEY": "runtime", "AUTH_ALLOW_PLAIN_HTTP": "true"}
-	cfg, err := loadConfig(func(key string) (string, bool) { v, ok := values[key]; return v, ok })
+	cfg, err := loadConfigEnv(func(key string) (string, bool) { v, ok := values[key]; return v, ok })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,4 +44,18 @@ func TestW1V2ListenersKeepBusinessPrivate(t *testing.T) {
 			t.Fatalf("listener %d want %d", w.Code, tc.want)
 		}
 	}
+}
+
+// loadConfigEnv loads the configuration the way the older tests expect: the
+// API mode is legacy unless the test sets one.
+func loadConfigEnv(lookup func(string) (string, bool)) (serverConfig, error) {
+	return loadConfig(func(key string) (string, bool) {
+		if value, ok := lookup(key); ok {
+			return value, true
+		}
+		if key == "WAREHOUSE_API_MODE" {
+			return "legacy", true
+		}
+		return "", false
+	}, os.ReadFile)
 }

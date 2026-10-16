@@ -45,6 +45,25 @@ func (s *eventStoreWrapper) ReadBatches(ctx context.Context, afterSequence int64
 	return batches, err
 }
 
+func (s *eventStoreWrapper) ScanBatches(ctx context.Context, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	return scanViaRead(ctx, s, afterSequence, fn)
+}
+
+// scanViaRead streams what the wrapper's own ReadBatches returns, so a fault
+// injected into ReadBatches reaches code that scans.
+func scanViaRead(ctx context.Context, store EventStore, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	batches, err := store.ReadBatches(ctx, afterSequence)
+	if err != nil {
+		return err
+	}
+	for _, batch := range batches {
+		if err := fn(batch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func seedStore(t *testing.T, expiresAt time.Time, quantity domain.Quantity, consumed domain.Quantity) *memory.EventStore {
 	t.Helper()
 	store := memory.NewEventStore()

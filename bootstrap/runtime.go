@@ -52,7 +52,11 @@ func NewInMemory(options Options) (*Runtime, error) {
 		return nil, contract.ErrTimeZoneDataUnavailable
 	}
 	options.TZDataVersion = zonedata.Version
-	owner, err := application.NewOwner(memory.NewEventStore(), options.Now, options.NewID)
+	var events application.EventStore = memory.NewEventStore()
+	if options.WrapEventStore != nil {
+		events = options.WrapEventStore(events)
+	}
+	owner, err := application.NewOwner(events, options.Now, options.NewID)
 	if err != nil {
 		return nil, err
 	}
@@ -67,7 +71,11 @@ func NewInMemory(options Options) (*Runtime, error) {
 			return nil, err
 		}
 	}
-	if err := owner.ConfigureSnapshots(memory.NewSnapshotStore(), options.EventsPerSnapshot); err != nil {
+	var snapshots application.SnapshotStore = memory.NewSnapshotStore()
+	if options.WrapSnapshotStore != nil {
+		snapshots = options.WrapSnapshotStore(options.Scope, snapshots)
+	}
+	if err := owner.ConfigureSnapshots(snapshots, options.EventsPerSnapshot); err != nil {
 		return nil, err
 	}
 	coverage := options.CoverageFrom
@@ -363,6 +371,40 @@ func (r *Runtime) FindOrderByProposal(ctx context.Context, proposalID string) (c
 		converted.Allocations[index] = contract.Allocation{ProductID: allocation.ProductID, BatchID: allocation.BatchID, Quantity: contract.Quantity(allocation.Quantity)}
 	}
 	return converted, true, nil
+}
+
+func (r *Runtime) Head(ctx context.Context) (httpapi.Head, error) {
+	if err := r.enter(ctx); err != nil {
+		return httpapi.Head{}, err
+	}
+	defer r.leave()
+	head, err := r.owner.Head(ctx)
+	return httpapi.Head{StateVersion: head.StateVersion, EvaluatedAt: head.EvaluatedAt}, err
+}
+
+func (r *Runtime) FindOrderPlacement(ctx context.Context, orderID string) (httpapi.OrderPlacement, bool, error) {
+	if err := r.enter(ctx); err != nil {
+		return httpapi.OrderPlacement{}, false, err
+	}
+	defer r.leave()
+	placement, found, err := r.owner.FindOrderPlacement(ctx, orderID)
+	return placement, found, err
+}
+
+func (r *Runtime) FindOrder(ctx context.Context, orderID string) (contract.Order, bool, error) {
+	if err := r.enter(ctx); err != nil {
+		return contract.Order{}, false, err
+	}
+	defer r.leave()
+	return r.owner.FindOrder(ctx, orderID)
+}
+
+func (r *Runtime) HistoryPage(ctx context.Context, fromSequence int64, limit int) (contract.History, error) {
+	if err := r.enter(ctx); err != nil {
+		return contract.History{}, err
+	}
+	defer r.leave()
+	return r.owner.ReadHistoryPage(ctx, fromSequence, limit)
 }
 
 func (r *Runtime) RunSnapshotOnce(ctx context.Context) (bool, error) {

@@ -433,6 +433,10 @@ func (s *commitCollisionDuringReadFailureStore) ReadBatches(ctx context.Context,
 	return s.EventStore.ReadBatches(ctx, afterSequence)
 }
 
+func (s *commitCollisionDuringReadFailureStore) ScanBatches(ctx context.Context, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	return scanViaRead(ctx, s, afterSequence, fn)
+}
+
 type delayConfirmOrderEventStore struct {
 	EventStore
 	unknownAttempts int
@@ -487,6 +491,10 @@ func (s *hiddenProposalCorruptReadStore) ReadBatches(ctx context.Context, afterS
 		s.corruptedRead = true
 	}
 	return batches, err
+}
+
+func (s *hiddenProposalCorruptReadStore) ScanBatches(ctx context.Context, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	return scanViaRead(ctx, s, afterSequence, fn)
 }
 
 func newOrderCommitFixture(t *testing.T, now time.Time, stock contract.Quantity) (*Owner, EventStore) {

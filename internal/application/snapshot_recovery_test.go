@@ -79,7 +79,7 @@ func TestSnapshotRecoveryMatchesFullReplayAndProcessesDueBatch(t *testing.T) {
 	}
 }
 
-func TestSnapshotPrefixMismatchFallsBackToFullReplay(t *testing.T) {
+func TestSnapshotContradictingJournalTailFallsBackToFullReplay(t *testing.T) {
 	store := seedStore(t, moscowTime(2026, time.April, 4, 10), 10000, 0)
 	seedOwner, err := NewOwner(store, func() time.Time { return moscowTime(2026, time.April, 1, 10) }, nextTestID())
 	if err != nil {
@@ -88,10 +88,14 @@ func TestSnapshotPrefixMismatchFallsBackToFullReplay(t *testing.T) {
 	if err := seedOwner.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	// The snapshot sits on a batch boundary but holds another product than the
+	// one the journal tail (the delivery) refers to: structurally valid,
+	// contradicted by the tail.
 	candidate := snapshotFor(seedOwner.state)
-	command := candidate.State.Commands["register-p"]
-	command.CommandFingerprint = "different-journal-fingerprint"
-	candidate.State.Commands["register-p"] = command
+	candidate.LastSequence, candidate.State.StateVersion = 2, 2
+	candidate.State.Products = map[string]domain.Product{"other": {ProductID: "other", Name: "Other", BaseUnit: domain.BaseUnitG}}
+	candidate.State.Dishes = map[string]domain.Dish{}
+	candidate.State.DeliveryIDs, candidate.State.Batches = map[string]struct{}{}, map[string]domain.Batch{}
 	if err := domain.ValidateSnapshot(candidate); err != nil {
 		t.Fatalf("altered candidate should still be structurally valid: %v", err)
 	}
@@ -105,8 +109,8 @@ func TestSnapshotPrefixMismatchFallsBackToFullReplay(t *testing.T) {
 	if err := owner.Recover(context.Background()); err != nil {
 		t.Fatalf("Recover() with a journal-mismatched candidate = %v; want full replay fallback", err)
 	}
-	if owner.state.StateVersion != 3 || owner.state.Commands["register-p"].CommandFingerprint == "different-journal-fingerprint" {
-		t.Fatalf("recovered state did not come from journal: version %d command %#v", owner.state.StateVersion, owner.state.Commands["register-p"])
+	if owner.state.StateVersion != 3 || owner.state.Products["p"].ProductID != "p" || owner.lastSavedSequence != 0 {
+		t.Fatalf("recovered state did not come from journal: version %d, product %#v, accepted snapshot %d", owner.state.StateVersion, owner.state.Products["p"], owner.lastSavedSequence)
 	}
 }
 
@@ -134,13 +138,6 @@ func TestInvalidSnapshotCandidatesFallBackToFullReplay(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := domain.CloneSnapshot(valid)
 			test.edit(&candidate)
-			batches, err := store.ReadBatches(context.Background(), 0)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := auditSnapshotPrefix(candidate, batches); err == nil {
-				t.Fatal("invalid candidate passed prefix validation")
-			}
 			owner, err := NewOwner(store, func() time.Time { return moscowTime(2026, time.April, 1, 10) }, nextTestID())
 			if err != nil {
 				t.Fatal(err)
@@ -207,7 +204,7 @@ func TestConfigureSnapshotsRequiresEarlyPositiveStore(t *testing.T) {
 }
 
 func snapshotFor(state domain.InventoryState) domain.Snapshot {
-	return domain.Snapshot{SchemaVersion: domain.InventorySchemaV1, StreamID: domain.InventoryStreamID, LastSequence: state.StateVersion, State: domain.CloneInventoryState(state)}
+	return domain.Snapshot{SchemaVersion: domain.SnapshotSchemaV2, StreamID: domain.InventoryStreamID, LastSequence: state.StateVersion, State: domain.CloneInventoryState(state)}
 }
 
 type fixedSnapshotStore struct {
@@ -232,4 +229,8 @@ func (s *editedBatchesStore) ReadBatches(ctx context.Context, sequence int64) ([
 		s.edit(batches)
 	}
 	return batches, err
+}
+
+func (s *editedBatchesStore) ScanBatches(ctx context.Context, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	return scanViaRead(ctx, s, afterSequence, fn)
 }

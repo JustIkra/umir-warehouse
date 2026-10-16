@@ -96,7 +96,7 @@ func TestAcceptanceFailedReconciliationBlocksAdmissionAndRepairs(t *testing.T) {
 	}
 	assertOldProjection := func() {
 		t.Helper()
-		owner.mu.Lock()
+		owner.mu.lockUncancellable()
 		defer owner.mu.Unlock()
 		if owner.state.StateVersion != 3 || owner.state.Batches["batch"].RemainingQuantity != 10000 {
 			t.Fatalf("failed reconciliation changed old inventory: %#v", owner.state)
@@ -105,11 +105,30 @@ func TestAcceptanceFailedReconciliationBlocksAdmissionAndRepairs(t *testing.T) {
 			t.Fatalf("failed reconciliation changed old expiration index: %#v", owner.expirations)
 		}
 	}
-	wrapped.failNextFullReads(2)
+	wrapped.failNextFullReads(1)
 	if err := owner.Recover(ctx); !errors.Is(err, contract.ErrInventoryUnavailable) {
 		t.Fatalf("Recover() during rebuild failure = %v; want InventoryUnavailable", err)
 	}
 	assertOldProjection()
+	owner.mu.lockUncancellable()
+	if !owner.usable {
+		owner.mu.Unlock()
+		t.Fatal("a failed rebuild made a consistent projection unusable")
+	}
+	owner.mu.Unlock()
+	// A journal that contradicts itself makes the projection unusable.
+	wrapped.failNextFullReadsWith(1, domain.ErrInvalidRecordedBatch)
+	if err := owner.Recover(ctx); !errors.Is(err, contract.ErrInventoryUnavailable) {
+		t.Fatalf("Recover() with a contradicting journal = %v; want InventoryUnavailable", err)
+	}
+	assertOldProjection()
+	owner.mu.lockUncancellable()
+	if owner.usable {
+		owner.mu.Unlock()
+		t.Fatal("a contradicting journal left the projection usable")
+	}
+	owner.mu.Unlock()
+	wrapped.failNextFullReads(1)
 	clock.Set(dueAt)
 	if _, err := owner.GetInventory(ctx); !errors.Is(err, contract.ErrInventoryUnavailable) {
 		t.Fatalf("GetInventory() while rebuild still fails = %v; want InventoryUnavailable", err)
@@ -235,7 +254,7 @@ func TestAcceptanceReaderSeesWholeDeliveryAndExpiryProjection(t *testing.T) {
 	if read.view.StateVersion != 3 || len(read.view.Products) != 1 || read.view.Products[0].Quantity != 0 || len(read.view.Products[0].Batches) != 0 {
 		t.Fatalf("reader inventory after atomic delivery+expiry = %#v; want final zero-stock state at version 3", read.view)
 	}
-	owner.mu.Lock()
+	owner.mu.lockUncancellable()
 	version, tasks := owner.state.StateVersion, len(owner.expirations)
 	owner.mu.Unlock()
 	if version != 3 || tasks != 0 {
@@ -347,11 +366,17 @@ type acceptanceFailFullReadStore struct {
 	EventStore
 	mu       sync.Mutex
 	failures int
+	// fault is what the failing reads return; nil means an I/O error.
+	fault error
 }
 
 func (s *acceptanceFailFullReadStore) failNextFullReads(count int) {
+	s.failNextFullReadsWith(count, nil)
+}
+
+func (s *acceptanceFailFullReadStore) failNextFullReadsWith(count int, fault error) {
 	s.mu.Lock()
-	s.failures = count
+	s.failures, s.fault = count, fault
 	s.mu.Unlock()
 }
 
@@ -364,12 +389,20 @@ func (s *acceptanceFailFullReadStore) ReadBatches(ctx context.Context, afterSequ
 		s.mu.Lock()
 		if s.failures > 0 {
 			s.failures--
+			fault := s.fault
 			s.mu.Unlock()
+			if fault != nil {
+				return nil, fault
+			}
 			return nil, errors.New("acceptance injected reconciliation failure")
 		}
 		s.mu.Unlock()
 	}
 	return s.EventStore.ReadBatches(ctx, afterSequence)
+}
+
+func (s *acceptanceFailFullReadStore) ScanBatches(ctx context.Context, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	return scanViaRead(ctx, s, afterSequence, fn)
 }
 
 type acceptanceGateFullReadStore struct {
@@ -400,6 +433,10 @@ func (s *acceptanceGateFullReadStore) ReadBatches(ctx context.Context, afterSequ
 		<-s.release
 	}
 	return batches, err
+}
+
+func (s *acceptanceGateFullReadStore) ScanBatches(ctx context.Context, afterSequence int64, fn func(domain.RecordedBatch) error) error {
+	return scanViaRead(ctx, s, afterSequence, fn)
 }
 
 type acceptanceGateAppendStore struct {

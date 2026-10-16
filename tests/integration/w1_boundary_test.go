@@ -17,6 +17,7 @@ import (
 
 	"github.com/JustIkra/umir-warehouse/bootstrap"
 	"github.com/JustIkra/umir-warehouse/contract"
+	"github.com/JustIkra/umir-warehouse/internal/application"
 )
 
 const (
@@ -46,13 +47,16 @@ type fixture struct {
 func scope(tenant string) contract.Scope {
 	return contract.Scope{OrganizationID: orgID, RestaurantID: tenant, RuntimeEpoch: epoch, LifecycleVersion: "1", TimeZone: "Europe/Moscow", SettingsVersion: "1"}
 }
-func setup(t *testing.T) fixture {
+func setup(t *testing.T) fixture { return setupWith(t, nil) }
+
+// setupWith builds the fixture with wrap around each restaurant's event store.
+func setupWith(t *testing.T, wrap func(application.EventStore) application.EventStore) fixture {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg, err := bootstrap.NewRegistry(bootstrap.Options{Now: func() time.Time { return now }, NewID: rand.Text, EventsPerSnapshot: 1}, epoch)
+	reg, err := bootstrap.NewRegistry(bootstrap.Options{Now: func() time.Time { return now }, NewID: rand.Text, EventsPerSnapshot: 1, WrapEventStore: wrap}, epoch)
 	if err != nil {
 		t.Fatal(err)
 	}

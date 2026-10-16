@@ -26,7 +26,9 @@ func (o *Owner) writePendingLocked(ctx context.Context, batch domain.Batch, now 
 	return domain.ExpiryResult{BatchID: p.BatchID, ProductID: p.ProductID, ExpiresAt: p.ExpiresAt, ProcessedAt: now}, nil
 }
 func (o *Owner) ConfirmWriteoff(ctx context.Context, request contract.ConfirmWriteoffRequest) (result contract.WriteoffResult, err error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.WriteoffResult{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	var committedPreparation int64
 	defer func() {
@@ -83,7 +85,7 @@ func (o *Owner) ConfirmWriteoff(ctx context.Context, request contract.ConfirmWri
 		w := domain.WriteoffResult{BatchID: batch.BatchID, ProductID: batch.ProductID, WrittenOffQuantity: batch.RemainingQuantity, BaseUnit: prepared.State.Products[batch.ProductID].BaseUnit, ActorUserID: request.ActorUserID, ConfirmedAt: prepared.EvaluatedAt, EventID: eventID, OrganizationID: o.scope.OrganizationID, RestaurantID: o.scope.RestaurantID, RuntimeEpoch: o.scope.RuntimeEpoch, TimeZone: captured.TimeZone, SettingsVersion: captured.SettingsVersion, StateVersion: prepared.StateVersion + 1}
 		event := domain.Event{EventID: eventID, TenantID: o.scope.RestaurantID, RuntimeEpoch: o.scope.RuntimeEpoch, SchemaVersion: domain.InventorySchemaV2, RecordedAt: prepared.EvaluatedAt, Type: domain.EventBatchWriteoffConfirmed, Payload: domain.EventPayload{Writeoff: &w}}
 		command := domain.CommandBatch{ExpectedVersion: prepared.StateVersion, CommandID: request.CommandID, CommandType: "ConfirmWriteoff", CommandFingerprint: fingerprint, Events: []domain.Event{event}}
-		if _, err := domain.ApplyRecordedBatch(prepared.State, asRecordedBatch(command)); err != nil {
+		if _, err := domain.PlanBatch(&o.state, asRecordedBatch(command)); err != nil {
 			return contract.WriteoffResult{}, err
 		}
 		record, found, err = o.appendOwnerCommandLocked(ctx, command)
@@ -100,7 +102,9 @@ func (o *Owner) ConfirmWriteoff(ctx context.Context, request contract.ConfirmWri
 	}
 }
 func (o *Owner) ResolveWriteoff(ctx context.Context, commandID, batchID string) (contract.WriteoffObservation, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.WriteoffObservation{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if commandID == "" || isReservedCommandID(commandID) || batchID == "" || o.scope.RestaurantID == "" {
 		return contract.WriteoffObservation{}, contract.ErrInvalidArgument

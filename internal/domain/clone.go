@@ -1,5 +1,7 @@
 package domain
 
+import "maps"
+
 func CloneDish(value Dish) Dish {
 	value.Ingredients = append([]Ingredient(nil), value.Ingredients...)
 	return value
@@ -102,56 +104,37 @@ func CloneRecordedBatch(value RecordedBatch) RecordedBatch {
 }
 
 func CloneInventoryState(value InventoryState) InventoryState {
-	if value.Products != nil {
-		products := make(map[string]Product, len(value.Products))
-		for id, product := range value.Products {
-			products[id] = product
-		}
-		value.Products = products
-	}
-	if value.Dishes != nil {
-		dishes := make(map[string]Dish, len(value.Dishes))
-		for id, dish := range value.Dishes {
-			dishes[id] = CloneDish(dish)
-		}
-		value.Dishes = dishes
-	}
-	if value.Deliveries != nil {
-		deliveries := make(map[string]Delivery, len(value.Deliveries))
-		for id, delivery := range value.Deliveries {
-			deliveries[id] = CloneDelivery(delivery)
-		}
-		value.Deliveries = deliveries
-	}
-	if value.Batches != nil {
-		batches := make(map[string]Batch, len(value.Batches))
-		for id, batch := range value.Batches {
-			batches[id] = batch
-		}
-		value.Batches = batches
-	}
-	if value.Orders != nil {
-		orders := make(map[string]Order, len(value.Orders))
-		for id, order := range value.Orders {
-			orders[id] = CloneOrder(order)
-		}
-		value.Orders = orders
-	}
-	if value.OrdersByProposal != nil {
-		ordersByProposal := make(map[string]string, len(value.OrdersByProposal))
-		for proposalID, orderID := range value.OrdersByProposal {
-			ordersByProposal[proposalID] = orderID
-		}
-		value.OrdersByProposal = ordersByProposal
-	}
-	if value.Commands != nil {
-		commands := make(map[string]CommandRecord, len(value.Commands))
-		for id, command := range value.Commands {
-			commands[id] = CloneCommandRecord(command)
-		}
-		value.Commands = commands
-	}
+	value.Products = maps.Clone(value.Products)
+	value.Dishes = cloneDishes(value.Dishes)
+	value.DeliveryIDs = maps.Clone(value.DeliveryIDs)
+	source := value
+	value.Batches = maps.Clone(value.Batches)
+	value.cloneIndex(source)
 	return value
+}
+
+// CloneReadView copies what a reader of the current inventory needs:
+// products, dishes and batches. DeliveryIDs is left out and nil.
+func CloneReadView(value InventoryState) InventoryState {
+	view := InventoryState{
+		Products:     maps.Clone(value.Products),
+		Dishes:       cloneDishes(value.Dishes),
+		Batches:      maps.Clone(value.Batches),
+		StateVersion: value.StateVersion,
+	}
+	view.cloneIndex(value)
+	return view
+}
+
+func cloneDishes(dishes map[string]Dish) map[string]Dish {
+	if dishes == nil {
+		return nil
+	}
+	cloned := make(map[string]Dish, len(dishes))
+	for id, dish := range dishes {
+		cloned[id] = CloneDish(dish)
+	}
+	return cloned
 }
 
 func CloneSnapshot(value Snapshot) Snapshot {

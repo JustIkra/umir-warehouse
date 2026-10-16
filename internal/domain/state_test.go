@@ -11,10 +11,11 @@ func TestReplayWithoutDecisions(t *testing.T) {
 	manufacturedAt := time.Date(2026, time.January, 1, 9, 0, 0, 0, moscow)
 	expiresAt := time.Date(2026, time.March, 1, 9, 0, 0, 0, moscow)
 	receivedAt := time.Date(2026, time.January, 2, 10, 0, 0, 0, moscow)
-	state, err := ApplyRecordedBatch(InventoryState{
+	state := InventoryState{
 		Products:     map[string]Product{"p1": {ProductID: "p1", Name: "Tomato", BaseUnit: BaseUnitG}},
 		StateVersion: 1,
-	}, RecordedBatch{
+	}
+	err := state.ApplyBatch(RecordedBatch{
 		CommandID: "receive-d", CommandType: "ReceiveDelivery", CommandFingerprint: "fp-d", FinalSequence: 2,
 		Events: []Event{{
 			EventID: "delivery-event", StreamID: "inventory", Sequence: 2,
@@ -36,17 +37,20 @@ func TestReplayWithoutDecisions(t *testing.T) {
 	if state.StateVersion != 2 || state.Batches["batch-1"].ExpiresAt != expiresAt {
 		t.Fatalf("replayed state = %#v; want version 2 and saved expiry %s", state, expiresAt)
 	}
+	if _, ok := state.DeliveryIDs["delivery-1"]; !ok {
+		t.Fatalf("replayed delivery IDs = %v; want delivery-1", state.DeliveryIDs)
+	}
 	if state.Batches["batch-1"].RemainingQuantity != 5000 {
 		t.Fatalf("replayed quantity = %d; want saved quantity 5000", state.Batches["batch-1"].RemainingQuantity)
 	}
-	if _, err := ApplyRecordedBatch(state, RecordedBatch{FinalSequence: 2, Events: []Event{}}); !errors.Is(err, ErrInvalidEventBatch) {
+	if err := state.ApplyBatch(RecordedBatch{FinalSequence: 2, Events: []Event{}}); !errors.Is(err, ErrInvalidEventBatch) {
 		t.Fatalf("empty batch error = %v; want ErrInvalidEventBatch", err)
 	}
 }
 
 func TestReducerRejectsBrokenReferencesWithoutMutatingInput(t *testing.T) {
 	original := InventoryState{StateVersion: 0, Products: map[string]Product{"p1": {ProductID: "p1", Name: "Tomato", BaseUnit: BaseUnitG}}}
-	_, err := ApplyRecordedBatch(original, RecordedBatch{
+	err := original.ApplyBatch(RecordedBatch{
 		CommandID: "define-dish", CommandType: "DefineDish", CommandFingerprint: "fp", FinalSequence: 1,
 		Events: []Event{{
 			EventID: "dish-event", StreamID: "inventory", Sequence: 1, SchemaVersion: 1,
@@ -55,7 +59,7 @@ func TestReducerRejectsBrokenReferencesWithoutMutatingInput(t *testing.T) {
 		}},
 	})
 	if !errors.Is(err, ErrProductNotFound) {
-		t.Fatalf("ApplyRecordedBatch() error = %v; want ErrProductNotFound", err)
+		t.Fatalf("ApplyBatch() error = %v; want ErrProductNotFound", err)
 	}
 	if original.StateVersion != 0 || len(original.Dishes) != 0 || original.Products["p1"].Name != "Tomato" {
 		t.Fatalf("failed replay mutated input state: %#v", original)
@@ -67,7 +71,7 @@ func TestReducerRejectsRepeatedRecipeProductWithoutMutatingInput(t *testing.T) {
 	original := InventoryState{
 		Products: map[string]Product{"p1": {ProductID: "p1", Name: "Tomato", BaseUnit: BaseUnitG}},
 	}
-	_, err := ApplyRecordedBatch(original, RecordedBatch{
+	err := original.ApplyBatch(RecordedBatch{
 		CommandID: "define-dish", CommandType: "DefineDish", CommandFingerprint: "fp", FinalSequence: 1,
 		Events: []Event{{
 			EventID: "dish-event", StreamID: InventoryStreamID, Sequence: 1, SchemaVersion: InventorySchemaV1,
@@ -79,7 +83,7 @@ func TestReducerRejectsRepeatedRecipeProductWithoutMutatingInput(t *testing.T) {
 		}},
 	})
 	if !errors.Is(err, ErrInvalidEvent) {
-		t.Fatalf("ApplyRecordedBatch() error = %v; want ErrInvalidEvent", err)
+		t.Fatalf("ApplyBatch() error = %v; want ErrInvalidEvent", err)
 	}
 	if original.StateVersion != 0 || len(original.Dishes) != 0 || len(original.Products) != 1 || original.Products["p1"].Name != "Tomato" {
 		t.Fatalf("failed replay mutated input state: %#v", original)
@@ -87,7 +91,8 @@ func TestReducerRejectsRepeatedRecipeProductWithoutMutatingInput(t *testing.T) {
 }
 
 func TestReducerRejectsUnsupportedSchema(t *testing.T) {
-	_, err := ApplyRecordedBatch(InventoryState{}, RecordedBatch{
+	var state InventoryState
+	err := state.ApplyBatch(RecordedBatch{
 		CommandID: "register-p", CommandType: "RegisterProduct", CommandFingerprint: "fp", FinalSequence: 1,
 		Events: []Event{{
 			EventID: "product-event", StreamID: InventoryStreamID, Sequence: 1, SchemaVersion: 2,
@@ -96,7 +101,7 @@ func TestReducerRejectsUnsupportedSchema(t *testing.T) {
 		}},
 	})
 	if !errors.Is(err, ErrUnsupportedSchema) {
-		t.Fatalf("ApplyRecordedBatch() error = %v; want ErrUnsupportedSchema", err)
+		t.Fatalf("ApplyBatch() error = %v; want ErrUnsupportedSchema", err)
 	}
 }
 
@@ -105,7 +110,7 @@ func TestReducerRejectsUnbalancedExpiry(t *testing.T) {
 	state := InventoryState{
 		Batches: map[string]Batch{"batch-1": {BatchID: "batch-1", ProductID: "p1", ExpiresAt: expiresAt, ReceivedQuantity: 1000, RemainingQuantity: 1000}},
 	}
-	_, err := ApplyRecordedBatch(state, RecordedBatch{
+	err := state.ApplyBatch(RecordedBatch{
 		CommandID: "expire-1", CommandType: "ExpireBatch", CommandFingerprint: "fp", FinalSequence: 1,
 		Events: []Event{{
 			EventID: "expiry-event", StreamID: InventoryStreamID, Sequence: 1, SchemaVersion: InventorySchemaV1,
@@ -114,7 +119,7 @@ func TestReducerRejectsUnbalancedExpiry(t *testing.T) {
 		}},
 	})
 	if !errors.Is(err, ErrInvalidEvent) {
-		t.Fatalf("ApplyRecordedBatch() error = %v; want ErrInvalidEvent", err)
+		t.Fatalf("ApplyBatch() error = %v; want ErrInvalidEvent", err)
 	}
 	if state.Batches["batch-1"].RemainingQuantity != 1000 || state.Batches["batch-1"].WrittenOffForExpiry != 0 {
 		t.Fatalf("failed replay mutated batch: %#v", state.Batches["batch-1"])

@@ -127,13 +127,19 @@ type ExpiringBatch struct {
 	IsExpired         bool
 }
 
+// InventoryState holds the current inventory. It keeps no order or command
+// history: those live in the event store, which enforces their uniqueness.
 type InventoryState struct {
-	Products         map[string]Product
-	Dishes           map[string]Dish
-	Deliveries       map[string]Delivery
-	Batches          map[string]Batch
-	Orders           map[string]Order
-	OrdersByProposal map[string]string
-	Commands         map[string]CommandRecord
-	StateVersion     int64
+	Products     map[string]Product
+	Dishes       map[string]Dish
+	DeliveryIDs  map[string]struct{}
+	Batches      map[string]Batch
+	StateVersion int64
+
+	// byProduct lists the IDs of the batches of each product and indexed counts
+	// the batches listed. It is derived from Batches, built where a state is
+	// built or cloned and never serialized. A state whose count differs from
+	// len(Batches), such as a literal, is searched in full instead.
+	byProduct map[string][]string
+	indexed   int
 }

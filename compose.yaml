@@ -6,5 +6,6 @@ services:
       - "127.0.0.1:18083:8080"
     environment:
       TZ: Europe/Moscow
+      WAREHOUSE_API_MODE: legacy
     restart: unless-stopped
 

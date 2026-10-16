@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"errors"
+	"log"
 	"strconv"
 	"sync"
 	"time"
@@ -26,7 +27,11 @@ type Registry struct {
 	epoch      string
 	tenants    map[string]registeredRuntime
 	registered chan struct{}
+	// snapshotRetry is how long a restaurant's snapshot worker waits after a failure.
+	snapshotRetry time.Duration
 }
+
+const defaultSnapshotRetry = 5 * time.Second
 
 func NewRegistry(options Options, epoch string) (*Registry, error) {
 	if err := zonedata.Check(); err != nil {
@@ -39,7 +44,7 @@ func NewRegistry(options Options, epoch string) (*Registry, error) {
 	if options.Now == nil || options.NewID == nil || options.EventsPerSnapshot <= 0 || !contract.ValidEntityID(epoch) {
 		return nil, contract.ErrInvalidArgument
 	}
-	return &Registry{options: options, epoch: epoch, tenants: make(map[string]registeredRuntime), registered: make(chan struct{}, 1)}, nil
+	return &Registry{options: options, epoch: epoch, tenants: make(map[string]registeredRuntime), registered: make(chan struct{}, 1), snapshotRetry: defaultSnapshotRetry}, nil
 }
 func (r *Registry) Register(ctx context.Context, scope contract.Scope) error {
 	_, err := r.register(ctx, scope, "")
@@ -79,16 +84,42 @@ func (r *Registry) register(ctx context.Context, scope contract.Scope, operation
 		if old.scope.LifecycleVersion != scope.LifecycleVersion {
 			return contract.RuntimeReadiness{}, contract.ErrForbidden
 		}
-		if old.scope.TimeZone != scope.TimeZone || old.scope.SettingsVersion != scope.SettingsVersion {
+		// Settings only move forward: newer ones replace the stored settings, older
+		// ones are a stale repeat, and the same number with another zone is a
+		// different request.
+		oldVersion, newVersion := settingsNumber(old.scope), settingsNumber(scope)
+		switch {
+		case newVersion == oldVersion && old.scope.TimeZone != scope.TimeZone:
 			return contract.RuntimeReadiness{}, contract.ErrCommandIdentityConflict
+		case newVersion > oldVersion:
+			if operationID != "" && old.registerOperation != "" && old.registerOperation != operationID {
+				return contract.RuntimeReadiness{}, contract.ErrCommandIdentityConflict
+			}
+			// The owner may be busy; waiting for it must not hold the registry,
+			// so the lock is given up for the update. The owner never takes the
+			// registry lock, so nothing here can wait on the registry in turn.
+			owner := old.runtime.owner
+			r.mu.Unlock()
+			err := owner.UpdateSettings(ctx, scope)
+			r.mu.Lock()
+			if err != nil {
+				return contract.RuntimeReadiness{}, err
+			}
+			old = r.tenants[scope.RestaurantID]
+			if old.closed {
+				return contract.RuntimeReadiness{}, contract.ErrScopeDeleted
+			}
+			if settingsNumber(old.scope) < newVersion {
+				old.scope = scope
+			}
 		}
 		if operationID != "" {
 			if old.registerOperation != "" && old.registerOperation != operationID {
 				return contract.RuntimeReadiness{}, contract.ErrCommandIdentityConflict
 			}
 			old.registerOperation = operationID
-			r.tenants[scope.RestaurantID] = old
 		}
+		r.tenants[scope.RestaurantID] = old
 		return r.readiness(old), nil
 	}
 	coverage := r.options.Now()
@@ -113,6 +144,15 @@ func (r *Registry) register(ctx context.Context, scope contract.Scope, operation
 	default:
 	}
 	return r.readiness(entry), nil
+}
+
+// settingsNumber is the numeric settings version of a validated scope.
+func settingsNumber(scope contract.Scope) int64 {
+	n, err := strconv.ParseInt(scope.SettingsVersion, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 func (r *Registry) readiness(entry registeredRuntime) contract.RuntimeReadiness {
 	state := "ready"
@@ -227,59 +267,54 @@ func (r *Registry) RuntimeFor(ctx context.Context, scope contract.Scope) (httpap
 	return r.Resolve(ctx, scope)
 }
 
+// RunSnapshotWorker runs the snapshot worker of every open restaurant until
+// ctx ends. A restaurant whose worker fails is retried after a pause on its
+// own; the others are not affected.
 func (r *Registry) RunSnapshotWorker(parent context.Context) error {
 	if err := parent.Err(); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
 	var workers sync.WaitGroup
 	defer workers.Wait()
-	type workerResult struct {
-		runtime *Runtime
-		err     error
-	}
-	results := make(chan workerResult, 1)
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
 	started := make(map[*Runtime]bool)
 	start := func() {
 		r.mu.RLock()
 		defer r.mu.RUnlock()
 		for _, entry := range r.tenants {
 			runtime := entry.runtime
-			if entry.closed {
-				continue
-			}
-			if started[runtime] {
+			if entry.closed || started[runtime] {
 				continue
 			}
 			started[runtime] = true
-			workers.Go(func() {
-				err := runtime.RunSnapshotWorker(ctx)
-				if err == nil {
-					err = errors.New("restaurant snapshot worker stopped")
-				}
-				select {
-				case results <- workerResult{runtime, err}:
-				case <-ctx.Done():
-				}
-			})
+			workers.Go(func() { r.keepSnapshotWorker(ctx, runtime) })
 		}
 	}
 	start()
 	for {
 		select {
 		case <-parent.Done():
-			cancel()
 			return parent.Err()
-		case result := <-results:
-			delete(started, result.runtime)
-			if errors.Is(result.err, contract.ErrScopeDeleted) {
-				continue
-			}
-			cancel()
-			return result.err
 		case <-r.registered:
 			start()
+		}
+	}
+}
+
+// keepSnapshotWorker runs one restaurant's worker, again after each failure,
+// until ctx ends or the restaurant is deleted.
+func (r *Registry) keepSnapshotWorker(ctx context.Context, runtime *Runtime) {
+	for {
+		err := runtime.RunSnapshotWorker(ctx)
+		if ctx.Err() != nil || errors.Is(err, contract.ErrScopeDeleted) {
+			return
+		}
+		log.Printf("warehouse: snapshot worker of a restaurant stopped, trying again in %v: %v", r.snapshotRetry, err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(r.snapshotRetry):
 		}
 	}
 }

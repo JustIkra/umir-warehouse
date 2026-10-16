@@ -25,7 +25,7 @@ func (o *Owner) syncProjectionLocked(ctx context.Context) error {
 	}
 	version, err := o.events.Version(ctx)
 	if err != nil {
-		o.usable = false
+		o.markUnusable(err)
 		return err
 	}
 	if version < o.state.StateVersion {
@@ -35,25 +35,27 @@ func (o *Owner) syncProjectionLocked(ctx context.Context) error {
 	if version == o.state.StateVersion {
 		return nil
 	}
-	batches, err := o.events.ReadBatches(ctx, o.state.StateVersion)
-	if err != nil {
+	// Every batch applies atomically, so a scan cut short by the context leaves
+	// a consistent prefix of the journal in the projection.
+	var applyErr error
+	err = o.events.ScanBatches(ctx, o.state.StateVersion, func(batch domain.RecordedBatch) error {
+		applyErr = o.applyBatchLocked(batch)
+		return applyErr
+	})
+	switch {
+	case applyErr != nil:
+		o.usable = false
+		return o.recoverCurrentLocked(ctx)
+	case err != nil && isContextErr(err):
+		return err
+	case err != nil:
 		o.usable = false
 		return err
-	}
-	state := domain.CloneInventoryState(o.state)
-	index := cloneExpirationIndex(o.expirations)
-	for _, batch := range batches {
-		state, index, err = applyProjectionBatch(state, index, batch)
-		if err != nil {
-			o.usable = false
-			return o.recoverCurrentLocked(ctx)
-		}
-	}
-	if state.StateVersion != version {
+	case o.state.StateVersion < version:
 		o.usable = false
 		return o.recoverCurrentLocked(ctx)
 	}
-	o.publishProjection(state, index)
+	o.publishProjection()
 	return nil
 }
 
@@ -70,131 +72,222 @@ func (o *Owner) recoverCurrentLocked(ctx context.Context) error {
 	return domain.ErrConcurrentModification
 }
 
+// projection is a recovery candidate built outside the Owner's fields.
+type projection struct {
+	state       domain.InventoryState
+	expirations map[string]time.Time
+	// snapshotSequence is the snapshot the candidate started from; zero when
+	// it was replayed from the start of the journal.
+	snapshotSequence int64
+}
+
+// recoverLocked rebuilds the projection and publishes it only if the whole
+// rebuild succeeds; on any error the previous projection stays. It stays
+// usable when the rebuild fails for a reason outside the journal (a canceled
+// context, an unavailable store) and stops being usable when the journal
+// itself is inconsistent.
 func (o *Owner) recoverLocked(ctx context.Context) error {
 	o.started = true
-	o.usable = false
-	batches, err := o.events.ReadBatches(ctx, 0)
+	// The pending command is looked up first: a failing lookup or a conflicting
+	// record is known before the journal is read.
+	committed, err := o.pendingCommittedLocked(ctx)
 	if err != nil {
 		return err
 	}
-	version, err := o.events.Version(ctx)
+	candidate, err := o.buildProjection(ctx)
 	if err != nil {
+		if isJournalFault(err) {
+			o.usable = false
+		}
 		return err
 	}
-	prefixVersion := int64(0)
-	if len(batches) > 0 {
-		prefixVersion = batches[len(batches)-1].FinalSequence
-	}
-	if err := validateJournalContext(ctx, batches, prefixVersion); err != nil {
-		return err
-	}
-	if version < prefixVersion {
-		return domain.ErrInvalidRecordedBatch
-	}
-	if version > prefixVersion {
-		return domain.ErrConcurrentModification
-	}
-	var candidate domain.Snapshot
-	hasCandidate := false
-	if o.snapshotStore != nil {
-		candidate, hasCandidate, err = o.snapshotStore.LoadLatest(ctx)
-		if err != nil {
+	if o.pending != nil && !committed {
+		// Another writer may have recorded the command while the journal was read.
+		if committed, err = o.pendingCommittedLocked(ctx); err != nil {
 			return err
 		}
 	}
-	state := domain.InventoryState{}
-	startSequence := int64(0)
-	if hasCandidate && candidate.LastSequence <= version && auditSnapshotPrefix(candidate, batches) == nil {
-		state = domain.CloneInventoryState(candidate.State)
-		startSequence = candidate.LastSequence
-		o.lastSavedSequence = max(o.lastSavedSequence, candidate.LastSequence)
-		o.snapshotWorker.observeSaved(candidate.LastSequence)
+	if committed {
+		o.pending = nil
 	}
-	for _, batch := range batches {
-		if batch.FinalSequence <= startSequence {
-			continue
-		}
-		state, err = domain.ApplyRecordedBatch(state, batch)
-		if err != nil {
-			return err
-		}
+	o.state, o.expirations = candidate.state, candidate.expirations
+	if candidate.snapshotSequence > 0 {
+		o.lastSavedSequence = max(o.lastSavedSequence, candidate.snapshotSequence)
+		o.snapshotWorker.observeSaved(candidate.snapshotSequence)
 	}
-	if state.StateVersion != version {
-		return domain.ErrInvalidRecordedBatch
-	}
-	index, err := expirationIndex(state)
-	if err != nil {
-		return err
-	}
-	o.publishProjection(state, index)
-	if o.pending != nil {
-		if record, found := state.Commands[o.pending.CommandID]; found {
-			if record.CommandType != o.pending.CommandType || record.CommandFingerprint != o.pending.CommandFingerprint {
-				o.usable = false
-				return domain.ErrCommandIdentityConflict
-			}
-			o.pending = nil
-		}
-	}
+	o.publishProjection()
 	return nil
 }
 
-func (o *Owner) publishProjection(state domain.InventoryState, index map[string]time.Time) {
-	o.state = state
-	o.expirations = index
+// pendingCommittedLocked reports whether the store already holds the pending
+// command. A record with another identity is a conflict.
+func (o *Owner) pendingCommittedLocked(ctx context.Context) (bool, error) {
+	if o.pending == nil {
+		return false, nil
+	}
+	record, found, err := o.events.FindCommand(ctx, o.pending.CommandID)
+	if err != nil || !found {
+		return false, err
+	}
+	if record.CommandType != o.pending.CommandType || record.CommandFingerprint != o.pending.CommandFingerprint {
+		o.usable = false
+		return false, domain.ErrCommandIdentityConflict
+	}
+	return true, nil
+}
+
+// buildProjection prefers the latest snapshot plus the journal tail and falls
+// back to the whole journal when the snapshot is invalid or contradicts it.
+// Only a fault in the snapshot or the journal causes the fallback; any other
+// error, such as a store failure, is returned.
+func (o *Owner) buildProjection(ctx context.Context) (projection, error) {
+	if o.snapshotStore != nil {
+		snapshot, found, err := o.snapshotStore.LoadLatest(ctx)
+		if err != nil && !isJournalFault(err) {
+			return projection{}, err
+		}
+		if err != nil {
+			o.logf("warehouse: the latest snapshot is unusable, replaying the journal from the start: %v", err)
+		} else if found {
+			candidate, err := o.projectFromSnapshot(ctx, snapshot)
+			if err == nil || !isJournalFault(err) {
+				return candidate, err
+			}
+			o.logf("warehouse: snapshot at sequence %d is unusable, replaying the journal from the start: %v", snapshot.LastSequence, err)
+		}
+	}
+	return o.projectFromJournal(ctx)
+}
+
+// isJournalFault reports whether err says that a snapshot or the journal is
+// itself wrong, as opposed to the store being unavailable, the context ending
+// or another writer being ahead.
+func isJournalFault(err error) bool {
+	for _, fault := range []error{
+		domain.ErrInvalidSnapshot, domain.ErrUnsupportedSchema, domain.ErrInvalidEventBatch, domain.ErrInvalidEvent,
+		domain.ErrInvalidRecordedBatch, domain.ErrProductNotFound, domain.ErrDishNotFound, domain.ErrBatchNotFound,
+		domain.ErrInsufficientQuantity, domain.ErrQuantityOverflow, domain.ErrInvalidQuantity,
+		domain.ErrInvalidShelfLife, domain.ErrInvalidBusinessTime, domain.ErrShelfLifeOverflow,
+	} {
+		if errors.Is(err, fault) {
+			return true
+		}
+	}
+	return false
+}
+
+// projectFromSnapshot takes ownership of the snapshot state: stores return copies.
+func (o *Owner) projectFromSnapshot(ctx context.Context, snapshot domain.Snapshot) (projection, error) {
+	if err := domain.ValidateSnapshot(snapshot); err != nil {
+		return projection{}, err
+	}
+	// The state may come from storage without the owner's derived batch index.
+	snapshot.State.Reindex()
+	index, err := expirationIndex(snapshot.State)
+	if err != nil {
+		return projection{}, err
+	}
+	candidate := projection{state: snapshot.State, expirations: index, snapshotSequence: snapshot.LastSequence}
+	return o.completeProjection(ctx, candidate)
+}
+
+func (o *Owner) projectFromJournal(ctx context.Context) (projection, error) {
+	return o.completeProjection(ctx, projection{expirations: map[string]time.Time{}})
+}
+
+// completeProjection replays the journal after the candidate's version and
+// checks the result against the store's version: a newer store means a
+// concurrent writer (the caller retries), an older one an inconsistent journal.
+func (o *Owner) completeProjection(ctx context.Context, candidate projection) (projection, error) {
+	walk := newJournalWalk(candidate.state.StateVersion)
+	err := o.events.ScanBatches(ctx, candidate.state.StateVersion, func(batch domain.RecordedBatch) error {
+		if err := walk.check(batch); err != nil {
+			return err
+		}
+		return applyBatch(&candidate.state, candidate.expirations, batch)
+	})
+	if err != nil {
+		return projection{}, err
+	}
+	version, err := o.events.Version(ctx)
+	if err != nil {
+		return projection{}, err
+	}
+	switch {
+	case version > candidate.state.StateVersion:
+		return projection{}, domain.ErrConcurrentModification
+	case version < candidate.state.StateVersion:
+		return projection{}, domain.ErrInvalidRecordedBatch
+	}
+	return candidate, nil
+}
+
+// markUnusable stops the projection from being served after err, unless err is
+// the end of a request's context, which says nothing about the journal.
+func (o *Owner) markUnusable(err error) {
+	if !isContextErr(err) {
+		o.usable = false
+	}
+}
+
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func (o *Owner) publishProjection() {
 	o.usable = true
 	o.offerSnapshotLocked()
 }
 
-func validateJournalContext(ctx context.Context, batches []domain.RecordedBatch, version int64) error {
-	if version < 0 {
-		return domain.ErrInvalidRecordedBatch
-	}
-	expected := int64(1)
-	commands := make(map[string]struct{}, len(batches))
-	eventIDs := make(map[string]struct{})
-	for _, batch := range batches {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if len(batch.Events) == 0 || batch.CommandID == "" || batch.CommandType == "" || batch.CommandFingerprint == "" || batch.FinalSequence != batch.Events[len(batch.Events)-1].Sequence {
-			return domain.ErrInvalidRecordedBatch
-		}
-		if _, exists := commands[batch.CommandID]; exists {
-			return domain.ErrInvalidRecordedBatch
-		}
-		commands[batch.CommandID] = struct{}{}
-		if int64(len(batch.Events)) > math.MaxInt64-expected {
-			return domain.ErrInvalidRecordedBatch
-		}
-		for _, event := range batch.Events {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if event.EventID == "" {
-				return domain.ErrInvalidRecordedBatch
-			}
-			if _, exists := eventIDs[event.EventID]; exists {
-				return domain.ErrInvalidRecordedBatch
-			}
-			eventIDs[event.EventID] = struct{}{}
-			if err := domain.ValidateRecordedEvent(event, batch, expected); err != nil {
-				return err
-			}
-			expected++
-		}
-		if _, err := domain.ResultForBatch(batch); err != nil {
-			return err
-		}
-	}
-	if expected-1 != version {
-		return domain.ErrInvalidRecordedBatch
-	}
-	return nil
+// journalWalk checks a journal read as a stream: the sequence is gapless from
+// where the walk starts and every batch is well formed. Command and event IDs
+// are unique across the journal, which only a walk from the start can see; a
+// walk from a snapshot relies on the store's own uniqueness checks.
+type journalWalk struct {
+	next     int64
+	commands map[string]struct{}
+	eventIDs map[string]struct{}
 }
 
-func auditSnapshotPrefix(snapshot domain.Snapshot, batches []domain.RecordedBatch) error {
-	return domain.ValidateSnapshotPrefix(snapshot, batches)
+func newJournalWalk(after int64) *journalWalk {
+	walk := &journalWalk{next: after + 1}
+	if after == 0 {
+		walk.commands = map[string]struct{}{}
+		walk.eventIDs = map[string]struct{}{}
+	}
+	return walk
+}
+
+func (w *journalWalk) check(batch domain.RecordedBatch) error {
+	if len(batch.Events) == 0 || batch.CommandID == "" || batch.CommandType == "" || batch.CommandFingerprint == "" || batch.FinalSequence != batch.Events[len(batch.Events)-1].Sequence {
+		return domain.ErrInvalidRecordedBatch
+	}
+	if w.commands != nil {
+		if _, exists := w.commands[batch.CommandID]; exists {
+			return domain.ErrInvalidRecordedBatch
+		}
+		w.commands[batch.CommandID] = struct{}{}
+	}
+	if int64(len(batch.Events)) > math.MaxInt64-w.next {
+		return domain.ErrInvalidRecordedBatch
+	}
+	for _, event := range batch.Events {
+		if event.EventID == "" {
+			return domain.ErrInvalidRecordedBatch
+		}
+		if w.eventIDs != nil {
+			if _, exists := w.eventIDs[event.EventID]; exists {
+				return domain.ErrInvalidRecordedBatch
+			}
+			w.eventIDs[event.EventID] = struct{}{}
+		}
+		if err := domain.ValidateRecordedEvent(event, batch, w.next); err != nil {
+			return err
+		}
+		w.next++
+	}
+	_, err := domain.ResultForBatch(batch)
+	return err
 }
 
 func expirationIndex(state domain.InventoryState) (map[string]time.Time, error) {
@@ -210,55 +303,36 @@ func expirationIndex(state domain.InventoryState) (map[string]time.Time, error) 
 	return index, nil
 }
 
-func applyProjectionBatch(state domain.InventoryState, index map[string]time.Time, batch domain.RecordedBatch) (domain.InventoryState, map[string]time.Time, error) {
-	next, err := domain.ApplyRecordedBatch(state, batch)
-	if err != nil {
-		return domain.InventoryState{}, nil, err
-	}
-	updated := cloneExpirationIndex(index)
-	for _, event := range batch.Events {
-		switch event.Type {
-		case domain.EventDeliveryReceived:
-			for _, registered := range event.Payload.Batches {
-				if batch, exists := next.Batches[registered.BatchID]; exists && batch.RemainingQuantity > 0 && !batch.PendingWriteoff {
-					updated[registered.BatchID] = batch.ExpiresAt
-				} else {
-					delete(updated, registered.BatchID)
-				}
-			}
-		case domain.EventOrderPlaced:
-			for _, allocation := range event.Payload.Order.Allocations {
-				if batch, exists := next.Batches[allocation.BatchID]; exists && batch.RemainingQuantity > 0 && !batch.PendingWriteoff {
-					updated[allocation.BatchID] = batch.ExpiresAt
-				} else {
-					delete(updated, allocation.BatchID)
-				}
-			}
-		case domain.EventBatchExpiryPending:
-			delete(updated, event.Payload.Pending.BatchID)
-		case domain.EventBatchWriteoffConfirmed:
-			delete(updated, event.Payload.Writeoff.BatchID)
-		case domain.EventBatchExpired:
-			delete(updated, event.Payload.Expiry.BatchID)
-		}
-	}
-	return next, updated, nil
-}
-
-func cloneExpirationIndex(index map[string]time.Time) map[string]time.Time {
-	cloned := make(map[string]time.Time, len(index))
-	for batchID, dueAt := range index {
-		cloned[batchID] = dueAt
-	}
-	return cloned
-}
-
-func (o *Owner) applyCommittedBatch(batch domain.RecordedBatch) error {
-	state, index, err := applyProjectionBatch(o.state, o.expirations, batch)
+// applyBatch applies one recorded batch to the state and the expiration index
+// in place. The batch is planned first, so a rejected batch changes nothing.
+func applyBatch(state *domain.InventoryState, expirations map[string]time.Time, batch domain.RecordedBatch) error {
+	delta, err := domain.PlanBatch(state, batch)
 	if err != nil {
 		return err
 	}
-	o.publishProjection(state, index)
+	state.Merge(delta)
+	for batchID, b := range delta.Batches {
+		if b.RemainingQuantity > 0 && !b.PendingWriteoff {
+			expirations[batchID] = b.ExpiresAt
+		} else {
+			delete(expirations, batchID)
+		}
+	}
+	return nil
+}
+
+func (o *Owner) applyBatchLocked(batch domain.RecordedBatch) error {
+	if o.expirations == nil {
+		o.expirations = map[string]time.Time{}
+	}
+	return applyBatch(&o.state, o.expirations, batch)
+}
+
+func (o *Owner) applyCommittedBatch(batch domain.RecordedBatch) error {
+	if err := o.applyBatchLocked(batch); err != nil {
+		return err
+	}
+	o.publishProjection()
 	return nil
 }
 
@@ -269,7 +343,7 @@ func (o *Owner) resolvePendingLocked(ctx context.Context) (domain.CommandRecord,
 	pending := cloneCommandBatch(*o.pending)
 	record, found, err := o.events.FindCommand(ctx, pending.CommandID)
 	if err != nil {
-		o.usable = false
+		o.markUnusable(err)
 		return domain.CommandRecord{}, false, err
 	}
 	if found {
@@ -280,7 +354,7 @@ func (o *Owner) resolvePendingLocked(ctx context.Context) (domain.CommandRecord,
 		}
 		batches, err := o.events.ReadBatches(ctx, pending.ExpectedVersion)
 		if err != nil {
-			o.usable = false
+			o.markUnusable(err)
 			o.pending = nil
 			return record, true, err
 		}
@@ -301,7 +375,7 @@ func (o *Owner) resolvePendingLocked(ctx context.Context) (domain.CommandRecord,
 	}
 	result, err := o.events.AppendBatch(ctx, *pending)
 	if err != nil {
-		o.usable = false
+		o.markUnusable(err)
 		if errors.Is(err, domain.ErrConcurrentModification) {
 			o.pending = nil
 		}

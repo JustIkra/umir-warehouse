@@ -63,6 +63,12 @@ func TestW6FrozenRoutesAreInstalled(t *testing.T) {
 func w6Stock(t *testing.T) (fixture, *bootstrap.Runtime) {
 	t.Helper()
 	f := setup(t)
+	return f, w6Seed(t, f)
+}
+
+// w6Seed registers a product, a dish and a delivery in the first restaurant.
+func w6Seed(t *testing.T, f fixture) *bootstrap.Runtime {
+	t.Helper()
 	runtime, err := f.registry.Resolve(context.Background(), scope(tenantA))
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +83,7 @@ func w6Stock(t *testing.T) (fixture, *bootstrap.Runtime) {
 	if _, err = runtime.ReceiveDelivery(ctx, contract.ReceiveDeliveryRequest{CommandID: "supply", DeliveryID: "supply", Number: "1", CreatedAt: now, Lines: []contract.DeliveryLine{{ProductID: "P", Quantity: 100, ManufacturedAt: now, ReceivedAt: now, ShelfLife: contract.ShelfLife{Value: 1, Unit: contract.ShelfLifeDay}}}}); err != nil {
 		t.Fatal(err)
 	}
-	return f, runtime
+	return runtime
 }
 func w6Call(t *testing.T, f fixture, tenant, method, path, op, cap, body string) *httptest.ResponseRecorder {
 	t.Helper()

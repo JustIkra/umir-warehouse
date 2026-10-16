@@ -11,7 +11,9 @@ import (
 )
 
 func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDeliveryRequest) (contract.DeliveryReceipt, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return contract.DeliveryReceipt{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	if request.CommandID == "" || isReservedCommandID(request.CommandID) {
 		return contract.DeliveryReceipt{}, contract.ErrInvalidArgument
@@ -53,7 +55,7 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 		if err := o.syncProjectionLocked(ctx); err != nil {
 			return contract.DeliveryReceipt{}, inventoryUnavailable(err)
 		}
-		if _, exists := o.state.Deliveries[request.DeliveryID]; exists {
+		if _, exists := o.state.DeliveryIDs[request.DeliveryID]; exists {
 			return contract.DeliveryReceipt{}, contract.ErrDeliveryAlreadyReceived
 		}
 		if request.Number == "" || len(request.Lines) == 0 || !businessTime(request.CreatedAt) {
@@ -70,10 +72,14 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 		if err != nil {
 			return contract.DeliveryReceipt{}, inventoryUnavailable(err)
 		}
-		if record, exists := prepared.State.Commands[request.CommandID]; exists {
+		record, found, err = o.findCommand(ctx, request.CommandID, "ReceiveDelivery", fingerprint)
+		if err != nil {
+			return contract.DeliveryReceipt{}, err
+		}
+		if found {
 			return recordedDelivery(record, fingerprint)
 		}
-		if _, exists := prepared.State.Deliveries[request.DeliveryID]; exists {
+		if _, exists := o.state.DeliveryIDs[request.DeliveryID]; exists {
 			return contract.DeliveryReceipt{}, contract.ErrDeliveryAlreadyReceived
 		}
 		now := prepared.EvaluatedAt
@@ -118,7 +124,8 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 			deliveryEvent.RuntimeEpoch = o.scope.RuntimeEpoch
 			deliveryEvent.SchemaVersion = domain.InventorySchemaV2
 		}
-		temporary, err := deliveryProjection(prepared.State, request.CommandID, fingerprint, deliveryEvent)
+		deliveryOnly := domain.CommandBatch{ExpectedVersion: prepared.StateVersion, CommandID: request.CommandID, CommandType: "ReceiveDelivery", CommandFingerprint: fingerprint, Events: []domain.Event{deliveryEvent}}
+		temporary, err := domain.PlanBatch(&o.state, asRecordedBatch(deliveryOnly))
 		if err != nil {
 			return contract.DeliveryReceipt{}, err
 		}
@@ -153,11 +160,11 @@ func (o *Owner) ReceiveDelivery(ctx context.Context, request contract.ReceiveDel
 			}
 		}
 		command := domain.CommandBatch{ExpectedVersion: prepared.StateVersion, CommandID: request.CommandID, CommandType: "ReceiveDelivery", CommandFingerprint: fingerprint, Events: events}
-		candidate, err := domain.ApplyRecordedBatch(prepared.State, asRecordedBatch(command))
+		planned, err := domain.PlanBatch(&o.state, asRecordedBatch(command))
 		if err != nil {
 			return contract.DeliveryReceipt{}, err
 		}
-		if err := domain.ValidateInventoryTotals(candidate); err != nil {
+		if err := domain.ValidateInventoryTotalsWith(&o.state, planned); err != nil {
 			return contract.DeliveryReceipt{}, err
 		}
 		record, found, err = o.appendOwnerCommandLocked(ctx, command)
@@ -214,15 +221,6 @@ func validateDelivery(state domain.InventoryState, request contract.ReceiveDeliv
 		batches[index] = domain.Batch{DeliveryID: request.DeliveryID, LineNo: int64(index + 1), ProductID: product.ProductID, ManufacturedAt: manufacturedAt, ShelfLife: life, ReceivedAt: receivedAt, ExpiresAt: expiresAt, ReceivedQuantity: line.Quantity, RemainingQuantity: line.Quantity}
 	}
 	return delivery, batches, nil
-}
-
-func deliveryProjection(state domain.InventoryState, commandID, fingerprint string, event domain.Event) (domain.InventoryState, error) {
-	command := domain.CommandBatch{ExpectedVersion: state.StateVersion, CommandID: commandID, CommandType: "ReceiveDelivery", CommandFingerprint: fingerprint, Events: []domain.Event{event}}
-	projected, err := domain.ApplyRecordedBatch(state, asRecordedBatch(command))
-	if err != nil {
-		return domain.InventoryState{}, err
-	}
-	return projected, nil
 }
 
 func asRecordedBatch(command domain.CommandBatch) domain.RecordedBatch {

@@ -1,6 +1,8 @@
 version: "2"
 run:
   tests: true
+  build-tags:
+    - perf
   relative-path-mode: cfg
 linters:
   default: none
@@ -126,6 +128,7 @@ linters:
             - "golang.org/x/text/cases$"
             - "golang.org/x/text/unicode/norm$"
             - "context$"
+            - "log$"
             - "sync$"
             - "sync/atomic$"
             - "crypto/sha256$"

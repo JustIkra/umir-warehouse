@@ -9,6 +9,9 @@ import (
 	"github.com/JustIkra/umir-warehouse/contract"
 )
 
+// historyPageSize is the most events one history response carries.
+const historyPageSize = 500
+
 type journalRecordWire struct {
 	TenantID     string          `json:"tenantID"`
 	RuntimeEpoch string          `json:"runtimeEpoch"`
@@ -46,20 +49,14 @@ func (h *scopedHandlers) scopedHistory(w http.ResponseWriter, r *http.Request, r
 			return
 		}
 	}
-	history, err := runtime.GetHistory(r.Context())
+	history, err := runtime.HistoryPage(r.Context(), from, historyPageSize)
 	if err != nil {
 		writeScopedError(w, err, false)
 		return
 	}
-	records := make([]journalRecordWire, 0)
+	records := make([]journalRecordWire, 0, len(history.Events))
 	for _, event := range history.Events {
-		if event.Sequence <= from {
-			continue
-		}
 		records = append(records, journalRecordWire{scope.RestaurantID, scope.RuntimeEpoch, wireScopedEvent(event, scope, h.options.TZDataVersion)})
-		if len(records) == 500 {
-			break
-		}
 	}
 	writeScopedResult(w, scope, history.EvaluatedAt, history.StateVersion, struct {
 		Events []journalRecordWire `json:"events"`

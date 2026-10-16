@@ -3,7 +3,8 @@ package application
 import (
 	"context"
 	"errors"
-	"sync"
+	"log"
+	"strconv"
 	"time"
 
 	"github.com/JustIkra/umir-warehouse/contract"
@@ -16,7 +17,7 @@ type Owner struct {
 	loadZone          func(string) (*time.Location, error)
 	tzdataVersion     string
 	scope             contract.Scope
-	mu                sync.Mutex
+	mu                ctxMutex
 	events            EventStore
 	now               func() time.Time
 	newID             func() string
@@ -29,8 +30,12 @@ type Owner struct {
 	snapshotWorker    *SnapshotWorker
 	snapshotEvery     int64
 	lastSavedSequence int64
+	logf              func(string, ...any)
 }
 
+// ReadState is the inventory a caller evaluates. Owner.Prepare returns an
+// independent copy. prepareLocked returns a borrowed view of the Owner's own
+// state, valid only while the caller holds the lock: do not keep or change it.
 type ReadState struct {
 	State        domain.InventoryState
 	EvaluatedAt  time.Time
@@ -41,11 +46,28 @@ func NewOwner(events EventStore, now func() time.Time, newID func() string) (*Ow
 	if events == nil || now == nil || newID == nil {
 		return nil, contract.ErrInvalidArgument
 	}
-	return &Owner{events: events, now: now, newID: newID, loadZone: domain.LoadZone}, nil
+	return &Owner{mu: newCtxMutex(), events: events, now: now, newID: newID, loadZone: domain.LoadZone, logf: log.Printf}, nil
+}
+
+// ConfigureLogger replaces the function the Owner and its snapshot worker log
+// through; it must be called before the Owner starts.
+func (o *Owner) ConfigureLogger(logf func(string, ...any)) error {
+	o.mu.lockUncancellable()
+	defer o.mu.Unlock()
+	if o.started || logf == nil {
+		return contract.ErrInvalidArgument
+	}
+	o.logf = logf
+	if o.snapshotWorker != nil {
+		o.snapshotWorker.setLogger(logf)
+	}
+	return nil
 }
 
 func (o *Owner) Recover(ctx context.Context) error {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	o.started = true
 	if err := o.recoverLocked(ctx); err != nil {
@@ -67,13 +89,16 @@ func (o *Owner) Recover(ctx context.Context) error {
 }
 
 func (o *Owner) Prepare(ctx context.Context) (ReadState, error) {
-	o.mu.Lock()
+	if err := o.mu.Lock(ctx); err != nil {
+		return ReadState{}, inventoryUnavailable(err)
+	}
 	defer o.mu.Unlock()
 	o.started = true
 	state, _, err := o.prepareLocked(ctx)
 	if err != nil {
 		return ReadState{}, inventoryUnavailable(err)
 	}
+	state.State = domain.CloneReadView(state.State)
 	return state, nil
 }
 
@@ -93,6 +118,9 @@ func (o *Owner) FindOrderByProposal(ctx context.Context, proposalID string) (dom
 	return domain.CloneOrder(order), found, nil
 }
 
+// prepareLocked returns a borrowed ReadState: State shares the Owner's maps and
+// is valid only while o.mu is held. Callers must not keep it past the unlock,
+// change it, or use it after a write that applies a batch.
 func (o *Owner) prepareLocked(ctx context.Context) (ReadState, []contract.ExpiryResult, error) {
 	if err := o.syncProjectionLocked(ctx); err != nil {
 		return ReadState{}, nil, err
@@ -104,7 +132,7 @@ func (o *Owner) prepareLocked(ctx context.Context) (ReadState, []contract.Expiry
 		if !ok {
 			version, err := o.events.Version(ctx)
 			if err != nil {
-				o.usable = false
+				o.markUnusable(err)
 				return ReadState{}, results, err
 			}
 			if version != o.state.StateVersion {
@@ -117,7 +145,7 @@ func (o *Owner) prepareLocked(ctx context.Context) (ReadState, []contract.Expiry
 			if _, due := o.nextDueBatch(evaluatedAt); due {
 				continue
 			}
-			return ReadState{State: domain.CloneInventoryState(o.state), EvaluatedAt: evaluatedAt, StateVersion: o.state.StateVersion}, results, nil
+			return ReadState{State: o.state, EvaluatedAt: evaluatedAt, StateVersion: o.state.StateVersion}, results, nil
 		}
 		result, err := o.expireDueLocked(ctx, batchID, now)
 		if err != nil {
@@ -139,7 +167,7 @@ func (o *Owner) prepareLocked(ctx context.Context) (ReadState, []contract.Expiry
 }
 
 func (o *Owner) ConfigureScope(scope contract.Scope) error {
-	o.mu.Lock()
+	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
 	if o.started || o.scope.RestaurantID != "" {
 		return contract.ErrInvalidArgument
@@ -151,8 +179,28 @@ func (o *Owner) ConfigureScope(scope contract.Scope) error {
 	return nil
 }
 
+// UpdateSettings replaces the time zone and settings version of the scope
+// with newer ones for the same restaurant and lifecycle. The inventory stays.
+func (o *Owner) UpdateSettings(ctx context.Context, scope contract.Scope) error {
+	if err := o.mu.Lock(ctx); err != nil {
+		return err
+	}
+	defer o.mu.Unlock()
+	if scope.Validate() != nil || scope.OrganizationID != o.scope.OrganizationID || scope.RestaurantID != o.scope.RestaurantID || scope.RuntimeEpoch != o.scope.RuntimeEpoch || scope.LifecycleVersion != o.scope.LifecycleVersion {
+		return contract.ErrInvalidArgument
+	}
+	// Concurrent updates may arrive in either order; settings only move forward.
+	current, currentErr := strconv.ParseInt(o.scope.SettingsVersion, 10, 64)
+	next, nextErr := strconv.ParseInt(scope.SettingsVersion, 10, 64)
+	if currentErr == nil && nextErr == nil && next <= current {
+		return nil
+	}
+	o.scope.TimeZone, o.scope.SettingsVersion = scope.TimeZone, scope.SettingsVersion
+	return nil
+}
+
 func (o *Owner) ConfigureTZData(version string) error {
-	o.mu.Lock()
+	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
 	if o.started {
 		return contract.ErrInvalidArgument
@@ -162,7 +210,7 @@ func (o *Owner) ConfigureTZData(version string) error {
 }
 
 func (o *Owner) ConfigureZoneLoader(loader func(string) (*time.Location, error)) error {
-	o.mu.Lock()
+	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
 	if o.started || loader == nil {
 		return contract.ErrInvalidArgument
@@ -172,7 +220,7 @@ func (o *Owner) ConfigureZoneLoader(loader func(string) (*time.Location, error))
 }
 
 func (o *Owner) ValidateAnalyticsScope(scope contract.Scope) error {
-	o.mu.Lock()
+	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
 	if scope.Validate() != nil || scope.OrganizationID != o.scope.OrganizationID || scope.RestaurantID != o.scope.RestaurantID || scope.LifecycleVersion != o.scope.LifecycleVersion {
 		return contract.ErrForbidden
