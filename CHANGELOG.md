@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Accept a repeated restaurant registration with different settings. For the same lifecycle version, a higher `settingsVersion` replaces the stored time zone and settings while the inventory stays, a lower one is a successful repeat that changes nothing, and the same version with another time zone is still a `CommandIdentityConflict`. A repeat of a lost registration answer after the organization's settings changed now succeeds.
+
 - Keep the projection when a request ends early. The owner lock is a context-aware mutex: a request whose context ends while it waits leaves without touching anything, and `usable` is no longer cleared by a canceled or timed-out request, only by a journal that contradicts the projection. The server's `WriteTimeout` is now the request timeout plus five seconds so a result recorded just before the deadline can still be written.
 
 - Answer commits and passive reads from bounded store reads. `order-commits` takes the position of the order from `FindOrderPlacement`, so a second command for a proposal that is already an order answers 200 with the same order instead of an unknown outcome; `orders`, `order-attempts`, `commands` and history pages use `Head`, `FindOrder` and `HistoryPage` instead of copying the journal. Planning holds the owner only to capture the version and a shallow view and reads the period facts without it; `Movements` reads the events of its period and takes names from the captured products. `Analytics` reads the journal through `CaptureJournal` and `ReadPeriod`, which replace `ReadAnalyticsJournal`. `bootstrap.Options.WrapEventStore` lets tests wrap each restaurant's store.

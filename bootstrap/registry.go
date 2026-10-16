@@ -79,16 +79,29 @@ func (r *Registry) register(ctx context.Context, scope contract.Scope, operation
 		if old.scope.LifecycleVersion != scope.LifecycleVersion {
 			return contract.RuntimeReadiness{}, contract.ErrForbidden
 		}
-		if old.scope.TimeZone != scope.TimeZone || old.scope.SettingsVersion != scope.SettingsVersion {
+		// Settings only move forward: newer ones replace the stored settings, older
+		// ones are a stale repeat, and the same number with another zone is a
+		// different request.
+		oldVersion, newVersion := settingsNumber(old.scope), settingsNumber(scope)
+		switch {
+		case newVersion == oldVersion && old.scope.TimeZone != scope.TimeZone:
 			return contract.RuntimeReadiness{}, contract.ErrCommandIdentityConflict
+		case newVersion > oldVersion:
+			if operationID != "" && old.registerOperation != "" && old.registerOperation != operationID {
+				return contract.RuntimeReadiness{}, contract.ErrCommandIdentityConflict
+			}
+			if err := old.runtime.owner.UpdateSettings(ctx, scope); err != nil {
+				return contract.RuntimeReadiness{}, err
+			}
+			old.scope = scope
 		}
 		if operationID != "" {
 			if old.registerOperation != "" && old.registerOperation != operationID {
 				return contract.RuntimeReadiness{}, contract.ErrCommandIdentityConflict
 			}
 			old.registerOperation = operationID
-			r.tenants[scope.RestaurantID] = old
 		}
+		r.tenants[scope.RestaurantID] = old
 		return r.readiness(old), nil
 	}
 	coverage := r.options.Now()
@@ -113,6 +126,12 @@ func (r *Registry) register(ctx context.Context, scope contract.Scope, operation
 	default:
 	}
 	return r.readiness(entry), nil
+}
+
+// settingsNumber is the numeric settings version of a validated scope.
+func settingsNumber(scope contract.Scope) int64 {
+	n, _ := strconv.ParseInt(scope.SettingsVersion, 10, 64)
+	return n
 }
 func (r *Registry) readiness(entry registeredRuntime) contract.RuntimeReadiness {
 	state := "ready"

@@ -178,6 +178,20 @@ func (o *Owner) ConfigureScope(scope contract.Scope) error {
 	return nil
 }
 
+// UpdateSettings replaces the time zone and settings version of the scope
+// with newer ones for the same restaurant and lifecycle. The inventory stays.
+func (o *Owner) UpdateSettings(ctx context.Context, scope contract.Scope) error {
+	if err := o.mu.Lock(ctx); err != nil {
+		return err
+	}
+	defer o.mu.Unlock()
+	if scope.Validate() != nil || scope.OrganizationID != o.scope.OrganizationID || scope.RestaurantID != o.scope.RestaurantID || scope.RuntimeEpoch != o.scope.RuntimeEpoch || scope.LifecycleVersion != o.scope.LifecycleVersion {
+		return contract.ErrInvalidArgument
+	}
+	o.scope.TimeZone, o.scope.SettingsVersion = scope.TimeZone, scope.SettingsVersion
+	return nil
+}
+
 func (o *Owner) ConfigureTZData(version string) error {
 	o.mu.lockUncancellable()
 	defer o.mu.Unlock()
