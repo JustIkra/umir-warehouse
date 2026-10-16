@@ -278,9 +278,9 @@ Healthy catalogue reports compare the actual Warehouse runtime version with `zon
 
 The independent Feedback discovery overlay `b2e3b3824e622d68360d73854f24920c827b9c1aefadf013241ec69262daa02f` does not change Warehouse credential ownership. Warehouse still receives only `auth-warehouse`, `gateway-warehouse`, `serving-warehouse`, and its separate `fixture-warehouse` control credential. The base FOC binding remains `af215b378140b8e690523fc537007679b8c2599ed3039f7f2a0c651a64c59410`; protocol remains `umir-operational-fixtures/1.1.0`. Profile source/image smoke is an owner handoff, separate from runner qualification and J1/E acceptance.
 
-## Durable storage foundation (wave 2, in progress)
+## Durable storage work (wave 2, in progress)
 
-The W2 branch includes the shared PostgreSQL, RabbitMQ, Redis and outbox relay adapters copied from Factory `reference/durable@26166c8ba197`. Production bootstrap still uses the W1 stores. The durable schema, journal, outbox composition, shared captures, CLI and readiness are follow-up work; this foundation does not make Warehouse durable.
+The W2 branch includes the shared PostgreSQL, RabbitMQ, Redis and outbox relay adapters copied from Factory `reference/durable@26166c8ba197`. It now also defines the initial Warehouse schema migration for storage generation, restaurant lifecycle, streams, partitioned commands and events, snapshots, order attempts, forced tenant RLS, worker leases, outbox storage, and the closed-restaurant purge function. The migration can be run and verified independently, but production bootstrap still uses the W1 stores. Journal codecs, PostgreSQL store implementations, durable runtime composition, bounded caches, relay, captures, CLI and readiness remain in progress. This work is not a durable Warehouse release.
 
 Run `make check`, `make quality-test` and `make integration`. Integration tests need `UMIR_TEST_DATABASE_URL`, `UMIR_TEST_AMQP_URL`, `UMIR_TEST_AMQP_MANAGEMENT_URL` and `UMIR_TEST_REDIS_CACHE_URL`. In the Factory W0 checkout, run `bash scripts/durable-test-infra.sh up`, then evaluate its `env` output in the test shell without printing it. The suite fails when configuration is missing. It creates temporary `t_warehouse_*` databases and broker vhosts and a `t:warehouse:*` cache prefix, and removes only these test objects. The cache test does not use limiter Redis.
 

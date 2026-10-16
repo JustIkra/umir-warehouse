@@ -2,6 +2,8 @@
 
 ## Не выпущено
 
+- Add the first Warehouse PostgreSQL migration for storage generation, restaurant lifecycle, streams, partitioned commands and events, snapshots, order attempts, worker leases, outbox support, forced tenant RLS, and the seven-day closed-restaurant purge function. This migration is not yet wired into production startup; the W2 storage work remains in progress.
+
 - Add the W2 integration foundation: unmodified Factory PostgreSQL, RabbitMQ, Redis and relay adapters, isolated test infrastructure helpers, a race-enabled `make integration` gate and CI coverage. The production store remains unchanged; durable journal/schema/bootstrap work is not complete.
 
 - Fix two regressions found in review. A request with a rotated key ID now waits for the key refresh already in flight instead of failing with `InvalidToken`. A state decoded from storage gets the batch index when it is recovered from a snapshot and on its first merge, and the delivery totals check reads only the batches of the products it touches. A settings update that waits for a busy owner no longer holds up the registry; owner settings only move forward.
