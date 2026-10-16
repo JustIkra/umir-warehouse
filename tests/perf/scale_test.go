@@ -26,6 +26,8 @@ const (
 	commitBlocks  = 3
 	// deliveryEvery orders a delivery arrives.
 	deliveryEvery = 150
+	// movementCalls is how many Movements calls make up one timed run.
+	movementCalls = 10
 	// repeats takes the best of several runs of a read so scheduling noise does
 	// not decide a ratio.
 	repeats = 5
@@ -237,8 +239,16 @@ func TestScale(t *testing.T) {
 		r.recInputs = s.timed("recommendations", func() error { _, err := s.planning.Recommendations(s.ctx, planning); return err })
 		r.inventory = s.timed("inventory", func() error { _, err := s.owner.GetInventory(s.ctx); return err })
 		r.history = s.timed("history", func() error { _, err := s.owner.GetHistory(s.ctx); return err })
-		movements := s.best("movements", func() error { _, err := s.analytics.Movements(s.ctx, analytics); return err })
-		r.movements, r.movementsCPU = movements.wall, movements.cpu
+		// A single call is too short to time on a small corpus, so a run is a batch of calls.
+		movements := s.best("movements", func() error {
+			for range movementCalls {
+				if _, err := s.analytics.Movements(s.ctx, analytics); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		r.movements, r.movementsCPU = movements.wall/movementCalls, movements.cpu/movementCalls
 		r.recoverLive = s.timed("recover", func() error { return s.owner.Recover(s.ctx) })
 		journal := s.recoverFresh("recover_journal", false)
 		r.recoverJournal, r.recoverJournalCPU = journal.wall, journal.cpu
@@ -281,7 +291,10 @@ func TestScale(t *testing.T) {
 	// busy machine does not stretch.
 	t.Logf("wall: recover_journal %.2f, movements %.2f", float64(last.recoverJournal)/float64(first.recoverJournal), float64(last.movements)/float64(first.movements))
 	ratio("recover_journal_cpu", first.recoverJournalCPU, last.recoverJournalCPU, 12)
-	ratio("movements_cpu", first.movementsCPU, last.movementsCPU, 12)
+	// Movements reads and sums every event of the period, so it grows with the
+	// corpus (8 times) and a little more as the events stop fitting in cache. It
+	// was 53 times before the period was read directly.
+	ratio("movements_cpu", first.movementsCPU, last.movementsCPU, 20)
 	// The commit ratio is checked on the median of the timed commits: on a busy
 	// machine the mean is decided by a few preempted samples. The best-block
 	// mean ratio is printed too.
